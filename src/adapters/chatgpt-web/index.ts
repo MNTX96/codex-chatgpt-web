@@ -1,7 +1,8 @@
 import { createHash, randomBytes } from "node:crypto";
-import { resolve } from "node:path";
+import { existsSync } from "node:fs";
+import { join, relative, resolve } from "node:path";
 import { isChatGptWebZeroRiskBackendModel } from "../../chatgpt-web-models";
-import { defaultBrokerEndpoint, expandUserPath, resolveBrokerEndpoint } from "../../config";
+import { defaultBrokerEndpoint, expandUserPath, getConfigDir, resolveBrokerEndpoint } from "../../config";
 import {
   cancelLauncherManualTurn,
   endLauncherManualTurn,
@@ -21,9 +22,9 @@ import { namespacedToolName, type AdapterEvent, type CodexContentPart, type Code
 import type { ProviderAdapter } from "../base";
 import { parseDataUrl } from "../image";
 import { ChatGptWebAdapterError } from "./adapter-error";
-import { ChatGptBrowserWorker } from "./browser-worker";
+import { ChatGptBrowserWorker, chatGptBrowserCapacityAvailable } from "./browser-worker";
 import { extractChatGptTurnEnvironment, extractChatGptTurnIdentity, priorChatGptAbortedTurnIds } from "./environment";
-import { CHATGPT_WEB_LUNA_MODEL_ID, resolveChatGptWebModelMode, type ChatGptWebCapabilities } from "./model";
+import { CHATGPT_WEB_LUNA_MODEL_ID, CHATGPT_WEB_MODEL_ID, resolveChatGptWebModelMode, type ChatGptWebCapabilities } from "./model";
 import { chatGptReadOnlyContextWarning, compileChatGptWebPrompt } from "./prompt";
 import { createChatGptStructuredOutputValidator } from "./output-validation";
 import { chatGptWebTurnRetryPolicy } from "./retry-policy";
@@ -36,6 +37,8 @@ import {
   type CapturedChatGptLunaCheckpoint,
 } from "./rolling-checkpoint";
 import { ChatGptExternalTurnProgress } from "./turn-progress";
+import { resolveOutputArtifactTarget } from "./artifacts/artifact-target";
+import type { OutputArtifact } from "./artifacts/types";
 import {
   canonicalizeCompactionHandoff,
   existingStructuredCompactionRun,
@@ -49,6 +52,21 @@ import {
   chatGptConversationKey,
   retainedConversationResumeRequest,
 } from "./conversation-key";
+import { ImageFactoryService } from "./image-factory/service";
+import { ImageFactoryStore, imageKey } from "./image-factory/state";
+import { IMAGE_FACTORY_INSTRUCTIONS_VERSION } from "./image-factory/instructions";
+
+function verifiedImageConversationUrl(value: string | undefined, projectId: string): string | undefined {
+  if (!value) return undefined;
+  try {
+    const url = new URL(value);
+    if (url.origin !== "https://chatgpt.com" || url.username || url.password || url.hash) return undefined;
+    if (!url.pathname.startsWith(`/g/${projectId}`) || !/\/c\/[A-Za-z0-9_-]{8,128}(?:\/|$)/.test(url.pathname)) return undefined;
+    return url.href;
+  } catch {
+    return undefined;
+  }
+}
 
 function brokerSocketPath(provider: CodexProviderConfig): string {
   const configured = provider.chatgptWeb?.brokerSocketPath?.trim();
@@ -359,6 +377,118 @@ export function createChatGptWebAdapter(
   };
   const manualInteraction = provider.chatgptWeb?.browserInteractionMode === "manual";
   const executionNamespace = chatGptWebExecutionNamespace(provider);
+  const imageFactoryEnabled = !manualInteraction && configuredCapabilities.localToolsEnabled;
+  const imageFactoryStore = imageFactoryEnabled
+    ? new ImageFactoryStore(join(getConfigDir(), "runtime", "image-factory", executionNamespace))
+    : undefined;
+  const imageFactoryWorker = imageFactoryEnabled
+    ? ChatGptBrowserWorker.forProvider({
+      ...provider,
+      chatgptWeb: {
+        ...provider.chatgptWeb,
+        // The child runs in a project chat and never selects the Codex connector. A distinct
+        // resolved config gives it its own maintenance queue while the shared browser admission
+        // counter still enforces the five-tab ceiling.
+        appName: `${provider.chatgptWeb?.appName ?? "ChatGPT"} Image Factory Child`,
+        browserDiagnosticsPath: join(getConfigDir(), "diagnostics", "image-factory"),
+      },
+    })
+    : undefined;
+  const imageFactory = imageFactoryEnabled && imageFactoryStore && imageFactoryWorker
+    ? new ImageFactoryService(
+      imageFactoryStore,
+      executionNamespace,
+      async options => {
+        const binding = await imageFactoryWorker.ensureImageFactoryProject(imageFactoryStore);
+        const session = {
+          ...options.request.session,
+          owner: options.request.session.owner,
+          accountKey: binding.accountKey,
+          projectId: binding.projectId,
+          updatedAt: Date.now(),
+        };
+        let submittedConversationUrl = session.conversationUrl;
+        options.update({ session });
+        const imageModelId = configuredCapabilities.solAvailable ? CHATGPT_WEB_MODEL_ID : CHATGPT_WEB_LUNA_MODEL_ID;
+        const imageCapabilities: ChatGptWebCapabilities = {
+          ...configuredCapabilities,
+          localToolsEnabled: false,
+        };
+        const conversationKey = imageKey("conversation", executionNamespace, session.id);
+        const artifacts: OutputArtifact[] = [];
+        const childTarget = {
+          ...options.target,
+          metadata: {
+            output: "image" as const,
+            surface: "persistent" as const,
+            projectId: binding.projectId,
+            conversationUrl: submittedConversationUrl ?? `https://chatgpt.com/g/${binding.projectId}/project`,
+            actualMode: imageModelId,
+            instructionsVersion: IMAGE_FACTORY_INSTRUCTIONS_VERSION,
+            imageSessionId: session.id,
+            jobId: options.request.jobId,
+            sourceTurn: options.request.sourceTurnId,
+          },
+        };
+        const answer = await imageFactoryWorker.run({
+          traceId: `image_${options.request.jobId.slice(0, 56)}`,
+          modelId: imageModelId,
+          reasoning: "low",
+          capabilities: imageCapabilities,
+          surface: "persistent",
+          persistentProjectId: binding.projectId,
+          executionTarget: {
+            output: "image",
+            surface: "persistent",
+            projectId: binding.projectId,
+            imageSessionId: session.id,
+          },
+          skipConnectorIdentity: true,
+          prepare: async () => ({ text: options.prompt, images: options.images, release: () => {} }),
+          ...(session.hasConversation ? { prepareResume: async () => ({ text: options.prompt, images: options.images, release: () => {} }) } : {}),
+          ...(session.hasConversation ? { requireRetainedConversation: true } : {}),
+          retainConversation: true,
+          conversationKey,
+          abortSignal: options.signal,
+          onSubmitted: url => {
+            submittedConversationUrl = verifiedImageConversationUrl(url, binding.projectId) ?? submittedConversationUrl;
+            childTarget.metadata.conversationUrl = submittedConversationUrl
+              ?? `https://chatgpt.com/g/${binding.projectId}/project`;
+            options.update({
+              session: {
+                ...session,
+                hasConversation: true,
+                conversationUrl: submittedConversationUrl,
+                updatedAt: Date.now(),
+              },
+              phase: "submitted",
+            });
+          },
+          onTextDelta: () => {},
+          outputArtifactTarget: childTarget,
+          outputArtifactExecutionKey: options.request.jobKey,
+          requireOutputArtifact: true,
+          onOutputArtifact: artifact => artifacts.push(artifact),
+        });
+        const updatedSession = {
+          ...session,
+          hasConversation: true,
+          actualMode: imageModelId,
+          conversationUrl: submittedConversationUrl ?? `https://chatgpt.com/g/${binding.projectId}/project`,
+          updatedAt: Date.now(),
+        };
+        options.update({ session: updatedSession, phase: "downloading" });
+        const manifestAbsolute = join(childTarget.outputDirectory, "manifest.json");
+        return {
+          status: artifacts.length > 0 ? "completed" : "failed",
+          artifacts,
+          ...(existsSync(manifestAbsolute) ? { manifestPath: relative(options.target.workspaceRoot, manifestAbsolute).replaceAll("\\", "/") } : {}),
+          ...(answer ? { text: answer } : {}),
+        };
+      },
+      () => chatGptBrowserCapacityAvailable(),
+    )
+    : undefined;
   const retainedLauncherDescriptor = provider.chatgptWeb?.browserHost === "launcher"
     && provider.chatgptWeb.browserHostDescriptorPath
       ? resolve(expandUserPath(provider.chatgptWeb.browserHostDescriptorPath))
@@ -406,6 +536,21 @@ export function createChatGptWebAdapter(
       ? { localTools: true }
       : resolveChatGptWebModelMode(parsed.modelId, parsed.options.reasoning, turnCapabilities);
     const identity = extractChatGptTurnIdentity(parsed);
+    const outputArtifactTarget = !parsed._compactionRequest && !manualRequest
+      ? resolveOutputArtifactTarget(environment, chatGptTurnExecutionKey(parsed), provider.chatgptWeb?.generatedImageArtifacts)
+      : undefined;
+    const outputArtifactRequired = !parsed._compactionRequest && !manualRequest
+      && (provider.chatgptWeb?.generatedImageArtifacts?.mode ?? "workspace") === "workspace"
+      && (provider.chatgptWeb?.generatedImageArtifacts?.capturePolicy ?? "required") === "required";
+    const outputArtifactLifecycle = outputArtifactTarget ? {
+      outputArtifactTarget,
+      outputArtifactExecutionKey: chatGptTurnExecutionKey(parsed),
+      onOutputArtifact: (artifact: OutputArtifact) => trace.push({
+        kind: "commentary",
+        text: `Generated image saved to workspace:\n${artifact.relativePath}\nLocal path: ${artifact.absolutePath}`,
+      }),
+      onOutputArtifactWarning: (warning: string) => trace.push({ kind: "commentary", text: warning }),
+    } : outputArtifactRequired ? { requireOutputArtifact: true } : {};
     const captureLunaCheckpoint = parsed.modelId === CHATGPT_WEB_LUNA_MODEL_ID
       && !parsed._compactionRequest
       && Boolean(identity.threadId && identity.turnId);
@@ -690,6 +835,7 @@ export function createChatGptWebAdapter(
         onReasoningSummary: (text, continuation) => trace.push({ kind: "reasoning", text, ...(continuation ? { continuation: true } : {}) }),
         onCommentary: (text, continuation) => trace.push({ kind: "commentary", text, ...(continuation ? { continuation: true } : {}) }),
         onTextDelta: delta => text.push(delta),
+        ...outputArtifactLifecycle,
         ...(captureLunaCheckpoint ? {
           captureLunaCheckpoint: true,
           onLunaCheckpoint: captureCheckpoint,
@@ -719,6 +865,23 @@ export function createChatGptWebAdapter(
       );
       activeToken = turnToken;
       try {
+        if (imageFactory && broker.bindImageTools) {
+          broker.bindImageTools(turnToken, async (name, args) => {
+            if (!structuredBroker?.holdImageActivity) {
+              throw new Error("Image Factory requires the structured automatic turn broker");
+            }
+            const result = await imageFactory.call({
+              threadId: identity.threadId ?? identity.turnId ?? traceId,
+              environment,
+              signal: browserAbort.signal,
+              activity: () => structuredBroker.holdImageActivity!(turnToken),
+            }, name, args);
+            return {
+              content: [{ type: "text", text: JSON.stringify(result) }],
+              structuredContent: result,
+            };
+          });
+        }
         const compiled = compileChatGptWebPrompt(
           input,
           turnCapabilities,
@@ -754,6 +917,7 @@ export function createChatGptWebAdapter(
       onReasoningSummary: (text, continuation) => trace.push({ kind: "reasoning", text, ...(continuation ? { continuation: true } : {}) }),
       onCommentary: (text, continuation) => trace.push({ kind: "commentary", text, ...(continuation ? { continuation: true } : {}) }),
       onTextDelta: delta => text.push(delta),
+      ...outputArtifactLifecycle,
       externalProgress,
       completionFence: {
         begin: async () => broker.beginCompletionFence(await token.promise),
@@ -838,7 +1002,7 @@ export function createChatGptWebAdapter(
           return;
         }
         let environment: ReturnType<typeof extractChatGptTurnEnvironment> | undefined;
-        if (mode.localTools) {
+        if (mode.localTools || (!manualRequest && provider.chatgptWeb?.generatedImageArtifacts?.mode !== "off")) {
           try {
             environment = environmentStore.resolve(parsed);
           } catch (error) {
@@ -846,7 +1010,7 @@ export function createChatGptWebAdapter(
             console.warn(
               `[chatgpt-web] trusted environment unavailable (thread_id=${identity.threadId ? "present" : "missing"}, turn_id=${identity.turnId ? "present" : "missing"}, previous_response_id=${parsed.previousResponseId ?? "none"}, replay_prefix_items=${parsed._replayPrefixLen ?? 0}, context_messages=${parsed.context.messages.length})`,
             );
-            throw error;
+            if (mode.localTools) throw error;
           }
         }
         if (parsed._compactionRequest) {

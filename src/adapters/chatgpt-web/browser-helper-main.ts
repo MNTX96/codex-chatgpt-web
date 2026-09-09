@@ -9,6 +9,7 @@ import { createBrowserHelperPromptSelection } from "./browser-helper-prompt-sele
 import type { CompiledChatGptWebPrompt } from "./prompt";
 import { ChatGptMirroredTurnProgress } from "./turn-progress";
 import type { ChatGptExternalTurnProgressSnapshot } from "./turn-progress";
+import type { OutputArtifactTarget } from "./artifacts/types";
 
 interface RunMessage {
   type: "run";
@@ -30,9 +31,16 @@ interface RunMessage {
     retainConversation?: boolean;
     requireRetainedConversation?: boolean;
     conversationKey?: string;
+    surface?: "temporary" | "persistent";
+    persistentProjectId?: string;
+    executionTarget?: BrowserTurn["executionTarget"];
+    skipConnectorIdentity?: boolean;
     compaction?: boolean;
     captureLunaCheckpoint?: boolean;
     externalProgress?: boolean;
+    outputArtifactTarget?: OutputArtifactTarget;
+    outputArtifactExecutionKey?: string;
+    requireOutputArtifact?: boolean;
   };
 }
 
@@ -158,6 +166,9 @@ async function run(message: RunMessage): Promise<void> {
   if (message.turn.nativeConnector !== undefined && typeof message.turn.nativeConnector !== "boolean") {
     throw new Error("Browser helper native connector flag is invalid");
   }
+  if (message.turn.skipConnectorIdentity !== undefined && typeof message.turn.skipConnectorIdentity !== "boolean") {
+    throw new Error("Browser helper connector identity flag is invalid");
+  }
   if (message.turn.retainConversation !== undefined && typeof message.turn.retainConversation !== "boolean") {
     throw new Error("Browser helper conversation retention flag is invalid");
   }
@@ -168,6 +179,22 @@ async function run(message: RunMessage): Promise<void> {
   if (message.turn.conversationKey !== undefined && !/^[a-f0-9]{64}$/.test(message.turn.conversationKey)) {
     throw new Error("Browser helper conversation key is invalid");
   }
+  if (message.turn.surface !== undefined && message.turn.surface !== "temporary" && message.turn.surface !== "persistent") {
+    throw new Error("Browser helper chat surface is invalid");
+  }
+  if (message.turn.surface === "persistent"
+    && (typeof message.turn.persistentProjectId !== "string" || !/^g-p-[A-Za-z0-9_-]{16,128}$/.test(message.turn.persistentProjectId))) {
+    throw new Error("Browser helper persistent project id is invalid");
+  }
+  if (message.turn.executionTarget?.output === "image"
+    && (message.turn.executionTarget.surface !== "persistent"
+      || message.turn.executionTarget.projectId !== message.turn.persistentProjectId
+      || !message.turn.executionTarget.imageSessionId)) {
+    throw new Error("Browser helper image execution target is invalid");
+  }
+  if (message.turn.executionTarget?.output === "text" && message.turn.executionTarget.surface !== "temporary") {
+    throw new Error("Browser helper text execution target is invalid");
+  }
   if (message.turn.compaction !== undefined && typeof message.turn.compaction !== "boolean") {
     throw new Error("Browser helper compaction flag is invalid");
   }
@@ -176,6 +203,19 @@ async function run(message: RunMessage): Promise<void> {
   }
   if (message.turn.externalProgress !== undefined && typeof message.turn.externalProgress !== "boolean") {
     throw new Error("Browser helper external progress flag is invalid");
+  }
+  const artifactTarget = message.turn.outputArtifactTarget;
+  if (message.turn.requireOutputArtifact !== undefined && typeof message.turn.requireOutputArtifact !== "boolean") {
+    throw new Error("Browser helper output artifact requirement is invalid");
+  }
+  if (artifactTarget && (!message.turn.outputArtifactExecutionKey || !/^[a-f0-9]{64}$/.test(message.turn.outputArtifactExecutionKey)
+    || typeof artifactTarget.workspaceRoot !== "string" || typeof artifactTarget.outputDirectory !== "string"
+    || !Array.isArray(artifactTarget.writableRoots) || artifactTarget.writableRoots.some(root => typeof root !== "string")
+    || !Number.isSafeInteger(artifactTarget.maxArtifacts) || artifactTarget.maxArtifacts <= 0
+    || !Number.isSafeInteger(artifactTarget.maxBytesPerArtifact) || artifactTarget.maxBytesPerArtifact <= 0
+    || !Number.isSafeInteger(artifactTarget.maxTotalBytes) || artifactTarget.maxTotalBytes <= 0
+    || !["required", "best-effort"].includes(artifactTarget.capturePolicy))) {
+    throw new Error("Browser helper output artifact target is invalid");
   }
   const provider: CodexProviderConfig = {
     adapter: "chatgpt-web",
@@ -217,8 +257,20 @@ async function run(message: RunMessage): Promise<void> {
     ...(message.turn.retainConversation ? { retainConversation: true } : {}),
     ...(message.turn.requireRetainedConversation ? { requireRetainedConversation: true } : {}),
     ...(message.turn.conversationKey ? { conversationKey: message.turn.conversationKey } : {}),
+    ...(message.turn.surface ? { surface: message.turn.surface } : {}),
+    ...(message.turn.persistentProjectId ? { persistentProjectId: message.turn.persistentProjectId } : {}),
+    ...(message.turn.executionTarget ? { executionTarget: message.turn.executionTarget } : {}),
+    ...(message.turn.skipConnectorIdentity ? { skipConnectorIdentity: true } : {}),
     abortSignal: abortController.signal,
     ...(message.turn.compaction ? { compaction: true } : {}),
+    ...(artifactTarget ? {
+      outputArtifactTarget: artifactTarget,
+      outputArtifactExecutionKey: message.turn.outputArtifactExecutionKey!,
+      onOutputArtifact: artifact => {
+        if (!writeProtocol({ type: "event", id: message.id, event: "output_artifact", artifact })) throw new Error("Browser helper could not report output artifact");
+      },
+    } : {}),
+    ...(message.turn.requireOutputArtifact ? { requireOutputArtifact: true } : {}),
     ...(progress ? {
       externalProgress: progress,
       completionFence: {
@@ -268,8 +320,8 @@ async function run(message: RunMessage): Promise<void> {
         reject(new Error("Browser helper could not request the Send activation boundary"));
       }
     }),
-    onSubmitted: () => {
-      if (!writeProtocol({ type: "event", id: message.id, event: "submitted" })) {
+    onSubmitted: url => {
+      if (!writeProtocol({ type: "event", id: message.id, event: "submitted", ...(url ? { url } : {}) })) {
         throw new Error("Browser helper could not persist ChatGPT submission evidence");
       }
     },
@@ -517,4 +569,14 @@ process.once("SIGTERM", () => {
 });
 
 // Advertise the optional frames this helper understands so the daemon can negotiate them explicitly.
-writeProtocol({ type: "ready", features: ["progress", "tool-boundary-ack", "completion-fence", "multipart-stage-ack"] });
+writeProtocol({
+  type: "ready",
+  features: [
+    "progress",
+    "tool-boundary-ack",
+    "completion-fence",
+    "multipart-stage-ack",
+    "output-artifact-v1",
+    "image-factory-v1",
+  ],
+});

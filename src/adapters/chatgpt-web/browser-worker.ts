@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { chromium, type Browser, type BrowserContext, type Locator, type Page } from "playwright-core";
@@ -16,6 +16,10 @@ import {
 import { estimateTokens } from "../../lib/token-estimate";
 import type { CodexProviderConfig } from "../../types";
 import { parseDataUrl } from "../image";
+import { OutputImageAdapter } from "./artifacts/image/output-image-adapter";
+import { outputImageSignature } from "./artifacts/image/image-detector";
+import { sniffImageMime } from "./artifacts/image/image-sniffer";
+import type { OutputArtifact, OutputArtifactTarget } from "./artifacts/types";
 import {
   ChatGptMarkdownBuffer,
   ChatGptMarkdownConsistencyError,
@@ -46,6 +50,7 @@ import { estimateCompiledChatGptWebInputTokens } from "./input-tokens";
 import {
   assertAuthenticatedChatGptPage,
   assertTemporaryChatPage,
+  assertPersistentChatPage,
   CHATGPT_ASSISTANT_TURN_SELECTOR,
   CHATGPT_COMPLETION_ACTION_SELECTOR,
   CHATGPT_COMPOSER_SELECTOR,
@@ -94,10 +99,14 @@ import type {
   ChatGptExternalTurnProgressSnapshot,
   ChatGptTurnProgressReader,
 } from "./turn-progress";
+import { ensureImageFactoryProject, type ImageFactoryProjectUi } from "./image-factory/project-manager";
+import type { ImageFactoryStore } from "./image-factory/state";
+import type { ChatExecutionTarget } from "./image-factory/contracts";
 
 export { MAX_CHATGPT_BROWSER_TABS } from "./concurrency";
 
 const workers = new Map<string, ChatGptBrowserWorker>();
+let activeChatGptBrowserTurns = 0;
 
 export async function closeChatGptBrowserWorkers(): Promise<void> {
   const active = [...workers.values()];
@@ -112,6 +121,11 @@ export async function closeChatGptBrowserWorkers(): Promise<void> {
 }
 
 export const CHATGPT_RESPONSE_DOM_GRACE_MS = 60_000;
+
+/** Shared across provider workers so an Image Factory child cannot bypass the five-tab limit. */
+export function chatGptBrowserCapacityAvailable(): boolean {
+  return activeChatGptBrowserTurns < MAX_CHATGPT_BROWSER_TABS;
+}
 /**
  * How long a staged Bigger Context part may take to produce its assistant turn. A staged part is two
  * orders of magnitude larger than an ordinary prompt and ChatGPT reads all of it before answering.
@@ -1136,6 +1150,12 @@ function withBrowserTurnAbort<T>(promise: Promise<T>, signal?: AbortSignal): Pro
   });
 }
 
+function browserPageUrl(page: Page): string | undefined {
+  const candidate = page as Page & { url?: unknown };
+  if (typeof candidate.url === "function") return (candidate.url as () => string)();
+  return typeof candidate.url === "string" ? candidate.url : undefined;
+}
+
 export interface BrowserTurn {
   traceId: string;
   modelId: string;
@@ -1148,13 +1168,18 @@ export interface BrowserTurn {
   retainConversation?: boolean;
   requireRetainedConversation?: boolean;
   conversationKey?: string;
+  surface?: "temporary" | "persistent";
+  persistentProjectId?: string;
+  executionTarget?: ChatExecutionTarget;
+  /** Image Factory retained chats do not attach a Codex connector to the project conversation. */
+  skipConnectorIdentity?: boolean;
   onPreparedSelected?: (reused: boolean) => void | Promise<void>;
   abortSignal?: AbortSignal;
   onHeartbeat?: () => void;
   /** Send activation is the ambiguity boundary after which a fresh surface must not replay this prompt. */
   onSendActivated?: () => void | Promise<void>;
   /** Semantic submission evidence proved that ChatGPT accepted the prompt. */
-  onSubmitted?: () => void;
+  onSubmitted?: (conversationUrl?: string) => void;
   /** One inert Bigger Context stage completed its exact acknowledgement boundary. */
   onMultipartStageAcknowledged?: (stageIndex: number) => void | Promise<void>;
   /** Visible ChatGPT reasoning-summary step titles only; never hidden chain-of-thought. */
@@ -1175,6 +1200,11 @@ export interface BrowserTurn {
   /** Require and remove the private Luna checkpoint tail from the visible Markdown stream. */
   captureLunaCheckpoint?: boolean;
   onLunaCheckpoint?: (captured: CapturedChatGptLunaCheckpoint) => void;
+  outputArtifactTarget?: OutputArtifactTarget;
+  outputArtifactExecutionKey?: string;
+  requireOutputArtifact?: boolean;
+  onOutputArtifact?: (artifact: OutputArtifact) => void;
+  onOutputArtifactWarning?: (warning: string) => void;
 }
 
 interface ChatGptSubmissionBaseline {
@@ -1237,10 +1267,11 @@ export function chatGptTurnIsComplete(state: {
   currentText: string;
   currentHtml?: string;
   completionActionVisible: boolean;
+  generatedImageKeys?: readonly string[];
 }): boolean {
   return state.responsePresent
     && !state.running
-    && state.currentText.length > 0
+    && (state.currentText.length > 0 || (state.generatedImageKeys?.length ?? 0) > 0)
     && state.completionActionVisible;
 }
 
@@ -1388,11 +1419,11 @@ export class ChatGptCompletionTracker {
     return revision > this.lastToolBatchRevision;
   }
 
-  observeToolBatch(revision: number, currentText: string): boolean {
+  observeToolBatch(revision: number, currentText: string, imageSignature = ""): boolean {
     if (!this.needsToolBatchObservation(revision)) return false;
     // The caller acknowledges the batch only after this projection is captured. The outer Codex
     // harness therefore cannot execute the tool until this exact pre-tool answer boundary exists.
-    this.postToolAnswerBaselineText = currentText;
+    this.postToolAnswerBaselineText = `${currentText}\0${imageSignature}`;
     this.lastToolBatchRevision = revision;
     this.missingPostToolAnswerSince = undefined;
     this.candidate = undefined;
@@ -1405,7 +1436,8 @@ export class ChatGptCompletionTracker {
     },
     now = Date.now(),
   ): boolean {
-    const signature = `${state.currentText}\0${state.currentHtml ?? state.currentText}`;
+    const imageSignature = (state.generatedImageKeys ?? []).join("\n");
+    const signature = `${state.currentText}\0${state.currentHtml ?? state.currentText}\0${imageSignature}`;
     // An outstanding tool call proves the model has more to say, whatever the rendered message
     // currently looks like. Completing here would return a truncated answer and retire the turn
     // while its own tool calls were still in flight.
@@ -1414,7 +1446,7 @@ export class ChatGptCompletionTracker {
       this.missingPostToolAnswerSince = undefined;
       return false;
     }
-    if (this.postToolAnswerBaselineText === state.currentText) {
+    if (this.postToolAnswerBaselineText === `${state.currentText}\0${imageSignature}`) {
       this.candidate = undefined;
       if (!chatGptTurnIsComplete(state)) {
         this.missingPostToolAnswerSince = undefined;
@@ -1467,6 +1499,7 @@ export class ChatGptTurnDomHealthTracker {
     running: boolean;
     currentText: string;
     completionActionVisible: boolean;
+    generatedImageKeys?: readonly string[];
     externalProgressLive?: boolean;
   }, now = Date.now()): string | undefined {
     if (state.responsePresent) this.sawResponse = true;
@@ -1493,6 +1526,7 @@ export class ChatGptTurnDomHealthTracker {
     const emptyCompletion = state.responsePresent
       && !state.running
       && state.currentText.length === 0
+      && (state.generatedImageKeys?.length ?? 0) === 0
       && state.completionActionVisible;
     if (!emptyCompletion) {
       this.emptyCompletionSince = undefined;
@@ -1577,6 +1611,7 @@ interface ChatGptResponseDomSnapshot {
   completionActionVisible: boolean;
   stoppedThinkingVisible: boolean;
   traceBlocks: ChatGptVisibleTraceBlock[];
+  generatedImageKeys: string[];
 }
 
 interface ChatGptResponseDomCache {
@@ -1594,6 +1629,7 @@ const absentResponseDomSnapshot = (): ChatGptResponseDomSnapshot => ({
   completionActionVisible: false,
   stoppedThinkingVisible: false,
   traceBlocks: [],
+  generatedImageKeys: [],
 });
 
 /** Convert the public ChatGPT turn DOM into append-only Codex reasoning summaries. */
@@ -1998,9 +2034,15 @@ export function chatGptImageFilePayloads(images: ChatGptWebPromptImage[]): Array
     if (!/^[A-Za-z0-9+/]*={0,2}$/.test(parsed.base64) || parsed.base64.length % 4 !== 0) {
       throw new Error(`ChatGPT web input image ${image.ref} contains invalid base64 data`);
     }
+    if (Math.floor(parsed.base64.length * 3 / 4) > 20_000_000) {
+      throw new Error(`ChatGPT web input image ${image.ref} exceeds 20 MB`);
+    }
     const buffer = Buffer.from(parsed.base64, "base64");
     if (buffer.length === 0) throw new Error(`ChatGPT web input image ${image.ref} is empty`);
     if (buffer.length > 20_000_000) throw new Error(`ChatGPT web input image ${image.ref} exceeds 20 MB`);
+    if (sniffImageMime(buffer) !== parsed.mediaType.toLowerCase()) {
+      throw new Error(`ChatGPT web input image ${image.ref} MIME type does not match its bytes`);
+    }
     totalBytes += buffer.length;
     if (totalBytes > 50_000_000) throw new Error("ChatGPT web input images exceed the 50 MB per-turn limit");
     return { name: `${image.ref}.${extension}`, mimeType: parsed.mediaType.toLowerCase(), buffer };
@@ -2128,7 +2170,7 @@ export class ChatGptBrowserWorker {
     if (this.activeRuns.has(turn.traceId)) {
       return Promise.reject(new Error(`Duplicate ChatGPT web browser turn: ${turn.traceId}`));
     }
-    if (this.activeRuns.size >= MAX_CHATGPT_BROWSER_TABS) {
+    if (!chatGptBrowserCapacityAvailable()) {
       return Promise.reject(new Error(
         `ChatGPT Web supports at most ${MAX_CHATGPT_BROWSER_TABS} simultaneous browser turns; close or finish a browser tab before starting another`,
       ));
@@ -2137,9 +2179,11 @@ export class ChatGptBrowserWorker {
     if (useHelper) {
       this.launcherHelper ??= new LauncherBrowserHelperClient(this.config);
     }
+    activeChatGptBrowserTurns += 1;
     const run = Promise.resolve().then(() => useHelper ? this.launcherHelper!.run(turn) : this.runExclusive(turn));
     this.activeRuns.set(turn.traceId, run);
     void run.finally(() => {
+      activeChatGptBrowserTurns = Math.max(0, activeChatGptBrowserTurns - 1);
       if (this.activeRuns.get(turn.traceId) === run) this.activeRuns.delete(turn.traceId);
     }).catch(() => {});
     return run;
@@ -2160,6 +2204,146 @@ export class ChatGptBrowserWorker {
     proAvailable?: boolean;
   }> {
     return this.enqueueMaintenance("session inspection", () => this.inspectSessionExclusive(detectCapabilities));
+  }
+
+  ensureImageFactoryProject(store: ImageFactoryStore) {
+    return this.enqueueMaintenance("Image Factory project setup", async () => {
+      if (!chatGptBrowserCapacityAvailable()) {
+        throw new Error("Image Factory setup requires an available ChatGPT browser slot");
+      }
+      activeChatGptBrowserTurns += 1;
+      let connection: Awaited<ReturnType<typeof connectLauncherBrowserHost>> | undefined;
+      let setupTraceId: string | undefined;
+      let setupStatus: "completed" | "failed" = "completed";
+      let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+      let heartbeatInFlight = false;
+      try {
+        let page: Page;
+        if (this.config.browserHost === "launcher") {
+          setupTraceId = `image_setup_${randomUUID().replaceAll("-", "")}`;
+          const lease = await notifyLauncherTurn(this.config.browserHostDescriptorPath!, {
+            phase: "start", traceId: setupTraceId, helperPid: process.pid,
+          });
+          if (!lease.surfaceId) throw new Error("Launcher did not lease a browser tab for Image Factory setup");
+          const sendHeartbeat = () => {
+            if (heartbeatInFlight) return;
+            heartbeatInFlight = true;
+            void notifyLauncherTurn(this.config.browserHostDescriptorPath!, {
+              phase: "heartbeat", traceId: setupTraceId!, helperPid: process.pid,
+            }, LAUNCHER_TURN_HEARTBEAT_TIMEOUT_MS).catch(() => {}).finally(() => {
+              heartbeatInFlight = false;
+            });
+          };
+          heartbeatTimer = setInterval(sendHeartbeat, LAUNCHER_TURN_HEARTBEAT_INTERVAL_MS);
+          heartbeatTimer.unref?.();
+          connection = await connectLauncherBrowserHost(this.config.browserHostDescriptorPath!, 20_000, lease.surfaceId);
+          page = connection.page;
+        } else {
+          page = await this.ensurePage();
+        }
+        const openSettings = async (projectId: string): Promise<Locator> => {
+          await page.goto(`https://chatgpt.com/g/${projectId}/project`, { waitUntil: "domcontentloaded", timeout: 60_000 });
+          await page.getByRole("button", { name: "Show project details", exact: true })
+            .waitFor({ state: "visible", timeout: 60_000 });
+          await page.getByRole("button", { name: "Show project details", exact: true }).click();
+          await page.getByRole("menuitem", { name: "Project settings", exact: true }).click();
+          return page.getByRole("dialog");
+        };
+        const inspect = async (id: string) => {
+          if (!/^g-p-[A-Za-z0-9_-]{16,128}$/.test(id)) throw new Error("Image Factory project id is invalid");
+          const dialog = await openSettings(id);
+          try {
+            const memory = (await dialog.getByRole("button", { name: "Memory", exact: true }).innerText())
+              .toLowerCase().includes("project-only") ? "project-only" as const : "unknown" as const;
+            const instructions = await dialog.getByRole("textbox", { name: "Instructions", exact: true }).inputValue();
+            return { id, memory, instructions };
+          } finally {
+            await dialog.getByRole("button", { name: "Close", exact: true }).click().catch(() => {});
+          }
+        };
+        const ui: ImageFactoryProjectUi = {
+          accountKey: async () => {
+            if (!/^https:\/\/chatgpt\.com(?:\/|$)/i.test(page.url())) {
+              await page.goto("https://chatgpt.com/", { waitUntil: "domcontentloaded", timeout: 60_000 });
+            }
+            const profileButton = page.locator(
+              '[data-testid="accounts-profile-button"], [aria-label*="open profile menu" i], [aria-label*="mở menu hồ sơ" i]',
+            ).last();
+            await profileButton.waitFor({ state: "visible", timeout: 30_000 });
+            const label = await profileButton.getAttribute("aria-label");
+            if (!label) throw new Error("ChatGPT account identity is unavailable");
+            return createHash("sha256").update(label).digest("hex");
+          },
+          list: async () => {
+            await page.goto("https://chatgpt.com/projects", { waitUntil: "domcontentloaded", timeout: 60_000 });
+            const rows = page.locator('[role="grid"] [role="row"][data-page-table-selectable-row="true"]');
+            const found = new Map<string, { id: string; name: string }>();
+            let stablePasses = 0;
+            for (let pass = 0; pass < 12 && stablePasses < 2; pass += 1) {
+              const rowCount = await rows.count();
+              for (let index = 0; index < rowCount; index += 1) {
+                const row = rows.nth(index);
+                const name = (await row.getByRole("gridcell").first().innerText()).trim().replace(/Pinned$/i, "").trim();
+                if (!name) continue;
+                await row.click({ force: true });
+                await page.waitForURL(/\/g\/g-p-[A-Za-z0-9_-]+\/project(?:$|\/)/, { timeout: 60_000 });
+                const id = new URL(page.url()).pathname.split("/")[2] ?? "";
+                if (!/^g-p-[A-Za-z0-9_-]{16,128}$/.test(id)) throw new Error("ChatGPT project row did not expose a valid project id");
+                found.set(id, { id, name });
+                await page.goto("https://chatgpt.com/projects", { waitUntil: "domcontentloaded", timeout: 60_000 });
+              }
+              const before = found.size;
+              await rows.last().scrollIntoViewIfNeeded().catch(() => {});
+              await new Promise(resolveSleep => setTimeout(resolveSleep, 100));
+              stablePasses = found.size === before ? stablePasses + 1 : 0;
+            }
+            return [...found.values()];
+          },
+          inspect,
+          create: async onCreated => {
+            await page.goto("https://chatgpt.com/projects", { waitUntil: "domcontentloaded", timeout: 60_000 });
+            const newButton = page.getByRole("button", { name: "New", exact: true });
+            if (await newButton.count() > 0) {
+              await newButton.click();
+            } else {
+              const projectsLink = page.getByRole("link", { name: /^Projects\s+New project$/i });
+              await projectsLink.getByRole("button", { name: "New project", exact: true }).click();
+            }
+            const dialog = page.getByRole("dialog");
+            await dialog.getByRole("textbox", { name: "Project name", exact: true }).fill("Image Factory");
+            await dialog.getByRole("button", { name: "Default memory", exact: true }).click();
+            await page.getByRole("menuitemradio", { name: /^Project-only memory/ }).click();
+            await dialog.getByRole("button", { name: "Create project", exact: true }).click();
+            await page.waitForURL(/\/g\/g-p-[A-Za-z0-9_-]+\/project/, { timeout: 60_000 });
+            const id = new URL(page.url()).pathname.split("/")[2];
+            if (!id) throw new Error("ChatGPT did not expose the created Image Factory project id");
+            onCreated(id);
+            return inspect(id);
+          },
+          writeInstructions: async (id, text) => {
+            const dialog = await openSettings(id);
+            await dialog.getByRole("textbox", { name: "Instructions", exact: true }).fill(text);
+            await dialog.getByRole("button", { name: "Save", exact: true }).click();
+            await dialog.waitFor({ state: "hidden", timeout: 30_000 }).catch(() => {});
+          },
+        };
+        return await ensureImageFactoryProject(store, ui);
+      } catch (error) {
+        setupStatus = "failed";
+        throw error;
+      } finally {
+        if (heartbeatTimer) clearInterval(heartbeatTimer);
+        if (connection) await connection.browser.close().catch(() => {});
+        if (setupTraceId) {
+          await notifyLauncherTurn(this.config.browserHostDescriptorPath!, {
+            phase: "end", traceId: setupTraceId, helperPid: process.pid, status: setupStatus,
+          }).catch(error => {
+            if (setupStatus === "completed") throw error;
+          });
+        }
+        activeChatGptBrowserTurns = Math.max(0, activeChatGptBrowserTurns - 1);
+      }
+    });
   }
 
   smokeTest(abortSignal?: AbortSignal): Promise<{ effort: string; response: string }> {
@@ -2504,6 +2688,33 @@ export class ChatGptBrowserWorker {
     await assertAuthenticatedChatGptPage(page);
     await assertTemporaryChatPage(page);
     await captureDiagnostic?.("session-verified");
+    return composer;
+  }
+
+  /** Prepare one normal project chat. It is only used by the Image Factory child worker. */
+  private async preparePersistentChatSurface(
+    page: Page,
+    projectId: string,
+    captureDiagnostic?: (checkpoint: string) => Promise<void>,
+  ): Promise<Locator> {
+    if (!/^g-p-[A-Za-z0-9_-]{16,128}$/.test(projectId)) {
+      throw new Error("Image Factory project id is invalid");
+    }
+    const expectedPrefix = `https://chatgpt.com/g/${projectId}`;
+    if (!page.url().startsWith(expectedPrefix)) {
+      await page.goto(`${expectedPrefix}/project`, { waitUntil: "domcontentloaded", timeout: 60_000 });
+      await captureDiagnostic?.("persistent-chat-navigation-complete");
+    }
+    let composer: Locator;
+    try {
+      composer = await this.activeComposer(page);
+    } catch {
+      throw new Error("ChatGPT web login is expired or the Image Factory project surface is unavailable");
+    }
+    await captureDiagnostic?.("persistent-composer-ready");
+    await throwIfChatGptSessionFailureAlert(page);
+    await assertPersistentChatPage(page, projectId);
+    await captureDiagnostic?.("persistent-session-verified");
     return composer;
   }
 
@@ -3389,7 +3600,7 @@ export class ChatGptBrowserWorker {
       completionTracker,
       recoverObservation,
     );
-    submissionLifecycle?.onSubmitted?.();
+    submissionLifecycle?.onSubmitted?.(browserPageUrl(page));
     return evidence;
   }
 
@@ -4097,6 +4308,7 @@ export class ChatGptBrowserWorker {
           completionActionVisible: completionAction !== undefined,
           stoppedThinkingVisible,
           traceBlocks,
+          generatedImageKeys: [],
         },
       };
     }, {
@@ -4111,6 +4323,11 @@ export class ChatGptBrowserWorker {
       return absentResponseDomSnapshot();
     }
     const snapshot = observed.snapshot ?? cache?.snapshot ?? absentResponseDomSnapshot();
+    // Image payload state is intentionally kept out of the Markdown projection. It participates
+    // only in completion so image-only replies are first-class responses.
+    if (snapshot.responsePresent) {
+      snapshot.generatedImageKeys = await outputImageSignature(responseTurn).catch(() => []);
+    }
     if (observed.snapshot && cache) {
       cache.key = observed.key;
       cache.snapshot = observed.snapshot;
@@ -4180,6 +4397,7 @@ export class ChatGptBrowserWorker {
       helperPid: process.pid,
       ...(turn.conversationKey ? { conversationKey: turn.conversationKey } : {}),
       ...((turn.conversationKey
+        && !turn.skipConnectorIdentity
         && (turn.nativeConnector || turn.capabilities.localToolsEnabled || turn.requireRetainedConversation))
         ? { connectorIdentity: this.config.appName }
         : {}),
@@ -4273,6 +4491,19 @@ export class ChatGptBrowserWorker {
     reuseConversation = false,
   ): Promise<string> {
     if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
+    const executionTarget = turn.executionTarget ?? { output: "text" as const, surface: "temporary" as const };
+    if (executionTarget.output === "image"
+      && (executionTarget.surface !== "persistent"
+        || executionTarget.projectId !== turn.persistentProjectId
+        || executionTarget.imageSessionId.length === 0)) {
+      throw new Error("Image execution target does not match the persistent Image Factory surface");
+    }
+    if (executionTarget.output === "text" && executionTarget.surface !== "temporary") {
+      throw new Error("Text execution targets must use Temporary Chat");
+    }
+    if (turn.surface === "persistent" && !turn.persistentProjectId) {
+      throw new Error("Persistent ChatGPT turns require an Image Factory project id");
+    }
     if ((turn.externalProgress !== undefined) !== (turn.completionFence !== undefined)) {
       throw new Error("Tool-capable ChatGPT turns require both progress and terminal-fence transports");
     }
@@ -4506,12 +4737,18 @@ export class ChatGptBrowserWorker {
       if (!reuseConversation) {
         await this.runStage(
           turn.traceId,
-          "temporary_chat_preparation",
+          turn.surface === "persistent" ? "persistent_chat_preparation" : "temporary_chat_preparation",
           browserStageTimeouts.temporaryChatPreparation,
-          () => this.prepareTemporaryChatSurface(
-            page,
-            checkpoint => diagnostics.capture(page, checkpoint),
-          ),
+          () => turn.surface === "persistent"
+            ? this.preparePersistentChatSurface(
+              page,
+              turn.persistentProjectId!,
+              checkpoint => diagnostics.capture(page, checkpoint),
+            )
+            : this.prepareTemporaryChatSurface(
+              page,
+              checkpoint => diagnostics.capture(page, checkpoint),
+            ),
         );
       }
       // A retained lease proves the connector binding, not the current model selection.
@@ -4744,6 +4981,7 @@ export class ChatGptBrowserWorker {
       const sentAt = Date.now();
       const visibleTrace = new ChatGptVisibleTraceTracker();
       const markdownBuffer = new ChatGptMarkdownBuffer();
+      const outputImageAdapter = new OutputImageAdapter();
       const checkpointStream = turn.captureLunaCheckpoint
         ? new ChatGptLunaCheckpointStream()
         : undefined;
@@ -4865,6 +5103,7 @@ export class ChatGptBrowserWorker {
           completionTracker.observeToolBatch(
             externalProgressSnapshot.lastToolBatchRevision,
             snapshot.visibleText,
+            snapshot.generatedImageKeys.join("\n"),
           );
           await turn.externalProgress.acknowledgeToolBatch(externalProgressSnapshot.lastToolBatchRevision);
         }
@@ -4906,6 +5145,7 @@ export class ChatGptBrowserWorker {
             running,
             currentText: snapshot.visibleText,
             completionActionVisible: snapshot.completionActionVisible,
+            generatedImageKeys: snapshot.generatedImageKeys,
             externalProgressLive,
           });
           if (domError) throw new Error(domError);
@@ -4915,6 +5155,7 @@ export class ChatGptBrowserWorker {
             currentText: snapshot.visibleText,
             currentHtml: snapshot.fullHtml,
             completionActionVisible: snapshot.completionActionVisible,
+            generatedImageKeys: snapshot.generatedImageKeys,
             externalToolCallsInFlight,
           });
           if (!completionReady) completionFenceRevision = undefined;
@@ -4946,6 +5187,22 @@ export class ChatGptBrowserWorker {
             if (snapshot.visibleText === "api_tool unavailable") {
               throw new Error("ChatGPT selected mode rejected the Codex Native MCP tool (api_tool unavailable)");
             }
+            if (turn.outputArtifactTarget && turn.outputArtifactExecutionKey && snapshot.generatedImageKeys.length > 0) {
+              const capture = await outputImageAdapter.captureFinal({
+                page, responseTurn: responseTurn.locator, assistantTurnId: responseTurn.identity,
+                traceId: turn.traceId, executionKey: turn.outputArtifactExecutionKey,
+                target: turn.outputArtifactTarget, abortSignal: turn.abortSignal,
+              });
+              for (const artifact of capture.artifacts) turn.onOutputArtifact?.(artifact);
+              if (capture.failures.length > 0 || capture.artifacts.length === 0) {
+                const message = `Generated image capture failed for ${capture.failures.length} artifact(s)`;
+                if (turn.outputArtifactTarget.capturePolicy === "required") throw new Error(message);
+                turn.onOutputArtifactWarning?.(message);
+              }
+            }
+            if (turn.requireOutputArtifact && !turn.outputArtifactTarget && snapshot.generatedImageKeys.length > 0) {
+              throw new Error("ChatGPT generated an image but no trusted writable workspace is available");
+            }
             const final = (() => {
               try {
                 return markdownBuffer.finish();
@@ -4958,7 +5215,7 @@ export class ChatGptBrowserWorker {
             }
             if (final.delta) emitMarkdownDelta(final.delta);
             if (checkpointStream) {
-              const completed = checkpointStream.finishOptional(snapshot.visibleText);
+              const completed = checkpointStream.finishOptional(snapshot.visibleText, snapshot.generatedImageKeys.length > 0);
               if (completed.visibleRemainder) turn.onTextDelta(completed.visibleRemainder);
               if (completed.captured) turn.onLunaCheckpoint!(completed.captured);
               else console.warn(`[chatgpt-web] browser turn ${turn.traceId} completed without a Luna rolling checkpoint; preserving full native history`);

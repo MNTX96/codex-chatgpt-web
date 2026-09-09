@@ -8,6 +8,7 @@ import {
   type CompactionTransactionHandle,
 } from "./compaction-transaction";
 import type { ChatGptTurnEnvironment } from "./environment";
+import { isImageTool, type ImageToolName } from "./image-factory/contracts";
 
 interface PendingTurn extends ChatGptTurnEnvironment {
   expiresAt?: number;
@@ -62,6 +63,7 @@ interface SafeTurnControl {
 }
 
 interface TurnChannel {
+  imageTool?: (name: ImageToolName, args: unknown) => Promise<BrokerToolResult>;
   traceId: string;
   externalOwner: boolean;
   environment: PendingTurn;
@@ -229,6 +231,10 @@ export interface TurnBrokerOwner {
   commitCompletionFence(token: string, revision: number): boolean | Promise<boolean>;
   waitForRetirement(token: string, signal?: AbortSignal): Promise<void>;
   revoke(token: string, reason?: Error): void | Promise<void>;
+  /** Bind the Image Factory virtual tools to an automatic Full-harness turn. */
+  bindImageTools?(token: string, handler: (name: ImageToolName, args: unknown) => Promise<BrokerToolResult>): void;
+  /** Keep the parent completion fence open while an image child job is running. */
+  holdImageActivity?(token: string): () => void;
 }
 
 /**
@@ -335,6 +341,28 @@ export class TurnBroker implements TurnBrokerOwner {
       completionWaiters: new Set(),
     };
     return token;
+  }
+
+  bindImageTools(token: string, handler: (name: ImageToolName, args: unknown) => Promise<BrokerToolResult>): void {
+    const channel = this.channels.get(token);
+    if (!channel || channel.safe || channel.completionCommitted) throw new Error("Image Factory requires an active automatic turn");
+    channel.imageTool = handler;
+  }
+
+  /** A child browser job holds the same terminal fence as a live MCP request. */
+  holdImageActivity(token: string): () => void {
+    const channel = this.channels.get(token);
+    if (!channel || channel.safe || channel.completionCommitted) throw new Error("Image Factory parent is no longer active");
+    const activity = opaqueId("image");
+    channel.activities.add(activity);
+    channel.activityRevision += 1;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      channel.activities.delete(activity);
+      channel.activityRevision += 1;
+    };
   }
 
   async beginCompactionTransaction(
@@ -1050,13 +1078,13 @@ export class TurnBroker implements TurnBrokerOwner {
         if (!existing || existing.token !== token || existing.channel !== activeChannel) {
           throw new Error("turn token binding state is inconsistent");
         }
-        return { bindingId: activeChannel.bindingId, activityId, environment: activeChannel.environment };
+        return { bindingId: activeChannel.bindingId, activityId, environment: activeChannel.environment, imageFactory: Boolean(activeChannel.imageTool) };
       }
       this.pending.delete(token);
       const bindingId = opaqueId("binding");
       activeChannel.bindingId = bindingId;
       this.bindings.set(bindingId, { token, channel: activeChannel });
-      return { bindingId, activityId, environment: activeChannel.environment };
+      return { bindingId, activityId, environment: activeChannel.environment, imageFactory: Boolean(activeChannel.imageTool) };
     }
 
     const bindingId = request.bindingId;
@@ -1114,6 +1142,10 @@ export class TurnBroker implements TurnBrokerOwner {
 
     const wireName = request.wireName?.trim();
     if (!wireName) throw new Error("wire tool name is required");
+    if (isImageTool(wireName) && binding.channel.imageTool) {
+      if (binding.channel.safe || request.freeform) throw new Error("Image Factory tool is unavailable in this turn");
+      return binding.channel.imageTool(wireName, request.arguments ?? {});
+    }
     const callId = opaqueId("call");
     const toolRequest: BrokerToolRequest = {
       callId,

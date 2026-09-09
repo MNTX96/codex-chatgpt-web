@@ -41,6 +41,26 @@ launcher-owned codex-chatgpt-web daemon
   `wait_agent` contract as direct and structured calls.
 - Tool calls and results remain in the same ChatGPT response while Codex executes them locally.
 
+### Image Factory
+
+Automatic Full-harness Web turns keep their text and vision work in the task-bound Temporary Chat.
+When the model needs to create or edit an image, the bridge exposes three virtual tools through the
+existing turn-bound MCP contract: `chatgpt_image_generate`, `chatgpt_image_wait`, and
+`chatgpt_image_cancel`. The image job opens a separate regular ChatGPT conversation in the
+Project-only-memory project named `Image Factory`, then downloads the generated artifact into
+`.codex/chatgpt-web-artifacts/<job-key>/` using the existing artifact store.
+
+The project is created lazily in the authenticated browser profile and is reused only after its
+Project-only memory and versioned instruction block are verified. Each native task owns an opaque
+image session and conversation binding; a follow-up edit reuses that binding, while a different task
+cannot address it. The child job has its own journal and deadline, but shares the five-browser-turn
+admission limit and the parent's completion fence. A parent cancellation cancels the child job.
+
+This routing does not add an Images model and does not change the parent model catalog. Native Codex,
+Zero Risk, and browser-only routes keep their existing image behavior. ChatGPT Web image generation
+still uses the signed-in ChatGPT account's availability and limits; the bridge does not promise free
+or quota-free image generation.
+
 ### Repository DEV driver
 
 The DEV chat is not another provider or browser implementation. It is a synthetic outer-Codex

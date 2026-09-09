@@ -8,7 +8,10 @@ import type { ChatGptTurnEnvironment } from "./environment";
 import { CODEX_COMPACTION_CONTROL_WIRE_NAME } from "./native-compaction-control";
 import { callTurnBroker, TurnBrokerTimeoutError, type BrokerToolResult } from "./turn-broker";
 
+import { imageToolInventory, isImageTool, NATIVE_IMAGE_TOOLS, assertWebImageToolRouting } from "./image-factory/contracts";
+
 interface ClaimedTurn {
+  imageFactory?: boolean;
   bindingId: string;
   activityId: string;
   environment: ChatGptTurnEnvironment & { expiresAt?: number };
@@ -370,7 +373,7 @@ function execGatewayProgram(
  * as direct calls. The model still owns its JavaScript; only the tool registry it receives is a
  * transparent proxy whose native wait functions validate their transport-bound argument before dispatch.
  */
-function transportBoundRawExecProgram(input: string, blockedExecName: string): string {
+function transportBoundRawExecProgram(input: string, blockedExecName: string, blockedImageNames: string[] = []): string {
   return [
     "await (async (tools) => {",
     input,
@@ -383,12 +386,15 @@ function transportBoundRawExecProgram(input: string, blockedExecName: string): s
     "  if (typeof ALL_TOOLS !== \"undefined\" && Array.isArray(ALL_TOOLS)) {",
     "    for (const tool of ALL_TOOLS) if (typeof tool?.name === \"string\") registryNames.add(tool.name);",
     "  }",
+    `  const blockedImageNames = new Set(${JSON.stringify(blockedImageNames)});`,
     "  const wrappers = new Map();",
     "  const expose = name => {",
     "    if (wrappers.has(name)) return wrappers.get(name);",
     "    const value = Reflect.get(source, name, source);",
     "    let exposed = value;",
-    "    if (typeof value === \"function\" && name === blockedExecName) {",
+    "    if (typeof value === \"function\" && blockedImageNames.has(name)) {",
+    "      exposed = () => { throw new Error(\"Use chatgpt_image_generate through codex_tool_call\"); };",
+    "    } else if (typeof value === \"function\" && name === blockedExecName) {",
     "      exposed = () => { throw new Error(\"Nested raw exec is unavailable inside ChatGPT Web exec\"); };",
     "    } else if (typeof value === \"function\" && typeof name === \"string\" && waitNames.has(name)) {",
     "      exposed = args => {",
@@ -769,26 +775,30 @@ export async function runChatGptMcpServer(options: {
         const { query, offset, limit, include_schema } = input;
         const bound = claimed.environment;
         const needle = query?.trim().toLowerCase();
-        const directMatches = safeVisibleTools(bound, contract).filter(tool => !needle || [
+        const directMatches = safeVisibleTools(bound, contract).filter(tool => !claimed.imageFactory || !NATIVE_IMAGE_TOOLS.has(wireName(tool))).filter(tool => !needle || [
           wireName(tool),
           tool.name,
           tool.namespace ?? "",
           tool.description,
         ].join("\n").toLowerCase().includes(needle));
-        const directPage = directMatches.slice(offset, offset + limit).map(tool => ({
+        const directEntries: Array<Record<string, unknown>> = [
+          ...(claimed.imageFactory ? imageToolInventory().filter(tool => !needle || (tool.name + "\n" + tool.description).toLowerCase().includes(needle)).map(({ parameters, ...tool }) => ({ ...tool, ...(include_schema ? { parameters } : {}) })) : []),
+          ...directMatches.map(tool => ({
           wire_name: wireName(tool),
           name: tool.name,
           namespace: tool.namespace ?? null,
           description: browserToolDescription(tool),
           kind: tool.freeform ? "freeform" : tool.toolSearch ? "tool_search" : "function",
           ...(include_schema ? { parameters: browserToolParameters(tool) } : {}),
-        }));
+        })),
+        ];
+        const directPage = directEntries.slice(offset, offset + limit);
         let nestedTotal = 0;
         let nestedPage: Array<Record<string, unknown>> = [];
         const gateway = execGateway(bound);
         if (gateway) {
-          const excludedGatewayNames = bound.tools.map(wireName);
-          const nestedOffset = Math.max(0, offset - directMatches.length);
+          const excludedGatewayNames = [...bound.tools.map(wireName), ...(claimed.imageFactory ? [...NATIVE_IMAGE_TOOLS] : [])];
+          const nestedOffset = Math.max(0, offset - directEntries.length);
           const nestedLimit = Math.max(0, limit - directPage.length);
           const response = await invoke(claimed.bindingId, bound, gateway, {
             input: gatewayToolCatalogProgram({
@@ -819,7 +829,7 @@ export async function runChatGptMcpServer(options: {
           }));
         }
         const page = [...directPage, ...nestedPage];
-        const total = directMatches.length + nestedTotal;
+        const total = directEntries.length + nestedTotal;
         return result({
           tools: page,
           total,
@@ -867,6 +877,12 @@ export async function runChatGptMcpServer(options: {
       }
       return withClaimedTurn("codex_tool_call", requestId, extra, async claimed => {
         const bound = claimed.environment;
+        if (claimed.imageFactory) assertWebImageToolRouting(wire_name);
+        if (claimed.imageFactory && isImageTool(wire_name)) {
+          if (input !== undefined) throw new Error("Image Factory calls require structured arguments");
+          const response = await callTurnBroker<BrokerToolResult>(options.brokerSocketPath, { method: "invoke", bindingId: claimed.bindingId, wireName: wire_name, arguments: args ?? {} }, 30_000, extra.signal);
+          return asMcpResult(response);
+        }
         const tool = safeVisibleTools(bound, contract)
           .find(candidate => wireName(candidate) === wire_name);
         if (!tool) {
@@ -886,14 +902,14 @@ export async function runChatGptMcpServer(options: {
           return invoke(claimed.bindingId, bound, gateway, {
             input: execGatewayProgram(wire_name, input !== undefined, {
               ...(input !== undefined ? { input } : { arguments: invocationArguments }),
-            }, bound.tools.map(wireName)),
+            }, [...bound.tools.map(wireName), ...(claimed.imageFactory ? [...NATIVE_IMAGE_TOOLS] : [])]),
           }, extra.signal);
         }
         if (tool.freeform) {
           if (input === undefined) throw new Error(`Freeform Codex tool ${wire_name} requires input`);
           if (args && Object.keys(args).length > 0) throw new Error(`Freeform Codex tool ${wire_name} does not accept arguments`);
           return invoke(claimed.bindingId, bound, tool, {
-            input: tool === execGateway(bound) ? transportBoundRawExecProgram(input, wireName(tool)) : input,
+            input: tool === execGateway(bound) ? transportBoundRawExecProgram(input, wireName(tool), claimed.imageFactory ? [...NATIVE_IMAGE_TOOLS] : []) : input,
           }, extra.signal);
         }
         if (input !== undefined) throw new Error(`Function Codex tool ${wire_name} does not accept freeform input`);

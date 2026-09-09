@@ -141,7 +141,7 @@ export class ChatGptLunaCheckpointStream {
   }
 
   /** A missing checkpoint skips the private cache; a present checkpoint still validates strictly. */
-  finishOptional(rawResponseText: string): CompletedChatGptLunaCheckpoint {
+  finishOptional(rawResponseText: string, imageOnly = false): CompletedChatGptLunaCheckpoint {
     if (this.markerSeen) {
       const completed = this.finish(rawResponseText);
       return { ...completed, visibleRemainder: "" };
@@ -151,7 +151,7 @@ export class ChatGptLunaCheckpointStream {
     }
     const visibleRemainder = this.flushVisibleRemainder();
     const answer = canonicalAnswer(this.visibleAnswer);
-    if (!answer) throw new Error("ChatGPT Luna completed without a user-facing answer");
+    if (!answer && !imageOnly) throw new Error("ChatGPT Luna completed without a user-facing answer");
     return { answer, visibleRemainder };
   }
 

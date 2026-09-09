@@ -129,6 +129,42 @@ test("daemon streams browser lifecycle through the real helper process", async (
   }
 });
 
+test("image turns require the Image Factory helper handshake", async () => {
+  const client = new LauncherBrowserHelperClient({
+    appName: "Codex Native",
+    browserHost: "launcher",
+    browserHostDescriptorPath: "/durable/launcher.json",
+    storageStatePath: "/durable/unused-state.json",
+    chromeExecutablePath: "/durable/unused-chrome",
+    turnTimeoutMs: 60_000,
+    headed: true,
+    autoApproveToolCalls: false,
+  });
+  const internal = client as unknown as {
+    ensureChild(): Promise<void>;
+    helperFeatures: Set<string>;
+  };
+  internal.ensureChild = async () => {};
+  internal.helperFeatures = new Set(["progress", "tool-boundary-ack", "completion-fence", "output-artifact-v1"]);
+
+  await expect(client.run({
+    traceId: "image-handshake-123",
+    modelId: "gpt-5.6-sol",
+    reasoning: "high",
+    capabilities: { localToolsEnabled: false, solAvailable: true, proAvailable: false },
+    surface: "persistent",
+    persistentProjectId: "g-p-1234567890abcdef",
+    executionTarget: {
+      output: "image",
+      surface: "persistent",
+      projectId: "g-p-1234567890abcdef",
+      imageSessionId: "session-123",
+    },
+    prepare: async () => ({ text: "generate", images: [], release() {} }),
+    onTextDelta() {},
+  })).rejects.toThrow("update or restart the launcher");
+});
+
 test("accepted compaction retires through the helper as completed without hiding cancellations or errors", async () => {
   const root = mkdtempSync(join(tmpdir(), "codex-helper-compaction-end-"));
   roots.push(root);

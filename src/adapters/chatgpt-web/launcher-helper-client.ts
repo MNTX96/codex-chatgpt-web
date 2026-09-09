@@ -1,11 +1,12 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 import { notifyLauncherTurn, readLauncherBrowserHostDescriptor } from "../../launcher-browser-host";
 import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError } from "./adapter-error";
 import type { CompiledChatGptWebPrompt } from "./prompt";
 import type { BrowserTurn, ResolvedBrowserConfig } from "./browser-worker";
+import type { OutputArtifact } from "./artifacts/types";
 import {
   parseChatGptLunaCheckpoint,
   type ChatGptLunaCheckpoint,
@@ -25,13 +26,14 @@ interface PendingTurn {
 
 type HelperMessage =
   | { type: "ready"; features?: string[] }
-  | { type: "event"; id: string; event: "heartbeat" | "send_activated" | "submitted" | "reasoning" | "commentary" | "text"; text?: string; continuation?: boolean }
+  | { type: "event"; id: string; event: "heartbeat" | "send_activated" | "submitted" | "reasoning" | "commentary" | "text"; text?: string; continuation?: boolean; url?: string }
   | { type: "event"; id: string; event: "tool_batch_observed"; revision: number }
   | { type: "event"; id: string; event: "multipart_stage_acknowledged"; stageIndex: number }
   | { type: "event"; id: string; event: "completion_fence_begin"; requestId: number }
   | { type: "event"; id: string; event: "completion_fence_commit"; requestId: number; revision: number }
   | { type: "event"; id: string; event: "prepared_selected"; reused: boolean }
   | { type: "event"; id: string; event: "luna_checkpoint"; checkpoint: ChatGptLunaCheckpoint; answerHash: string }
+  | { type: "event"; id: string; event: "output_artifact"; artifact: OutputArtifact }
   | { type: "result"; id: string; text: string }
   | {
       type: "error";
@@ -106,8 +108,22 @@ function parseHelperMessage(line: string): HelperMessage {
         answerHash: message.answerHash,
       };
     }
+    if (event === "output_artifact") {
+      const artifact = message.artifact as Partial<OutputArtifact> | undefined;
+      if (!artifact || artifact.kind !== "generated_image" || typeof artifact.id !== "string"
+        || typeof artifact.relativePath !== "string" || typeof artifact.absolutePath !== "string"
+        || !["image/png", "image/jpeg", "image/webp", "image/gif"].includes(String(artifact.mimeType))
+        || !Number.isSafeInteger(artifact.byteLength) || (artifact.byteLength ?? 0) <= 0
+        || typeof artifact.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(artifact.sha256)
+        || artifact.id !== `img_${artifact.sha256}` || !artifact.source
+        || typeof artifact.source.assistantTurnId !== "string" || typeof artifact.source.candidateKey !== "string") {
+        throw new Error("Launcher browser helper output artifact is invalid");
+      }
+      return { type: "event", id: message.id, event, artifact: artifact as OutputArtifact };
+    }
     const text = message.text;
     const continuation = message.continuation;
+    const url = message.url;
     if (event === "prepared_selected") {
       if (typeof message.reused !== "boolean") {
         throw new Error("Launcher browser helper prompt selection is invalid");
@@ -123,12 +139,24 @@ function parseHelperMessage(line: string): HelperMessage {
     if (continuation !== undefined && typeof continuation !== "boolean") {
       throw new Error("Launcher browser helper continuation flag is invalid");
     }
+    if (url !== undefined && (event !== "submitted" || typeof url !== "string")) {
+      throw new Error("Launcher browser helper submission URL is invalid");
+    }
+    if (url !== undefined) {
+      let parsedUrl: URL;
+      try { parsedUrl = new URL(url); }
+      catch { throw new Error("Launcher browser helper submission URL is invalid"); }
+      if (parsedUrl.origin !== "https://chatgpt.com" || parsedUrl.username || parsedUrl.password || parsedUrl.hash) {
+        throw new Error("Launcher browser helper submission URL is invalid");
+      }
+    }
     return {
       type: "event",
       id: message.id,
       event: event as "heartbeat" | "send_activated" | "submitted" | "reasoning" | "commentary" | "text",
       ...(text !== undefined ? { text: text as string } : {}),
       ...(continuation !== undefined ? { continuation: continuation as boolean } : {}),
+      ...(url !== undefined ? { url } : {}),
     };
   }
   if (message.type === "result") {
@@ -227,6 +255,14 @@ export class LauncherBrowserHelperClient {
         "Launcher browser helper does not support the MCP completion fence; update or restart the launcher",
       );
     }
+    if (turn.outputArtifactTarget && !this.helperFeatures.has("output-artifact-v1")) {
+      throw new Error("Launcher browser helper does not support output artifacts; update or restart the launcher");
+    }
+    if (turn.executionTarget?.output === "image" && !this.helperFeatures.has("image-factory-v1")) {
+      throw new Error(
+        "Launcher browser helper does not support Image Factory turns; update or restart the launcher",
+      );
+    }
     return await new Promise<string>((resolveResult, rejectResult) => {
         if (this.pending.has(turn.traceId)) {
           rejectResult(new Error(`Duplicate launcher browser turn: ${turn.traceId}`));
@@ -288,9 +324,15 @@ export class LauncherBrowserHelperClient {
             ...(turn.retainConversation ? { retainConversation: true } : {}),
             ...(turn.requireRetainedConversation ? { requireRetainedConversation: true } : {}),
             ...(turn.conversationKey ? { conversationKey: turn.conversationKey } : {}),
+            ...(turn.surface ? { surface: turn.surface } : {}),
+            ...(turn.persistentProjectId ? { persistentProjectId: turn.persistentProjectId } : {}),
+            ...(turn.executionTarget ? { executionTarget: turn.executionTarget } : {}),
+            ...(turn.skipConnectorIdentity ? { skipConnectorIdentity: true } : {}),
             ...(turn.compaction ? { compaction: true } : {}),
             ...(turn.captureLunaCheckpoint ? { captureLunaCheckpoint: true } : {}),
             ...(turn.externalProgress ? { externalProgress: true } : {}),
+            ...(turn.outputArtifactTarget ? { outputArtifactTarget: turn.outputArtifactTarget, outputArtifactExecutionKey: turn.outputArtifactExecutionKey } : {}),
+            ...(turn.requireOutputArtifact ? { requireOutputArtifact: true } : {}),
           },
         })
           // Only mirror once the run frame is on the wire, so the helper never sees progress for a
@@ -414,6 +456,20 @@ export class LauncherBrowserHelperClient {
     if (!pending) return;
     if (message.type === "event") {
       if (message.event === "heartbeat") pending.turn.onHeartbeat?.();
+      else if (message.event === "output_artifact") {
+        const target = pending.turn.outputArtifactTarget;
+        const artifact = message.artifact;
+        const outsideTarget = !target || (() => {
+          const result = relative(resolve(target.outputDirectory), resolve(artifact.absolutePath));
+          return result.startsWith(`..${sep}`) || result === "..";
+        })();
+        const expectedRelative = target ? relative(resolve(target.workspaceRoot), resolve(artifact.absolutePath)).replaceAll("\\", "/") : "";
+        if (outsideTarget || artifact.relativePath !== expectedRelative) {
+          this.abortWithLocalFailure(message.id, new Error("Launcher browser helper artifact path is outside its trusted target"), pending);
+          return;
+        }
+        pending.turn.onOutputArtifact?.(artifact);
+      }
       else if (message.event === "tool_batch_observed") {
         const progress = pending.turn.externalProgress;
         if (!progress) {
@@ -488,7 +544,7 @@ export class LauncherBrowserHelperClient {
           pending,
         ));
       }
-      else if (message.event === "submitted") pending.turn.onSubmitted?.();
+      else if (message.event === "submitted") pending.turn.onSubmitted?.(message.url);
       else if (message.event === "multipart_stage_acknowledged") {
         const multipart = pending.prepared?.multipart;
         if (!multipart

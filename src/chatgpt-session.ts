@@ -2,6 +2,7 @@ import type { Locator, Page } from "playwright-core";
 import type { ChatGptWebAccountCapabilities } from "./chatgpt-web-models";
 
 export const CHATGPT_TEMPORARY_CHAT_URL = "https://chatgpt.com/?temporary-chat=true";
+export const CHATGPT_PERSISTENT_CHAT_URL = "https://chatgpt.com/";
 export const CHATGPT_COMPOSER_SELECTOR = [
   '[data-testid="prompt-textarea"]',
   "#prompt-textarea",
@@ -174,6 +175,23 @@ export async function assertTemporaryChatPage(page: Page): Promise<void> {
   if (url.origin !== expected.origin || url.pathname !== expected.pathname || url.searchParams.get("temporary-chat") !== "true") {
     throw new Error(`ChatGPT left the isolated Temporary Chat surface (${page.url()})`);
   }
+}
+
+/** Validate a normal authenticated ChatGPT page without weakening Temporary Chat validation. */
+export async function assertPersistentChatPage(
+  page: Page,
+  projectId?: string,
+): Promise<void> {
+  const url = new URL(page.url());
+  if (url.origin !== "https://chatgpt.com" || url.searchParams.get("temporary-chat") === "true") {
+    throw new Error("ChatGPT persistent surface is not a normal authenticated chat page");
+  }
+  if (projectId && !url.pathname.includes(`/g/${projectId}`)) {
+    throw new Error("ChatGPT persistent surface is outside the configured Image Factory project");
+  }
+  await assertAuthenticatedChatGptPage(page);
+  const composer = page.locator(CHATGPT_COMPOSER_SELECTOR).filter({ visible: true });
+  if (await composer.count() !== 1) throw new Error("ChatGPT persistent surface has no authenticated composer");
 }
 
 export async function detectChatGptAccountCapabilities(

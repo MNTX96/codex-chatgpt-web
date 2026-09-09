@@ -42,6 +42,11 @@ Codex keeps the native task, context lifecycle, UI, and tool harness. The local 
 routes only the selected model task through a task-bound ChatGPT Temporary Chat; in full mode, MCP
 connects ChatGPT back to the tools of that same Codex task until its next compaction boundary.
 
+In automatic Full mode, image requests use the bridge's Image Factory tools. The parent text/vision
+turn remains in Temporary Chat; the image child runs in a regular ChatGPT conversation inside the
+Project-only-memory `Image Factory` project and saves verified artifacts in the workspace. This uses
+the signed-in ChatGPT account's image availability and limits and does not add an Images model.
+
 > [!TIP]
 > I also built **[ChatGPT Persona Voice](https://github.com/miuuyy/ChatGPT-Persona-Voice)**, a local
 > app that changes the ChatGPT/Codex voice in near real time. It never touches your account, browser
