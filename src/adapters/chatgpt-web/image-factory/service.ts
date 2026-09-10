@@ -36,8 +36,31 @@ export interface ImageFactoryParent {
 }
 interface LiveJob { job: StoredImageJob; abort: AbortController; done: Promise<void> }
 
+function shortImageJobId(value: string | undefined): string | undefined {
+  return value ? `${value.slice(0, 12)}…` : undefined;
+}
+
+function imageFactoryJobLog(
+  event: string,
+  fields: Record<string, string | number | boolean | undefined> = {},
+): void {
+  console.info(`[chatgpt-web] image-factory.job ${event} ${JSON.stringify(fields)}`);
+}
+
 /** Jobs execute locally in the bridge, never as unknown outer Codex tool calls. */
 export class ImageFactoryService {
+  private static readonly sharedServices = new Map<string, ImageFactoryService>();
+
+  static shared(directory: string, namespace: string, create: () => ImageFactoryService): ImageFactoryService {
+    const key = imageKey(resolve(directory), namespace);
+    let service = this.sharedServices.get(key);
+    if (!service) {
+      service = create();
+      this.sharedServices.set(key, service);
+    }
+    return service;
+  }
+
   private readonly live = new Map<string, LiveJob>();
   private capacityReservations = 0;
   constructor(
@@ -57,6 +80,11 @@ export class ImageFactoryService {
     const stored = this.live.get(key)?.job ?? this.store.read<StoredImageJob>("job", key);
     if (!stored || stored.owner !== owner) throw new ImageFactoryError("image_job_unavailable");
     const live = this.live.get(key);
+    imageFactoryJobLog("wait_or_cancel_requested", {
+      tool: name,
+      jobId: shortImageJobId(jobId),
+      live: Boolean(live),
+    });
     if (name === "chatgpt_image_cancel" && live) live.abort.abort(new ImageFactoryError("image_cancelled"));
     if (live) {
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -85,6 +113,12 @@ export class ImageFactoryService {
         existing.phase = "terminal";
         this.store.write("job", key, existing);
       }
+      imageFactoryJobLog("idempotent_replay", {
+        jobId: shortImageJobId(existing.result.jobId),
+        imageSessionId: shortImageJobId(existing.result.imageSessionId),
+        status: existing.result.status,
+        phase: existing.phase,
+      });
       return structuredClone(existing.result);
     }
     const target = resolveOutputArtifactTarget(parent.environment, key, { capturePolicy: "required" });
@@ -97,25 +131,36 @@ export class ImageFactoryService {
     if (input.image_session_id && (!session || session.owner !== owner)) throw new ImageFactoryError("image_session_unavailable");
     if ([...this.live.values()].some(value => value.job.owner === owner && value.job.result.imageSessionId === sessionId)) throw new ImageFactoryError("image_session_busy");
     session ??= { id: sessionId, owner, updatedAt: Date.now() };
-    this.store.write("session", sessionKey, session);
     const job: StoredImageJob = { key, owner, payloadHash, input, phase: "prepared", updatedAt: Date.now(), result: { jobId, imageSessionId: sessionId, status: "running", artifacts: [] } };
-    this.store.write("job", key, job);
+    const endActivity = parent.activity();
+    try {
+      parent.signal.throwIfAborted();
+      this.store.write("session", sessionKey, session);
+      this.store.write("job", key, job);
+    } catch (error) {
+      endActivity();
+      throw error;
+    }
     this.capacityReservations += 1;
+    imageFactoryJobLog("accepted", {
+      jobId: shortImageJobId(jobId),
+      imageSessionId: shortImageJobId(sessionId),
+      referenceImages: images.length,
+      capacityReservations: this.capacityReservations,
+    });
     const abort = new AbortController();
     const onParentAbort = () => abort.abort(parent.signal.reason);
     parent.signal.addEventListener("abort", onParentAbort, { once: true });
-    let endActivity: () => void;
-    try {
-      endActivity = parent.activity();
-    } catch (error) {
-      this.capacityReservations = Math.max(0, this.capacityReservations - 1);
-      parent.signal.removeEventListener("abort", onParentAbort);
-      throw error;
-    }
     let deadline: ReturnType<typeof setTimeout> | undefined;
     const save = () => { job.updatedAt = Date.now(); this.store.write("job", key, job); };
     deadline = setTimeout(() => abort.abort(new ImageFactoryError("image_setup_timeout")), IMAGE_FACTORY_TIMEOUTS.setup);
+    imageFactoryJobLog("execution_started", {
+      jobId: shortImageJobId(jobId),
+      imageSessionId: shortImageJobId(sessionId),
+      phase: job.phase,
+    });
     const done = Promise.resolve().then(async () => {
+      abort.signal.throwIfAborted();
       const result = await this.execute({
         request: { stateDirectory: this.store.directory, session: session!, jobId, jobKey: key, sourceTurnId: parent.threadId },
         prompt: input.prompt, images, target, signal: abort.signal,
@@ -125,6 +170,11 @@ export class ImageFactoryService {
           session = update.session;
           this.store.write("session", sessionKey, session);
           if (update.phase) job.phase = update.phase;
+          imageFactoryJobLog("phase_changed", {
+            jobId: shortImageJobId(jobId),
+            imageSessionId: shortImageJobId(sessionId),
+            phase: job.phase,
+          });
           if (update.phase === "submitted") {
             if (deadline) clearTimeout(deadline);
             deadline = setTimeout(() => abort.abort(new ImageFactoryError("image_generation_timeout")), IMAGE_FACTORY_TIMEOUTS.generation);
@@ -135,16 +185,35 @@ export class ImageFactoryService {
       abort.signal.throwIfAborted();
       if (!result.artifacts.length && result.status === "completed") throw new ImageFactoryError("image_not_generated");
       Object.assign(job.result, result);
+      imageFactoryJobLog("execution_completed", {
+        jobId: shortImageJobId(jobId),
+        imageSessionId: shortImageJobId(sessionId),
+        status: result.status,
+        artifacts: result.artifacts.length,
+      });
     }).catch(error => {
       const reason = abort.signal.aborted ? abort.signal.reason : error;
       const timedOut = reason instanceof ImageFactoryError && reason.code.endsWith("_timeout");
       job.result.status = abort.signal.aborted && !timedOut ? "cancelled" : "failed";
       job.result.error = { code: reason instanceof ImageFactoryError ? reason.code : "image_generation_failed", message: reason instanceof ImageFactoryError ? reason.message : "Image Factory could not complete this job; no native image tool was called." };
+      imageFactoryJobLog("execution_failed", {
+        jobId: shortImageJobId(jobId),
+        imageSessionId: shortImageJobId(sessionId),
+        status: job.result.status,
+        errorCode: job.result.error.code,
+      });
     }).finally(() => {
       if (deadline) clearTimeout(deadline);
       parent.signal.removeEventListener("abort", onParentAbort);
       job.phase = "terminal";
       try { save(); } finally { this.live.delete(key); this.capacityReservations = Math.max(0, this.capacityReservations - 1); endActivity(); }
+      imageFactoryJobLog("terminal", {
+        jobId: shortImageJobId(jobId),
+        imageSessionId: shortImageJobId(sessionId),
+        status: job.result.status,
+        phase: job.phase,
+        capacityReservations: this.capacityReservations,
+      });
     });
     this.live.set(key, { job, abort, done });
     // A journal failure remains observed even if the caller never polls again.

@@ -1,22 +1,29 @@
 import type { Locator } from "playwright-core";
 import type { OutputImageCandidate } from "../types";
 
+export const CHATGPT_GENERATED_IMAGE_CARD_SELECTOR = '[id^="image-"][class*="imagegen-image"]';
+
 /** Finds only ChatGPT's image-generation cards within the assistant turn bound by the worker. */
 export async function detectOutputImages(responseTurn: Locator): Promise<OutputImageCandidate[]> {
-  return await responseTurn.evaluate(root => {
-    const cards = [...root.querySelectorAll<HTMLElement>(".group\\/imagegen-image[id^='image-']")];
+  return await responseTurn.evaluate((root, cardSelector) => {
+    const cards = Array.from(root.querySelectorAll<HTMLElement>(cardSelector));
     return cards.flatMap((card, index) => {
-      const image = [...card.querySelectorAll<HTMLImageElement>("img")]
-        .find(candidate => candidate.currentSrc || candidate.src);
-      if (!image) return [];
+      // The image card and response actions can be committed before Electron's hidden view
+      // hydrates/lazy-loads the preview source. Card presence is still generated-image evidence;
+      // keep source/readiness separate so completion can hand the card to the capture stage.
+      const images = Array.from(card.querySelectorAll<HTMLImageElement>("img"));
+      const image = images.find(candidate => candidate.currentSrc || candidate.src) ?? images[0];
       const key = card.id || `image-card-${index}`;
-      const source = image.currentSrc || image.src;
-      const downloadAction = [...card.querySelectorAll<HTMLElement>("button, a")].some(control => {
+      const source = image ? (image.currentSrc || image.src) : "";
+      const downloadAction = Array.from(card.querySelectorAll<HTMLElement>("button, a")).some(control => {
         const label = [control.getAttribute("aria-label"), control.getAttribute("title"), control.textContent]
           .filter(Boolean).join(" ");
         return /\bdownload\b|original/i.test(label);
       });
-      const originalHref = [...card.querySelectorAll<HTMLAnchorElement>("a[href]")]
+      const originalHref = Array.from(card.querySelectorAll<HTMLAnchorElement>("a[href]"))
+        .filter(anchor => anchor.hasAttribute("download") || /\bdownload\b|original/i.test([
+          anchor.getAttribute("aria-label"), anchor.getAttribute("title"), anchor.textContent,
+        ].filter(Boolean).join(" ")))
         .map(anchor => anchor.href)
         .find(href => /^https:\/\//i.test(href));
       return [{
@@ -24,12 +31,14 @@ export async function detectOutputImages(responseTurn: Locator): Promise<OutputI
         imageSrc: source || undefined,
         ...(originalHref ? { originalHref } : {}),
         ...(downloadAction ? { downloadAction: true } : {}),
-        width: image.naturalWidth || undefined,
-        height: image.naturalHeight || undefined,
-        readiness: image.complete && image.naturalWidth > 0 ? "ready" : image.complete ? "error" : "loading",
+        width: image?.naturalWidth || undefined,
+        height: image?.naturalHeight || undefined,
+        readiness: source && image?.complete && image.naturalWidth > 0
+          ? "ready"
+          : source && image?.complete ? "error" : "loading",
       }];
     });
-  });
+  }, CHATGPT_GENERATED_IMAGE_CARD_SELECTOR);
 }
 
 /** A safe signature for completion detection. It intentionally never exposes source URLs. */

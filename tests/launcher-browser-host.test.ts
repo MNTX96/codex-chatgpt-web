@@ -14,6 +14,7 @@ import {
   inspectLauncherBrowserHostLiveness,
   notifyLauncherTurn,
   markLauncherManualTurnStarted,
+  readLauncherImageFactoryProjectId,
   readLauncherBrowserHostDescriptor,
   releaseLauncherRetainedConversation,
   selectLauncherPage,
@@ -22,6 +23,8 @@ import {
   waitForLauncherManualTerminal,
 } from "../src/launcher-browser-host";
 import type { Browser, BrowserContext, Page } from "playwright-core";
+import { assertLauncherImageDownloadSupport, beginLauncherImageDownload } from "../src/adapters/chatgpt-web/artifacts/image/download-transaction";
+import { ImageTransferDeadline } from "../src/adapters/chatgpt-web/image-transfer";
 
 const roots: string[] = [];
 
@@ -76,6 +79,82 @@ test("launcher descriptor is owner-only, loopback-only, and process-bound", () =
     expect(() => readLauncherBrowserHostDescriptor(path)).toThrow("unsafe permissions");
   }
 });
+
+test("image download preflight requires a supported launcher before browser work", () => {
+  const path = descriptorFile();
+  expect(() => assertLauncherImageDownloadSupport(path)).toThrow("image_download_runtime_unavailable");
+  const descriptor = JSON.parse(readFileSync(path, "utf8"));
+  descriptor.features = ["owned-image-download-v1"];
+  writeFileSync(path, JSON.stringify(descriptor));
+  expect(assertLauncherImageDownloadSupport(path).features).toContain("owned-image-download-v1");
+});
+
+test("Image Factory project id is read live from the launcher control channel", async () => {
+  let projectId: string | null = null;
+  const server = createServer(async (request, response) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(Buffer.from(chunk));
+    expect(request.url).toBe("/v1/image-factory/config");
+    expect(request.headers.authorization).toBe("Bearer launcher-control-token-0123456789abcdefghijklmnop");
+    expect(JSON.parse(Buffer.concat(chunks).toString("utf8"))).toEqual({});
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(`${JSON.stringify({ ok: true, projectId })}\n`);
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  try {
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("test server has no port");
+    const path = descriptorFile(`http://127.0.0.1:${address.port}`);
+    await expect(readLauncherImageFactoryProjectId(path)).resolves.toBeNull();
+    projectId = "custom-project-id";
+    await expect(readLauncherImageFactoryProjectId(path)).resolves.toBe("custom-project-id");
+    projectId = "next-project-id";
+    await expect(readLauncherImageFactoryProjectId(path)).resolves.toBe("next-project-id");
+  } finally {
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+for (const phase of ["attach", "target"] as const) {
+  test(`image download cancellation bounds CDP ${phase} observation and detaches its session`, async () => {
+    const path = descriptorFile();
+    const descriptor = JSON.parse(readFileSync(path, "utf8"));
+    descriptor.features = ["owned-image-download-v1"];
+    writeFileSync(path, JSON.stringify(descriptor));
+    const parent = new AbortController();
+    const budget = new ImageTransferDeadline(undefined, parent.signal);
+    const reason = new Error("cancel target verification");
+    let markStarted!: () => void;
+    const started = new Promise<void>(resolve => { markStarted = resolve; });
+    let markDetached!: () => void;
+    const detached = new Promise<void>(resolve => { markDetached = resolve; });
+    let detachCount = 0;
+    const session = {
+      send() { markStarted(); return new Promise<never>(() => {}); },
+      async detach() { detachCount++; markDetached(); },
+    };
+    let resolveLate!: (value: typeof session) => void;
+    const page = { context: () => ({
+      newCDPSession: () => phase === "target" ? Promise.resolve(session) : new Promise<typeof session>(resolve => {
+        resolveLate = resolve; markStarted();
+      }),
+    }) } as unknown as Page;
+    try {
+      const outcome = beginLauncherImageDownload({ page, owner: {
+        descriptorPath: path, traceId: "fixture-cdp", helperPid: process.pid,
+        surfaceId: descriptor.surfaceId, jobId: "fixture-cdp-job",
+      }, candidateKey: "image-1", maxBytes: 1_000, budget, log() {} }).then(() => undefined, error => error);
+      await started; parent.abort(reason);
+      expect(await outcome).toBe(reason);
+      if (phase === "attach") resolveLate(session);
+      await detached;
+      expect(detachCount).toBe(1);
+    } finally { budget.dispose(); }
+  });
+}
 
 test("launcher turn control sends authenticated lifecycle events", async () => {
   let received: { authorization?: string; body?: unknown } = {};

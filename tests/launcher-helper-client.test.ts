@@ -165,6 +165,29 @@ test("image turns require the Image Factory helper handshake", async () => {
   })).rejects.toThrow("update or restart the launcher");
 });
 
+test("image and required-artifact turns reject an old transfer helper before preparing a prompt", async () => {
+  const client = new LauncherBrowserHelperClient({
+    appName: "Codex Native", browserHost: "launcher", browserHostDescriptorPath: "/unused/launcher.json",
+    storageStatePath: "/unused/state.json", chromeExecutablePath: "/unused/chrome",
+    turnTimeoutMs: 60_000, headed: true, autoApproveToolCalls: false,
+  });
+  const internal = client as unknown as { ensureChild(): Promise<void>; helperFeatures: Set<string> };
+  internal.ensureChild = async () => {};
+  internal.helperFeatures = new Set(["image-factory-v1", "output-artifact-v1"]);
+  let preparations = 0;
+  for (const image of [true, false]) {
+    await expect(client.run({
+      traceId: "transfer-handshake", modelId: "gpt-5.6-sol", reasoning: "high",
+      capabilities: { localToolsEnabled: false, solAvailable: true, proAvailable: false },
+      ...(image ? { executionTarget: { output: "image" as const, surface: "persistent" as const,
+        projectId: "g-p-1234567890abcdef", imageSessionId: "session-123" } } : { requireOutputArtifact: true }),
+      prepare: async () => { preparations++; return { text: "generate", images: [], release() {} }; },
+      onTextDelta() {},
+    })).rejects.toThrow("image-transfer-v1");
+  }
+  expect(preparations).toBe(0);
+});
+
 test("accepted compaction retires through the helper as completed without hiding cancellations or errors", async () => {
   const root = mkdtempSync(join(tmpdir(), "codex-helper-compaction-end-"));
   roots.push(root);

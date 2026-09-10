@@ -1,20 +1,19 @@
 export type Language = "en" | "zh-CN" | "ja";
 export type LauncherProfile = "production" | "development";
 export type BrowserInteractionMode = "automatic" | "manual";
-export type Surface = "browser" | "setup" | "mcp" | "activity" | "settings";
+export type Surface = "browser" | "setup" | "image-factory" | "mcp" | "activity" | "settings";
 
 export interface LauncherState {
   version: 1;
   language: Language | null;
   onboardingComplete: boolean;
-  githubOpened: boolean;
-  xOpened: boolean;
   autoStart: boolean;
   keepRunningOnClose: boolean;
   showBrowserDuringTurns: boolean;
   browserInteractionMode: BrowserInteractionMode;
   experimentalBiggerContext: boolean;
   zeroRiskProEnabled: boolean;
+  imageFactoryProjectId: string | null;
   sidebarOpen: boolean;
   sidebarWidth: number;
   browserSmokePassed?: boolean;
@@ -102,11 +101,10 @@ export interface LauncherSnapshot {
   browser: BrowserState | null;
   connectorName: string;
   connectorNames: Record<BrowserInteractionMode, string>;
+  imageFactoryProjectId: string | null;
   mcpCredentialsConfigured: boolean;
   logs: LogRecord[];
   urls: {
-    github: string;
-    x: string;
     connectors: string;
     tunnels: string;
     keys: string;
@@ -122,7 +120,6 @@ export interface LauncherSnapshot {
 export interface LauncherApi {
   snapshot(): Promise<LauncherSnapshot>;
   setLanguage(language: Language): Promise<LauncherState>;
-  openSocial(target: "github" | "x"): Promise<LauncherState>;
   completeOnboarding(language: Language, browserInteractionMode: BrowserInteractionMode): Promise<LauncherState>;
   openExternal(url: string): Promise<boolean>;
   setBrowserBounds(bounds: { x: number; y: number; width: number; height: number }): Promise<boolean>;
@@ -146,6 +143,7 @@ export interface LauncherApi {
   cancelTurns(): Promise<{ stdout: string }>;
   uninstallIntegration(): Promise<{ cancelled: true } | { cancelled: false; state: LauncherState }>;
   setupCore(): Promise<{ ok: boolean; stdout: string; restartRequired: boolean }>;
+  setImageFactoryProjectId(projectId: string | null): Promise<LauncherSnapshot>;
   setupMcp(input: {
     tunnelId?: string;
     runtimeKey?: string;

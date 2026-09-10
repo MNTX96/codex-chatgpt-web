@@ -1,12 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
 import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { extensionForImageMime, imageDimensions } from "./image/image-sniffer";
 import type { OutputArtifactTarget, OutputImageArtifact, OutputImageMime } from "./types";
 
 function inside(child: string, parent: string): boolean {
   const value = relative(resolve(parent), resolve(child));
-  return value === "" || (!value.startsWith(`..${sep}`) && value !== "..");
+  return value === "" || (!value.startsWith(`..${sep}`) && value !== ".." && !isAbsolute(value));
 }
 
 function assertSafeDirectory(directory: string, target: OutputArtifactTarget): void {

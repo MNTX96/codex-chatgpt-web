@@ -130,6 +130,7 @@ export function App() {
             operation={operation}
             setError={setError}
             snapshot={snapshot}
+            updateSnapshot={(next) => setSnapshot(next)}
             updateState={updateState}
           />
         )}
@@ -152,7 +153,7 @@ function Onboarding({
   snapshot: LauncherSnapshot;
   updateState: (state: LauncherState) => void;
 }) {
-  const [stage, setStage] = useState<"language" | "interaction" | "support">(
+  const [stage, setStage] = useState<"language" | "interaction">(
     snapshot.state.language ? "interaction" : "language",
   );
   const [selectedLanguage, setSelectedLanguage] = useState<Language>(language);
@@ -163,7 +164,7 @@ function Onboarding({
   const localized = copyFor(selectedLanguage);
   const isLanguage = stage === "language";
   const isInteraction = stage === "interaction";
-  const stageIndex = isLanguage ? 0 : isInteraction ? 1 : 2;
+  const stageIndex = isLanguage ? 0 : 1;
 
   const chooseLanguage = async () => {
     setBusy(true);
@@ -171,18 +172,6 @@ function Onboarding({
     try {
       updateState(await api!.setLanguage(selectedLanguage));
       setStage("interaction");
-    } catch (cause) {
-      setError(messageOf(cause));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const openSocial = async (target: "github" | "x") => {
-    setBusy(true);
-    setError(null);
-    try {
-      updateState(await api!.openSocial(target));
     } catch (cause) {
       setError(messageOf(cause));
     } finally {
@@ -229,12 +218,8 @@ function Onboarding({
           transition={PANEL_TRANSITION}
         >
           <span className="welcome-kicker">0{stageIndex + 1}</span>
-          <h1>{isLanguage
-            ? localized.chooseLanguage
-            : isInteraction ? localized.interactionMode : localized.supportTitle}</h1>
-          <p>{isLanguage
-            ? localized.chooseLanguageHint
-            : isInteraction ? localized.interactionModeOnboardingBody : localized.supportBody}</p>
+          <h1>{isLanguage ? localized.chooseLanguage : localized.interactionMode}</h1>
+          <p>{isLanguage ? localized.chooseLanguageHint : localized.interactionModeOnboardingBody}</p>
 
           {isLanguage ? (
             <div className="welcome-options" role="radiogroup" aria-label={localized.chooseLanguage}>
@@ -260,7 +245,7 @@ function Onboarding({
                 onClick={() => setSelectedLanguage("ja")}
               />
             </div>
-          ) : isInteraction ? (
+          ) : (
             <InteractionModePicker
               className="welcome-interaction-mode-picker"
               copy={localized}
@@ -268,23 +253,6 @@ function Onboarding({
               mode={selectedInteractionMode}
               onChange={setSelectedInteractionMode}
             />
-          ) : (
-            <div className="welcome-options">
-              <WelcomeAction
-                complete={snapshot.state.githubOpened}
-                disabled={busy}
-                icon="github"
-                label={snapshot.state.githubOpened ? localized.starred : localized.star}
-                onClick={() => openSocial("github")}
-              />
-              <WelcomeAction
-                complete={snapshot.state.xOpened}
-                disabled={busy}
-                icon="x"
-                label={snapshot.state.xOpened ? localized.followed : localized.follow}
-                onClick={() => openSocial("x")}
-              />
-            </div>
           )}
         </motion.section>
       </AnimatePresence>
@@ -301,8 +269,8 @@ function Onboarding({
             </button>
           ) : null}
         </div>
-        <div className="welcome-progress" aria-label={`${stageIndex + 1} / 3`}>
-          {[0, 1, 2].map(index => (
+        <div className="welcome-progress" aria-label={`${stageIndex + 1} / 2`}>
+          {[0, 1].map(index => (
             <span
               className={index < stageIndex ? "is-complete" : index === stageIndex ? "is-active" : ""}
               key={index}
@@ -310,12 +278,12 @@ function Onboarding({
           ))}
         </div>
         <PrimaryButton
-          disabled={busy || (stage === "support" && (!snapshot.state.githubOpened || !snapshot.state.xOpened))}
+          disabled={busy}
           onClick={isLanguage
             ? chooseLanguage
-            : isInteraction ? () => setStage("support") : finish}
+            : finish}
         >
-          {stage === "support" ? localized.finishWelcome : localized.continue}
+          {isInteraction ? localized.finishWelcome : localized.continue}
         </PrimaryButton>
       </footer>
     </motion.main>
@@ -330,6 +298,7 @@ function LauncherShell({
   operation,
   setError,
   snapshot,
+  updateSnapshot,
   updateState,
 }: {
   browser: BrowserState | null;
@@ -339,6 +308,7 @@ function LauncherShell({
   operation: OperationState | null;
   setError: (error: string | null) => void;
   snapshot: LauncherSnapshot;
+  updateSnapshot: (snapshot: LauncherSnapshot) => void;
   updateState: (state: LauncherState) => void;
 }) {
   const interactionSetupComplete = snapshot.state.coreSetupComplete === true
@@ -357,16 +327,9 @@ function LauncherShell({
   const [sessionReminderBusy, setSessionReminderBusy] = useState(false);
   const [sessionReminderDue, setSessionReminderDue] = useState(false);
   const [mcpTargetMode, setMcpTargetMode] = useState<BrowserInteractionMode | null>(null);
-  const [biggerContextRecommendationOpen, setBiggerContextRecommendationOpen] = useState(
-    snapshot.state.browserInteractionMode === "automatic"
-      && snapshot.state.coreSetupComplete === true
-      && !snapshot.state.experimentalBiggerContext,
-  );
-  const [biggerContextRecommendationBusy, setBiggerContextRecommendationBusy] = useState(false);
   const browserSlotRef = useCallback((node: HTMLDivElement | null) => setBrowserSlot(node), []);
   const browserSurfaceActive = surface === "browser"
-    && !(compactSidebar && sidebarOpen)
-    && !biggerContextRecommendationOpen;
+    && !(compactSidebar && sidebarOpen);
   const needsBrowser = snapshot.state.browserInteractionMode === "automatic"
     && browser?.authenticated !== true;
   const needsSetup = !needsBrowser && !interactionSetupComplete;
@@ -379,16 +342,9 @@ function LauncherShell({
   const selectedManualTab = browser?.tabs.find(tab => tab.active && tab.interactionMode === "manual");
 
   useEffect(() => {
-    if (snapshot.state.browserInteractionMode === "manual") {
-      setBiggerContextRecommendationOpen(false);
-    }
-  }, [snapshot.state.browserInteractionMode]);
-
-  useEffect(() => {
     if (!selectedManualTab) return;
     setSurface("browser");
     setSidebarOpen(false);
-    setBiggerContextRecommendationOpen(false);
     void api!.setBrowserSurfaceActive(true).catch((cause) => setError(messageOf(cause)));
   }, [selectedManualTab?.id, selectedManualTab?.manualState, setError]);
 
@@ -515,19 +471,6 @@ function LauncherShell({
     }
   };
 
-  const setRecommendedBiggerContext = async (enabled: boolean) => {
-    if (biggerContextRecommendationBusy) return;
-    setBiggerContextRecommendationBusy(true);
-    setError(null);
-    try {
-      updateState(await api!.setBiggerContext(enabled));
-    } catch (cause) {
-      setError(messageOf(cause));
-    } finally {
-      setBiggerContextRecommendationBusy(false);
-    }
-  };
-
   return (
     <motion.main
       animate={{ opacity: 1 }}
@@ -565,18 +508,6 @@ function LauncherShell({
                 <strong>{copy.product}</strong>
                 {devProfile ? <em className="dev-profile-badge">{copy.devBadge}</em> : null}
               </div>
-              <div className="sidebar-brand-actions">
-                <IconButton
-                  icon="github"
-                  label="GitHub"
-                  onClick={() => void api!.openExternal(snapshot.urls.github).catch((cause) => setError(messageOf(cause)))}
-                />
-                <IconButton
-                  icon="x"
-                  label="X"
-                  onClick={() => void api!.openExternal(snapshot.urls.x).catch((cause) => setError(messageOf(cause)))}
-                />
-              </div>
             </div>
 
             <nav className="sidebar-nav" aria-label={copy.workspace}>
@@ -600,6 +531,12 @@ function LauncherShell({
                   icon="setup"
                   label={copy.setup}
                   onClick={() => navigateSurface("setup")}
+                />
+                <SidebarItem
+                  active={surface === "image-factory"}
+                  icon="setup"
+                  label={copy.imageFactory}
+                  onClick={() => navigateSurface("image-factory")}
                 />
                 <SidebarItem
                   active={surface === "mcp"}
@@ -676,6 +613,14 @@ function LauncherShell({
                 updateState={updateState}
               />
             ) : null}
+            {surface === "image-factory" ? (
+              <ImageFactorySurface
+                copy={copy}
+                setError={setError}
+                snapshot={snapshot}
+                updateSnapshot={updateSnapshot}
+              />
+            ) : null}
             {surface === "mcp" ? (
               <McpSurface
                 copy={copy}
@@ -714,19 +659,7 @@ function LauncherShell({
       </section>
 
       <AnimatePresence>
-        {biggerContextRecommendationOpen ? (
-          <BiggerContextRecommendation
-            busy={biggerContextRecommendationBusy || operation?.status === "running"}
-            checked={snapshot.state.experimentalBiggerContext}
-            copy={copy}
-            onChange={(enabled) => void setRecommendedBiggerContext(enabled)}
-            onClose={() => setBiggerContextRecommendationOpen(false)}
-          />
-        ) : null}
-      </AnimatePresence>
-
-      <AnimatePresence>
-        {sessionReminderDue && !biggerContextRecommendationOpen ? (
+        {sessionReminderDue ? (
           <SessionRefreshReminder
             busy={sessionReminderBusy}
             copy={copy}
@@ -1220,6 +1153,70 @@ function SetupSurface({
         <em>{snapshot.state.mcpSetupComplete ? copy.mcpReady : copy.configureMcp}</em>
         <Icon name="chevron" />
       </button>
+    </ContentSurface>
+  );
+}
+
+function ImageFactorySurface({
+  copy,
+  setError,
+  snapshot,
+  updateSnapshot,
+}: {
+  copy: Copy;
+  setError: (error: string | null) => void;
+  snapshot: LauncherSnapshot;
+  updateSnapshot: (snapshot: LauncherSnapshot) => void;
+}) {
+  const [projectId, setProjectId] = useState(snapshot.imageFactoryProjectId ?? "");
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    setProjectId(snapshot.imageFactoryProjectId ?? "");
+  }, [snapshot.imageFactoryProjectId]);
+
+  const save = async () => {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const next = await api!.setImageFactoryProjectId(projectId.trim() || null);
+      updateSnapshot(next);
+      setProjectId(next.imageFactoryProjectId ?? "");
+    } catch (cause) {
+      setError(messageOf(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <ContentSurface
+      subtitle={copy.imageFactorySubtitle}
+      title={copy.imageFactoryTitle}
+    >
+      <SectionHeading label={copy.imageFactoryProject} />
+      <p className="section-copy">{copy.imageFactoryProjectHelp}</p>
+      <div className="field-list">
+        <FieldRow label={copy.imageFactoryProjectId}>
+          <input
+            autoCapitalize="none"
+            autoCorrect="off"
+            onChange={(event) => setProjectId(event.target.value)}
+            placeholder="g-p-6aa1eeecf4e88191843bc929b28c3c7a"
+            spellCheck={false}
+            value={projectId}
+          />
+        </FieldRow>
+      </div>
+      <div className="inline-actions">
+        <PrimaryButton disabled={busy} onClick={() => void save()}>
+          {busy ? copy.imageFactorySaving : copy.imageFactorySave}
+        </PrimaryButton>
+      </div>
+      <NoticeRow icon={snapshot.imageFactoryProjectId ? "check" : "alert"} tone={snapshot.imageFactoryProjectId ? "success" : "warning"}>
+        {snapshot.imageFactoryProjectId ? copy.imageFactoryConfigured : copy.imageFactoryNotConfigured}
+      </NoticeRow>
     </ContentSurface>
   );
 }
@@ -2184,33 +2181,6 @@ function WelcomeOption({
   );
 }
 
-function WelcomeAction({
-  complete,
-  disabled,
-  icon,
-  label,
-  onClick,
-}: {
-  complete: boolean;
-  disabled?: boolean;
-  icon: "github" | "x";
-  label: string;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      className={`welcome-option is-social${complete ? " is-complete" : ""}`}
-      disabled={disabled}
-      onClick={onClick}
-      type="button"
-    >
-      <span><Icon name={icon} /></span>
-      <strong>{label}</strong>
-      <Icon name={complete ? "check" : "external"} />
-    </button>
-  );
-}
-
 function PrimaryButton({
   children,
   disabled = false,
@@ -2426,59 +2396,6 @@ function SessionRefreshReminder({
         </button>
       </div>
     </motion.aside>
-  );
-}
-
-function BiggerContextRecommendation({
-  busy,
-  checked,
-  copy,
-  onChange,
-  onClose,
-}: {
-  busy: boolean;
-  checked: boolean;
-  copy: Copy;
-  onChange: (checked: boolean) => void;
-  onClose: () => void;
-}) {
-  return (
-    <motion.div
-      animate={{ opacity: 1 }}
-      aria-describedby="bigger-context-recommendation-body"
-      aria-labelledby="bigger-context-recommendation-title"
-      aria-modal="true"
-      className="bigger-context-recommendation-backdrop"
-      exit={{ opacity: 0 }}
-      initial={{ opacity: 0 }}
-      role="dialog"
-      transition={{ duration: 0.18 }}
-    >
-      <motion.section
-        animate={{ opacity: 1, scale: 1, y: 0 }}
-        className="bigger-context-recommendation"
-        exit={{ opacity: 0, scale: 0.98, y: 6 }}
-        initial={{ opacity: 0, scale: 0.98, y: 8 }}
-        transition={PANEL_TRANSITION}
-      >
-        <header className="bigger-context-recommendation-header">
-          <small>{copy.biggerContext}</small>
-          <h2 id="bigger-context-recommendation-title">{copy.biggerContextRecommendationTitle}</h2>
-        </header>
-        <p className="bigger-context-recommendation-body" id="bigger-context-recommendation-body">{copy.biggerContextRecommendationBody}</p>
-        <div className="bigger-context-recommendation-toggle">
-          <div>
-            <strong>{copy.biggerContext}</strong>
-            <p>{copy.biggerContextRecommendationToggleBody}</p>
-          </div>
-          <Switch checked={checked} disabled={busy} onChange={onChange} />
-        </div>
-        {checked ? <p className="bigger-context-recommendation-restart">{copy.restartCodex}</p> : null}
-        <footer>
-          <SecondaryButton disabled={busy} onClick={onClose}>{copy.close}</SecondaryButton>
-        </footer>
-      </motion.section>
-    </motion.div>
   );
 }
 

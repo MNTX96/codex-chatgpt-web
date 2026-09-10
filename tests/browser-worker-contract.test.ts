@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createContext, runInContext } from "node:vm";
-import type { Page } from "playwright-core";
+import type { Locator, Page } from "playwright-core";
 import { CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPLETION_SETTLE_MS, CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS, CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS, ChatGptCompletionTracker, chatGptExternalProgressSuppressesDomHealth, CHATGPT_RESPONSE_DOM_GRACE_MS, MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_COMPOSER_SELECT_ALL_KEY, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptPromptAttachmentIntegrityError, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, browserDiagnosticCheckpoint, chatGptConnectorAttachmentMode, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptSubmissionEvidence, connectAfterClosingBrowserConnection, dismissChatGptTemporaryChatOnboarding, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, resolveChatGptWebMultipartStagingMode, sanitizeChatGptBrowserDiagnosticState, setChatGptThinkMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withChatGptBrowserObservationTimeout, CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS, browserStageTimeouts, ChatGptSuspensionClock, remainingStageBudgetMs } from "../src/adapters/chatgpt-web/browser-worker";
 import { ensureChatGptPersonalizedConnectorAccess, chatGptTurnIsComplete } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptStoppedThinkingError } from "../src/adapters/chatgpt-web/adapter-error";
@@ -16,10 +16,49 @@ import { compileChatGptWebPrompt, formatChatGptWebMultipartCommit, formatChatGpt
 import { estimateCompiledChatGptWebInputTokens } from "../src/adapters/chatgpt-web/input-tokens";
 import { estimateTokens } from "../src/lib/token-estimate";
 import { chatGptHtmlToMarkdown } from "../src/adapters/chatgpt-web/markdown";
+import { detectOutputImages, outputImageSignature } from "../src/adapters/chatgpt-web/artifacts/image/image-detector";
 
 test("image-only assistant output is a completed ChatGPT turn", () => {
   expect(chatGptTurnIsComplete({ responsePresent: true, running: false, currentText: "", completionActionVisible: true, generatedImageKeys: ["image-1:ready"] })).toBe(true);
   expect(chatGptTurnIsComplete({ responsePresent: true, running: false, currentText: "", completionActionVisible: true, generatedImageKeys: [] })).toBe(false);
+});
+
+test("generated image card is detected before a hidden preview source hydrates", async () => {
+  const { createDocument } = require("@mixmark-io/domino") as {
+    createDocument: (html: string) => { body: HTMLElement };
+  };
+  const document = createDocument(
+    '<section><div id="image-93c5f735-5404-462a-8443-3a4bfde488ea" '
+    + 'class="group/imagegen-image relative w-full">'
+    + '<button aria-label="Generated image: Cobalt Circle and Orange Triangle">'
+    + '<img alt="Generated image: Cobalt Circle and Orange Triangle"></button>'
+    + '<div data-testid="image-gen-overlay-actions"><button aria-label="Edit image">Edit</button></div>'
+    + '</div></section>',
+  );
+  const root = document.body.firstElementChild as HTMLElement;
+  const nodeListPrototype = Object.getPrototypeOf(root.querySelectorAll("*"));
+  nodeListPrototype[Symbol.iterator] ??= Array.prototype[Symbol.iterator];
+  const responseTurn = {
+    evaluate: async (callback: Function, argument?: unknown) => callback(root, argument),
+  } as unknown as Locator;
+
+  const candidates = await detectOutputImages(responseTurn);
+  expect(candidates).toHaveLength(1);
+  expect(candidates[0]).toMatchObject({
+    key: "image-93c5f735-5404-462a-8443-3a4bfde488ea",
+    readiness: "loading",
+  });
+  expect(candidates[0]?.imageSrc).toBeUndefined();
+
+  const signature = await outputImageSignature(responseTurn);
+  expect(signature).toHaveLength(1);
+  expect(chatGptTurnIsComplete({
+    responsePresent: true,
+    running: false,
+    currentText: "",
+    completionActionVisible: true,
+    generatedImageKeys: signature,
+  })).toBe(true);
 });
 
 function personalizedTemporaryChatRole(
@@ -2094,10 +2133,12 @@ test("retained tool turns insert into the connector-bound composer without selec
   expect(calls).toEqual(["fill", "focus", "insert", "assert"]);
 });
 
-test("image attachment readiness uses exact file tiles and not localized remove-button text", async () => {
+test("image attachment readiness uses exact file tiles and returns a pre-Send guard without localized button lookup", async () => {
   const imageUrl = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
   const calls: Array<[string, string?]> = [];
   const send = {
+    count: async () => 1,
+    isVisible: async () => true,
     isEnabled: async () => {
       calls.push(["sendEnabled"]);
       return true;
@@ -2108,9 +2149,11 @@ test("image attachment readiness uses exact file tiles and not localized remove-
       expect(role).toBe("group");
       expect(options).toEqual({ name: "codex-input-image-1.png", exact: true });
       return {
-        waitFor: async (state: { state: string; timeout: number }) => {
-          expect(state).toEqual({ state: "visible", timeout: 60_000 });
+        count: async () => 1,
+        isVisible: async () => true,
+        evaluate: async () => {
           calls.push(["fileTile", options.name]);
+          return "accepted";
         },
       };
     },
@@ -2126,11 +2169,16 @@ test("image attachment readiness uses exact file tiles and not localized remove-
     },
   };
   const input = {
-    waitFor: async (state: { state: string; timeout: number }) => {
-      expect(state).toEqual({ state: "attached", timeout: 20_000 });
+    count: async () => 1,
+    waitFor: async (state: { state: string; timeout: number; signal: AbortSignal }) => {
+      expect(state.state).toBe("attached");
+      expect(state.timeout).toBeLessThanOrEqual(20_000);
+      expect(state.signal.aborted).toBeFalse();
       calls.push(["inputReady"]);
     },
-    setInputFiles: async (files: Array<{ name: string }>) => {
+    setInputFiles: async (files: Array<{ name: string }>, options: { signal: AbortSignal; timeout: number }) => {
+      expect(options.signal.aborted).toBeFalse();
+      expect(options.timeout).toBeGreaterThan(0);
       calls.push(["setFiles", files.map(file => file.name).join(",")]);
     },
   };
@@ -2138,25 +2186,25 @@ test("image attachment readiness uses exact file tiles and not localized remove-
     locator: (selector: string) => {
       if (selector === 'input[data-testid="upload-photos-input"]') return input;
       if (selector === '[role="alert"]') {
-        return { allInnerTexts: async () => [] };
+        return { evaluateAll: async () => false };
       }
       return { last: () => composer };
     },
   };
   const attachFiles = (ChatGptBrowserWorker.prototype as unknown as {
-    attachFiles(page: unknown, prompt: unknown): Promise<void>;
+    attachFiles(page: unknown, prompt: unknown, signal: AbortSignal, log: () => void): Promise<{ assertReady(signal?: AbortSignal): Promise<void> }>;
   }).attachFiles;
 
-  await attachFiles.call({ activeComposer: async () => composer }, page, {
+  const signal = new AbortController().signal;
+  const guard = await attachFiles.call({ activeComposer: async () => composer }, page, {
     images: [{ ref: "codex-input-image-1", imageUrl }],
-  });
+  }, signal, () => {});
+  await guard.assertReady(signal);
 
-  expect(calls).toEqual([
-    ["inputReady"],
-    ["setFiles", "codex-input-image-1.png"],
-    ["fileTile", "codex-input-image-1.png"],
-    ["sendEnabled"],
-  ]);
+  expect(calls.filter(([name]) => name === "inputReady")).toHaveLength(1);
+  expect(calls.filter(([name]) => name === "setFiles")).toEqual([["setFiles", "codex-input-image-1.png"]]);
+  expect(calls.filter(([name]) => name === "fileTile").length).toBeGreaterThanOrEqual(3);
+  expect(calls.filter(([name]) => name === "sendEnabled").length).toBeGreaterThanOrEqual(3);
 });
 
 test("effort slider ARIA state fails closed on malformed and unsupported ranges", () => {

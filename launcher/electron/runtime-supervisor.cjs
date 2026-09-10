@@ -255,6 +255,9 @@ function validateConfig(config, descriptorPath, platform = process.platform, lau
     && typeof config.experimentalBiggerContext !== "boolean") {
     throw new Error("Runtime configuration has an invalid experimentalBiggerContext");
   }
+  if (config.imageFactoryProjectId !== undefined && typeof config.imageFactoryProjectId !== "string") {
+    throw new Error("Runtime configuration has an invalid imageFactoryProjectId");
+  }
   if (config.stallTimeoutSec !== undefined
     && (!Number.isFinite(config.stallTimeoutSec) || config.stallTimeoutSec <= 0)) {
     throw new Error("Runtime configuration has an invalid stallTimeoutSec");
@@ -1715,7 +1718,23 @@ class RuntimeSupervisor {
       && health?.mode === config.mode
       && health?.version === config.releaseVersion;
     if (daemonRunning && health.pid !== state.daemonPid) {
-      throw new Error("The process on the Responses port does not match the stale launcher marker");
+      const lostChildEvidence = state.daemonPid === null
+        && ["failed", "external"].includes(state.status)
+        && (state.ownerPid === process.pid || !processRunning(state.ownerPid))
+        && Number.isInteger(health.pid) && health.pid > 0;
+      if (!lostChildEvidence) {
+        throw new Error("The process on the Responses port does not match the stale launcher marker");
+      }
+      await this.acquireDrain(config);
+      try {
+        if (!await this.proxyHealth(config, 2_000, health.pid)) {
+          throw new Error("The Responses process changed while recovering the launcher marker");
+        }
+        state.daemonPid = health.pid;
+        writePrivateFileAtomic(this.statePath, `${JSON.stringify(state, null, 2)}\n`);
+      } finally {
+        await this.control(config, "resume");
+      }
     }
     if (!daemonRunning && processRunning(state.daemonPid)) {
       throw new Error(
@@ -2018,7 +2037,14 @@ class RuntimeSupervisor {
           restoredReady = false;
         }
       }
-      this.tryWriteState(restoredReady ? "ready" : "failed", message);
+      const remainingOwnership = this.readState();
+      if (!this.daemon && remainingOwnership && processRunning(remainingOwnership.daemonPid)) {
+        this.writeExternalState(message);
+      } else if (this.daemon || this.tunnel) {
+        this.tryWriteState(restoredReady ? "ready" : "failed", message);
+      } else {
+        this.writeExternalState(message);
+      }
       throw new Error(message);
     } finally {
       this.stopping = false;
@@ -2043,6 +2069,12 @@ class RuntimeSupervisor {
     try {
       if (this.recoveryTasks.size > 0) await Promise.allSettled([...this.recoveryTasks]);
       const failures = [];
+      const ownershipState = this.readState();
+      const recoveryConfig = !this.daemon && ownershipState ? this.readConfig() : null;
+      const unownedDaemon = !this.daemon && ownershipState && (
+        processRunning(ownershipState.daemonPid)
+        || (recoveryConfig && await this.proxyHealth(recoveryConfig))
+      );
       if (this.tunnel) {
         try {
           const config = this.readConfig();
@@ -2060,7 +2092,9 @@ class RuntimeSupervisor {
       } catch (error) {
         failures.push(`daemon: ${errorMessage(error)}`);
       }
-      if (failures.length === 0) this.clearState();
+      if (unownedDaemon) {
+        failures.push("Responses daemon is not owned by this launcher; preserving its recovery marker");
+      } else if (failures.length === 0) this.clearState();
       else this.tryWriteState("failed", failures.join("; "));
       this.logger.warn("runtime.forced_shutdown_completed", {
         message: errorMessage(reason),

@@ -50,7 +50,7 @@ existing turn-bound MCP contract: `chatgpt_image_generate`, `chatgpt_image_wait`
 Project-only-memory project named `Image Factory`, then downloads the generated artifact into
 `.codex/chatgpt-web-artifacts/<job-key>/` using the existing artifact store.
 
-The project is created lazily in the authenticated browser profile and is reused only after its
+The user creates the project in the authenticated browser profile; it is reused only after its
 Project-only memory and versioned instruction block are verified. Each native task owns an opaque
 image session and conversation binding; a follow-up edit reuses that binding, while a different task
 cannot address it. The child job has its own journal and deadline, but shares the five-browser-turn

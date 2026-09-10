@@ -300,6 +300,8 @@ function loadCommittedBrowserSurface(
   });
 }
 
+const { OwnedImageDownloads, IMAGE_DOWNLOAD_FEATURE } = require("./image-downloads.cjs");
+
 class BrowserHost {
   constructor({
     window,
@@ -352,6 +354,7 @@ class BrowserHost {
     this.visible = false;
     this.surfaceActive = true;
     this.turnTabs = new Map();
+    this.imageDownloads = new OwnedImageDownloads({ logger });
     this.closedTurnOwners = new Map();
     this.userCancelledTurnOwners = new Map();
     this.manualTerminalSignals = new Map();
@@ -1310,6 +1313,20 @@ class BrowserHost {
     return this.snapshot();
   }
 
+  imageDownload(action, body) {
+    requireAutomaticBrowserInspection(this, "Image artifact download");
+    const tab = [...this.turnTabs.values()].find(candidate => candidate.traceId === body.traceId);
+    if (!tab || tab.helperPid !== body.helperPid || tab.surfaceId !== body.surfaceId
+      || tab.interactionMode !== "automatic" || tab.status !== "running"
+      || tab.view.webContents.isDestroyed()
+      || tab.view.webContents.getOrCreateDevToolsTargetId() !== body.targetId) {
+      throw Object.assign(new Error("image_download_owner_mismatch"), { code: "image_download_owner_mismatch" });
+    }
+    if (action === "begin") return this.imageDownloads.begin(tab.view.webContents, body);
+    if (action === "status") return this.imageDownloads.status(body);
+    return this.imageDownloads.release(body);
+  }
+
   refreshTurnLeases(reason, now = Date.now()) {
     const refreshed = refreshTurnLeasesAfterSuspension(
       [...this.turnTabs.values()],
@@ -1512,6 +1529,7 @@ class BrowserHost {
   removeTurnTab(tab, abortRunning) {
     if (!this.turnTabs.has(tab.id)) return;
     this.turnTabs.delete(tab.id);
+    this.imageDownloads?.releaseContents(tab.view.webContents);
     if (tab.interactionMode === "manual") {
       if (tab.manualDeadlineTimer) clearTimeout(tab.manualDeadlineTimer);
       tab.manualDeadlineTimer = null;
@@ -2319,6 +2337,7 @@ class BrowserHost {
     }
     const cancelledByUser = this.userCancelledTurnOwners.get(traceId) === helperPid;
     tab.status = status === "completed" ? "ready" : status === "aborted" ? "aborted" : "error";
+    this.imageDownloads?.releaseContents(tab.view.webContents);
     this.syncPowerSaveBlocker();
     tab.message = status === "completed" ? "Task completed" : message || `ChatGPT turn ${status}`;
     tab.loading = false;
@@ -2856,6 +2875,7 @@ class BrowserHost {
     const descriptor = {
       version: 3,
       kind: "codex-web-gpt-launcher",
+      features: [IMAGE_DOWNLOAD_FEATURE],
       profile: this.profile,
       pid: process.pid,
       endpoint: `http://127.0.0.1:${this.cdpPort}`,
@@ -2879,6 +2899,7 @@ class BrowserHost {
   }
 
   destroy() {
+    this.imageDownloads?.destroy();
     try {
       const current = JSON.parse(fs.readFileSync(this.descriptorPath, "utf8"));
       if (current.pid === process.pid) fs.rmSync(this.descriptorPath, { force: true });

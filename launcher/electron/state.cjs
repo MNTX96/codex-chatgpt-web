@@ -8,14 +8,13 @@ const DEFAULT_STATE = Object.freeze({
   version: 1,
   language: null,
   onboardingComplete: false,
-  githubOpened: false,
-  xOpened: false,
   autoStart: true,
   keepRunningOnClose: true,
   showBrowserDuringTurns: true,
   browserInteractionMode: "automatic",
   experimentalBiggerContext: false,
   zeroRiskProEnabled: false,
+  imageFactoryProjectId: null,
   browserSmokePassed: false,
   browserSmokeVersion: null,
   sidebarOpen: true,
@@ -35,13 +34,13 @@ function readState(filePath) {
     if (!parsed || parsed.version !== 1) return { ...DEFAULT_STATE };
     const state = { ...DEFAULT_STATE, ...parsed };
     delete state.bridgeEnabled;
+    delete state.githubOpened;
+    delete state.xOpened;
     if (state.language !== null && state.language !== "en" && state.language !== "zh-CN" && state.language !== "ja") {
       state.language = DEFAULT_STATE.language;
     }
     for (const key of [
       "onboardingComplete",
-      "githubOpened",
-      "xOpened",
       "autoStart",
       "keepRunningOnClose",
       "showBrowserDuringTurns",
@@ -54,6 +53,13 @@ function readState(filePath) {
     }
     if (state.browserInteractionMode !== "automatic" && state.browserInteractionMode !== "manual") {
       state.browserInteractionMode = DEFAULT_STATE.browserInteractionMode;
+    }
+    if (state.imageFactoryProjectId !== null) {
+      if (typeof state.imageFactoryProjectId !== "string") {
+        state.imageFactoryProjectId = DEFAULT_STATE.imageFactoryProjectId;
+      } else {
+        state.imageFactoryProjectId = state.imageFactoryProjectId.trim() || null;
+      }
     }
     if (state.coreSetupComplete !== true) {
       if (state.onboardingComplete !== true) state.browserInteractionMode = "automatic";

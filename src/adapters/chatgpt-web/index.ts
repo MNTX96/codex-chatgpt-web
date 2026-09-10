@@ -10,6 +10,7 @@ import {
   LauncherManualTurnFailedError,
   LauncherManualTurnTimedOutError,
   markLauncherManualTurnStarted,
+  readLauncherImageFactoryProjectId,
   releaseLauncherRetainedConversation,
   startLauncherManualTurn,
   waitForLauncherManualSent,
@@ -354,6 +355,29 @@ function validateBatchTools(parsed: CodexParsedRequest, requests: BrokerToolRequ
 /** Keep the Responses bridge alive during every awaited phase of a browser turn. */
 export const CHATGPT_WEB_ADAPTER_HEARTBEAT_MS = 10_000;
 
+export function configuredImageFactoryProjectId(provider: CodexProviderConfig): string {
+  const projectId = provider.chatgptWeb?.imageFactoryProjectId?.trim();
+  if (!projectId) {
+    throw new Error("Image Factory is not configured. Set project_id in Configuration → Image Factory.");
+  }
+  return projectId;
+}
+
+function requireImageFactoryProjectId(projectId: string | null | undefined): string {
+  const normalized = projectId?.trim();
+  if (!normalized) {
+    throw new Error("Image Factory is not configured. Set project_id in Configuration → Image Factory.");
+  }
+  return normalized;
+}
+
+export async function resolveImageFactoryProjectId(provider: CodexProviderConfig): Promise<string> {
+  if (provider.chatgptWeb?.browserHost !== "launcher") return configuredImageFactoryProjectId(provider);
+  const descriptorPath = provider.chatgptWeb.browserHostDescriptorPath?.trim();
+  if (!descriptorPath) throw new Error("Launcher browser host descriptor path is missing");
+  return requireImageFactoryProjectId(await readLauncherImageFactoryProjectId(descriptorPath));
+}
+
 export function createChatGptWebAdapter(
   provider: CodexProviderConfig,
   dependencies: {
@@ -381,30 +405,44 @@ export function createChatGptWebAdapter(
   const imageFactoryStore = imageFactoryEnabled
     ? new ImageFactoryStore(join(getConfigDir(), "runtime", "image-factory", executionNamespace))
     : undefined;
-  const imageFactoryWorker = imageFactoryEnabled
-    ? ChatGptBrowserWorker.forProvider({
-      ...provider,
-      chatgptWeb: {
-        ...provider.chatgptWeb,
-        // The child runs in a project chat and never selects the Codex connector. A distinct
-        // resolved config gives it its own maintenance queue while the shared browser admission
-        // counter still enforces the five-tab ceiling.
-        appName: `${provider.chatgptWeb?.appName ?? "ChatGPT"} Image Factory Child`,
-        browserDiagnosticsPath: join(getConfigDir(), "diagnostics", "image-factory"),
-      },
-    })
-    : undefined;
-  const imageFactory = imageFactoryEnabled && imageFactoryStore && imageFactoryWorker
-    ? new ImageFactoryService(
+  const imageFactory = imageFactoryEnabled && imageFactoryStore
+    ? ImageFactoryService.shared(imageFactoryStore.directory, executionNamespace, () => new ImageFactoryService(
       imageFactoryStore,
       executionNamespace,
       async options => {
-        const binding = await imageFactoryWorker.ensureImageFactoryProject(imageFactoryStore);
+        options.signal.throwIfAborted();
+        const projectId = await resolveImageFactoryProjectId(provider);
+        const conversationKey = imageKey(
+          "conversation",
+          executionNamespace,
+          options.request.session.owner,
+          options.request.session.id,
+        );
+        const previousProjectId = options.request.session.projectId?.trim();
+        const projectChanged = previousProjectId
+          ? previousProjectId !== projectId
+          : options.request.session.hasConversation === true;
+        if (projectChanged
+          && options.request.session.hasConversation === true
+          && provider.chatgptWeb?.browserHost === "launcher") {
+          const descriptorPath = provider.chatgptWeb.browserHostDescriptorPath?.trim();
+          if (!descriptorPath) throw new Error("Launcher browser host descriptor path is missing");
+          await releaseLauncherRetainedConversation(descriptorPath, conversationKey);
+        }
+        const imageFactoryWorker = ChatGptBrowserWorker.forProvider({
+          ...provider,
+          chatgptWeb: {
+            ...provider.chatgptWeb,
+            appName: `${provider.chatgptWeb?.appName ?? "ChatGPT"} Image Factory ${imageKey(options.request.session.owner, options.request.session.id)}`,
+            browserDiagnosticsPath: join(getConfigDir(), "diagnostics", "image-factory"),
+          },
+        });
+        options.signal.throwIfAborted();
         const session = {
           ...options.request.session,
           owner: options.request.session.owner,
-          accountKey: binding.accountKey,
-          projectId: binding.projectId,
+          projectId,
+          ...(projectChanged ? { conversationUrl: undefined, hasConversation: false } : {}),
           updatedAt: Date.now(),
         };
         let submittedConversationUrl = session.conversationUrl;
@@ -414,15 +452,14 @@ export function createChatGptWebAdapter(
           ...configuredCapabilities,
           localToolsEnabled: false,
         };
-        const conversationKey = imageKey("conversation", executionNamespace, session.id);
         const artifacts: OutputArtifact[] = [];
         const childTarget = {
           ...options.target,
           metadata: {
             output: "image" as const,
             surface: "persistent" as const,
-            projectId: binding.projectId,
-            conversationUrl: submittedConversationUrl ?? `https://chatgpt.com/g/${binding.projectId}/project`,
+            projectId,
+            conversationUrl: submittedConversationUrl ?? `https://chatgpt.com/g/${projectId}/project`,
             actualMode: imageModelId,
             instructionsVersion: IMAGE_FACTORY_INSTRUCTIONS_VERSION,
             imageSessionId: session.id,
@@ -436,11 +473,11 @@ export function createChatGptWebAdapter(
           reasoning: "low",
           capabilities: imageCapabilities,
           surface: "persistent",
-          persistentProjectId: binding.projectId,
+          persistentProjectId: projectId,
           executionTarget: {
             output: "image",
             surface: "persistent",
-            projectId: binding.projectId,
+            projectId,
             imageSessionId: session.id,
           },
           skipConnectorIdentity: true,
@@ -451,9 +488,9 @@ export function createChatGptWebAdapter(
           conversationKey,
           abortSignal: options.signal,
           onSubmitted: url => {
-            submittedConversationUrl = verifiedImageConversationUrl(url, binding.projectId) ?? submittedConversationUrl;
+            submittedConversationUrl = verifiedImageConversationUrl(url, projectId) ?? submittedConversationUrl;
             childTarget.metadata.conversationUrl = submittedConversationUrl
-              ?? `https://chatgpt.com/g/${binding.projectId}/project`;
+              ?? `https://chatgpt.com/g/${projectId}/project`;
             options.update({
               session: {
                 ...session,
@@ -474,7 +511,7 @@ export function createChatGptWebAdapter(
           ...session,
           hasConversation: true,
           actualMode: imageModelId,
-          conversationUrl: submittedConversationUrl ?? `https://chatgpt.com/g/${binding.projectId}/project`,
+          conversationUrl: submittedConversationUrl ?? `https://chatgpt.com/g/${projectId}/project`,
           updatedAt: Date.now(),
         };
         options.update({ session: updatedSession, phase: "downloading" });
@@ -486,8 +523,8 @@ export function createChatGptWebAdapter(
           ...(answer ? { text: answer } : {}),
         };
       },
-      () => chatGptBrowserCapacityAvailable(),
-    )
+      reservations => chatGptBrowserCapacityAvailable(reservations),
+    ))
     : undefined;
   const retainedLauncherDescriptor = provider.chatgptWeb?.browserHost === "launcher"
     && provider.chatgptWeb.browserHostDescriptorPath
@@ -1276,7 +1313,7 @@ export function createChatGptWebAdapter(
         const nativeIdentity = extractChatGptTurnIdentity(parsed);
         const nativeTurnId = nativeIdentity.turnId;
         if (!nativeTurnId) throw new Error("ChatGPT web requires native Codex turn_id metadata for browser ownership");
-        const abortedTurnIds = manualRequest ? new Set(priorChatGptAbortedTurnIds(parsed)) : undefined;
+        const abortedTurnIds = new Set(priorChatGptAbortedTurnIds(parsed));
         if (abortedTurnIds?.size) {
           chatGptTurnSessions.retireAbortedOwnerTurns(ownerKey, abortedTurnIds, executionKey);
         }

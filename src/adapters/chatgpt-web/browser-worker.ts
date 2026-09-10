@@ -17,7 +17,10 @@ import { estimateTokens } from "../../lib/token-estimate";
 import type { CodexProviderConfig } from "../../types";
 import { parseDataUrl } from "../image";
 import { OutputImageAdapter } from "./artifacts/image/output-image-adapter";
-import { outputImageSignature } from "./artifacts/image/image-detector";
+import { assertLauncherImageDownloadSupport } from "./artifacts/image/download-transaction";
+import { attachPromptFiles, type AttachmentGuard } from "./file-attachments";
+import { imageTransferLog, type ImageTransferLog } from "./image-transfer";
+import { CHATGPT_GENERATED_IMAGE_CARD_SELECTOR, outputImageSignature } from "./artifacts/image/image-detector";
 import { sniffImageMime } from "./artifacts/image/image-sniffer";
 import type { OutputArtifact, OutputArtifactTarget } from "./artifacts/types";
 import {
@@ -99,9 +102,20 @@ import type {
   ChatGptExternalTurnProgressSnapshot,
   ChatGptTurnProgressReader,
 } from "./turn-progress";
-import { ensureImageFactoryProject, type ImageFactoryProjectUi } from "./image-factory/project-manager";
+import {
+  ensureImageFactoryProject,
+  type ImageFactoryProjectLog,
+  type ImageFactoryProjectUi,
+} from "./image-factory/project-manager";
 import type { ImageFactoryStore } from "./image-factory/state";
 import type { ChatExecutionTarget } from "./image-factory/contracts";
+import {
+  IMAGE_FACTORY_PROJECT_NAME,
+  isImageFactoryProjectRow,
+  openImageFactoryProject,
+  prepareProjectDirectory,
+  readProjectRowLabel,
+} from "./image-factory/project-navigation";
 
 export { MAX_CHATGPT_BROWSER_TABS } from "./concurrency";
 
@@ -123,8 +137,34 @@ export async function closeChatGptBrowserWorkers(): Promise<void> {
 export const CHATGPT_RESPONSE_DOM_GRACE_MS = 60_000;
 
 /** Shared across provider workers so an Image Factory child cannot bypass the five-tab limit. */
-export function chatGptBrowserCapacityAvailable(): boolean {
-  return activeChatGptBrowserTurns < MAX_CHATGPT_BROWSER_TABS;
+export function chatGptBrowserCapacityAvailable(reservations = 0): boolean {
+  return activeChatGptBrowserTurns + reservations < MAX_CHATGPT_BROWSER_TABS;
+}
+
+function shortImageFactoryId(value: string | undefined): string | undefined {
+  return value ? `${value.slice(0, 12)}…` : undefined;
+}
+
+function imageFactoryPageLocation(page: Page): string | undefined {
+  try {
+    const url = new URL(page.url());
+    if (url.protocol !== "https:" && url.protocol !== "http:") return url.protocol;
+    return `${url.origin}${url.pathname}`;
+  } catch {
+    return undefined;
+  }
+}
+
+function imageFactoryErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.length > 240 ? `${message.slice(0, 237)}…` : message;
+}
+
+function imageFactorySetupLog(
+  event: string,
+  fields: Record<string, string | number | boolean | undefined> = {},
+): void {
+  console.info(`[chatgpt-web] image-factory.setup ${event} ${JSON.stringify(fields)}`);
 }
 /**
  * How long a staged Bigger Context part may take to produce its assistant turn. A staged part is two
@@ -2206,14 +2246,26 @@ export class ChatGptBrowserWorker {
     return this.enqueueMaintenance("session inspection", () => this.inspectSessionExclusive(detectCapabilities));
   }
 
-  ensureImageFactoryProject(store: ImageFactoryStore) {
+  ensureImageFactoryProject(store: ImageFactoryStore, abortSignal?: AbortSignal) {
     return this.enqueueMaintenance("Image Factory project setup", async () => {
+      abortSignal?.throwIfAborted();
+      const startedAt = Date.now();
+      let setupTraceId: string | undefined;
+      const log: ImageFactoryProjectLog = (event, fields = {}) => imageFactorySetupLog(event, {
+        traceId: setupTraceId,
+        elapsedMs: Date.now() - startedAt,
+        ...fields,
+      });
+      log("started", {
+        browserHost: this.config.browserHost,
+        capacityAvailable: chatGptBrowserCapacityAvailable(),
+      });
       if (!chatGptBrowserCapacityAvailable()) {
+        log("rejected_capacity");
         throw new Error("Image Factory setup requires an available ChatGPT browser slot");
       }
       activeChatGptBrowserTurns += 1;
       let connection: Awaited<ReturnType<typeof connectLauncherBrowserHost>> | undefined;
-      let setupTraceId: string | undefined;
       let setupStatus: "completed" | "failed" = "completed";
       let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
       let heartbeatInFlight = false;
@@ -2221,13 +2273,24 @@ export class ChatGptBrowserWorker {
         let page: Page;
         if (this.config.browserHost === "launcher") {
           setupTraceId = `image_setup_${randomUUID().replaceAll("-", "")}`;
+          log("launcher_lease_requested");
           const lease = await notifyLauncherTurn(this.config.browserHostDescriptorPath!, {
             phase: "start", traceId: setupTraceId, helperPid: process.pid,
           });
-          if (!lease.surfaceId) throw new Error("Launcher did not lease a browser tab for Image Factory setup");
+          log("launcher_lease_received", {
+            surfaceId: shortImageFactoryId(lease.surfaceId),
+            reused: lease.reused,
+            connectorBound: lease.connectorBound,
+            cancelledByUser: lease.cancelledByUser,
+          });
+          if (!lease.surfaceId) {
+            log("launcher_lease_missing_surface");
+            throw new Error("Launcher did not lease a browser tab for Image Factory setup");
+          }
           const sendHeartbeat = () => {
             if (heartbeatInFlight) return;
             heartbeatInFlight = true;
+            log("launcher_heartbeat");
             void notifyLauncherTurn(this.config.browserHostDescriptorPath!, {
               phase: "heartbeat", traceId: setupTraceId!, helperPid: process.pid,
             }, LAUNCHER_TURN_HEARTBEAT_TIMEOUT_MS).catch(() => {}).finally(() => {
@@ -2236,33 +2299,77 @@ export class ChatGptBrowserWorker {
           };
           heartbeatTimer = setInterval(sendHeartbeat, LAUNCHER_TURN_HEARTBEAT_INTERVAL_MS);
           heartbeatTimer.unref?.();
+          log("browser_connection_requested", { surfaceId: shortImageFactoryId(lease.surfaceId) });
           connection = await connectLauncherBrowserHost(this.config.browserHostDescriptorPath!, 20_000, lease.surfaceId);
           page = connection.page;
+          log("browser_connection_ready", { url: imageFactoryPageLocation(page) });
         } else {
+          log("browser_page_requested");
           page = await this.ensurePage();
+          log("browser_page_ready", { url: imageFactoryPageLocation(page) });
         }
         const openSettings = async (projectId: string): Promise<Locator> => {
-          await page.goto(`https://chatgpt.com/g/${projectId}/project`, { waitUntil: "domcontentloaded", timeout: 60_000 });
-          await page.getByRole("button", { name: "Show project details", exact: true })
-            .waitFor({ state: "visible", timeout: 60_000 });
-          await page.getByRole("button", { name: "Show project details", exact: true }).click();
-          await page.getByRole("menuitem", { name: "Project settings", exact: true }).click();
-          return page.getByRole("dialog");
+          abortSignal?.throwIfAborted();
+          log("settings_navigation_started", { projectId: shortImageFactoryId(projectId) });
+          try {
+            await openImageFactoryProject(page, projectId, log);
+            abortSignal?.throwIfAborted();
+            log("settings_navigation_completed", {
+              projectId: shortImageFactoryId(projectId),
+              url: imageFactoryPageLocation(page),
+            });
+            log("settings_details_wait_started", { projectId: shortImageFactoryId(projectId) });
+            await page.getByRole("button", { name: "Show project details", exact: true })
+              .waitFor({ state: "visible", timeout: 60_000 });
+            log("settings_details_visible", { projectId: shortImageFactoryId(projectId) });
+            await page.getByRole("button", { name: "Show project details", exact: true }).click({ signal: abortSignal });
+            log("settings_menu_opened", { projectId: shortImageFactoryId(projectId) });
+            await page.getByRole("menuitem", { name: "Project settings", exact: true }).click({ signal: abortSignal });
+            log("settings_dialog_opened", { projectId: shortImageFactoryId(projectId) });
+            return page.getByRole("dialog");
+          } catch (error) {
+            log("settings_open_failed", {
+              projectId: shortImageFactoryId(projectId),
+              url: imageFactoryPageLocation(page),
+              error: imageFactoryErrorMessage(error),
+            });
+            throw error;
+          }
         };
         const inspect = async (id: string) => {
           if (!/^g-p-[A-Za-z0-9_-]{16,128}$/.test(id)) throw new Error("Image Factory project id is invalid");
           const dialog = await openSettings(id);
           try {
+            log("settings_values_read_started", { projectId: shortImageFactoryId(id) });
             const memory = (await dialog.getByRole("button", { name: "Memory", exact: true }).innerText())
               .toLowerCase().includes("project-only") ? "project-only" as const : "unknown" as const;
             const instructions = await dialog.getByRole("textbox", { name: "Instructions", exact: true }).inputValue();
+            log("settings_values_read_completed", {
+              projectId: shortImageFactoryId(id),
+              memory,
+              instructionsLength: instructions.length,
+            });
             return { id, memory, instructions };
+          } catch (error) {
+            log("settings_values_read_failed", {
+              projectId: shortImageFactoryId(id),
+              error: imageFactoryErrorMessage(error),
+            });
+            throw error;
           } finally {
-            await dialog.getByRole("button", { name: "Close", exact: true }).click().catch(() => {});
+            await dialog.getByRole("button", { name: "Close", exact: true }).click().then(
+              () => log("settings_dialog_closed", { projectId: shortImageFactoryId(id) }),
+              error => log("settings_dialog_close_failed", {
+                projectId: shortImageFactoryId(id),
+                error: imageFactoryErrorMessage(error),
+              }),
+            );
           }
         };
         const ui: ImageFactoryProjectUi = {
           accountKey: async () => {
+            abortSignal?.throwIfAborted();
+            log("account_page_check_started", { url: imageFactoryPageLocation(page) });
             if (!/^https:\/\/chatgpt\.com(?:\/|$)/i.test(page.url())) {
               await page.goto("https://chatgpt.com/", { waitUntil: "domcontentloaded", timeout: 60_000 });
             }
@@ -2272,76 +2379,90 @@ export class ChatGptBrowserWorker {
             await profileButton.waitFor({ state: "visible", timeout: 30_000 });
             const label = await profileButton.getAttribute("aria-label");
             if (!label) throw new Error("ChatGPT account identity is unavailable");
-            return createHash("sha256").update(label).digest("hex");
+            const accountKey = createHash("sha256").update(label).digest("hex");
+            log("account_page_check_completed", { accountKey: shortImageFactoryId(accountKey) });
+            return accountKey;
           },
           list: async () => {
-            await page.goto("https://chatgpt.com/projects", { waitUntil: "domcontentloaded", timeout: 60_000 });
+            abortSignal?.throwIfAborted();
+            log("project_list_navigation_started");
+            await prepareProjectDirectory(page);
+            log("project_list_navigation_completed", { url: imageFactoryPageLocation(page) });
             const rows = page.locator('[role="grid"] [role="row"][data-page-table-selectable-row="true"]');
             const found = new Map<string, { id: string; name: string }>();
             let stablePasses = 0;
+            let visitedRows = 0;
             for (let pass = 0; pass < 12 && stablePasses < 2; pass += 1) {
+              abortSignal?.throwIfAborted();
               const rowCount = await rows.count();
-              for (let index = 0; index < rowCount; index += 1) {
+              const observedNames: string[] = [];
+              for (let index = visitedRows; index < rowCount; index += 1) {
                 const row = rows.nth(index);
-                const name = (await row.getByRole("gridcell").first().innerText()).trim().replace(/Pinned$/i, "").trim();
-                if (!name) continue;
-                await row.click({ force: true });
+                const observedName = await readProjectRowLabel(row);
+                observedNames.push(observedName || "<empty>");
+                // Only open exact Image Factory rows. Opening every project to discover its id
+                // creates a list -> detail -> list loop and looks like bot navigation.
+                if (!(await isImageFactoryProjectRow(row))) continue;
+                log("project_row_open_started", { pass, index });
+                await page.waitForTimeout(900);
+                await row.click({ signal: abortSignal });
                 await page.waitForURL(/\/g\/g-p-[A-Za-z0-9_-]+\/project(?:$|\/)/, { timeout: 60_000 });
                 const id = new URL(page.url()).pathname.split("/")[2] ?? "";
                 if (!/^g-p-[A-Za-z0-9_-]{16,128}$/.test(id)) throw new Error("ChatGPT project row did not expose a valid project id");
-                found.set(id, { id, name });
-                await page.goto("https://chatgpt.com/projects", { waitUntil: "domcontentloaded", timeout: 60_000 });
+                found.set(id, { id, name: IMAGE_FACTORY_PROJECT_NAME });
+                log("project_row_open_completed", { pass, index, projectId: shortImageFactoryId(id) });
+                await page.waitForTimeout(700);
+                await prepareProjectDirectory(page);
               }
-              const before = found.size;
+              visitedRows = rowCount;
+              log("project_list_page_observed", { pass, rowCount, found: found.size, names: observedNames.join(" | ") });
               await rows.last().scrollIntoViewIfNeeded().catch(() => {});
-              await new Promise(resolveSleep => setTimeout(resolveSleep, 100));
-              stablePasses = found.size === before ? stablePasses + 1 : 0;
+              await new Promise(resolveSleep => setTimeout(resolveSleep, 500));
+              stablePasses = await rows.count() <= rowCount ? stablePasses + 1 : 0;
             }
+            log("project_list_completed", { count: found.size, stablePasses });
             return [...found.values()];
           },
           inspect,
-          create: async onCreated => {
-            await page.goto("https://chatgpt.com/projects", { waitUntil: "domcontentloaded", timeout: 60_000 });
-            const newButton = page.getByRole("button", { name: "New", exact: true });
-            if (await newButton.count() > 0) {
-              await newButton.click();
-            } else {
-              const projectsLink = page.getByRole("link", { name: /^Projects\s+New project$/i });
-              await projectsLink.getByRole("button", { name: "New project", exact: true }).click();
-            }
-            const dialog = page.getByRole("dialog");
-            await dialog.getByRole("textbox", { name: "Project name", exact: true }).fill("Image Factory");
-            await dialog.getByRole("button", { name: "Default memory", exact: true }).click();
-            await page.getByRole("menuitemradio", { name: /^Project-only memory/ }).click();
-            await dialog.getByRole("button", { name: "Create project", exact: true }).click();
-            await page.waitForURL(/\/g\/g-p-[A-Za-z0-9_-]+\/project/, { timeout: 60_000 });
-            const id = new URL(page.url()).pathname.split("/")[2];
-            if (!id) throw new Error("ChatGPT did not expose the created Image Factory project id");
-            onCreated(id);
-            return inspect(id);
-          },
           writeInstructions: async (id, text) => {
+            log("instructions_navigation_started", { projectId: shortImageFactoryId(id) });
             const dialog = await openSettings(id);
-            await dialog.getByRole("textbox", { name: "Instructions", exact: true }).fill(text);
-            await dialog.getByRole("button", { name: "Save", exact: true }).click();
+            log("instructions_editor_opened", { projectId: shortImageFactoryId(id) });
+            await dialog.getByRole("textbox", { name: "Instructions", exact: true }).fill(text, { signal: abortSignal });
+            log("instructions_filled", { projectId: shortImageFactoryId(id), instructionsLength: text.length });
+            await dialog.getByRole("button", { name: "Save", exact: true }).click({ signal: abortSignal });
+            log("instructions_save_clicked", { projectId: shortImageFactoryId(id) });
             await dialog.waitFor({ state: "hidden", timeout: 30_000 }).catch(() => {});
+            log("instructions_save_settled", { projectId: shortImageFactoryId(id) });
           },
         };
-        return await ensureImageFactoryProject(store, ui);
+        return await ensureImageFactoryProject(store, ui, log, abortSignal);
       } catch (error) {
         setupStatus = "failed";
+        log("failed", { error: imageFactoryErrorMessage(error) });
         throw error;
       } finally {
         if (heartbeatTimer) clearInterval(heartbeatTimer);
-        if (connection) await connection.browser.close().catch(() => {});
-        if (setupTraceId) {
-          await notifyLauncherTurn(this.config.browserHostDescriptorPath!, {
-            phase: "end", traceId: setupTraceId, helperPid: process.pid, status: setupStatus,
-          }).catch(error => {
-            if (setupStatus === "completed") throw error;
-          });
+        if (connection) {
+          log("browser_connection_closing");
+          await connection.browser.close().then(
+            () => log("browser_connection_closed"),
+            error => log("browser_connection_close_failed", { error: imageFactoryErrorMessage(error) }),
+          );
         }
-        activeChatGptBrowserTurns = Math.max(0, activeChatGptBrowserTurns - 1);
+        try {
+          if (setupTraceId) {
+            log("launcher_lease_ending", { status: setupStatus });
+            await notifyLauncherTurn(this.config.browserHostDescriptorPath!, {
+              phase: "end", traceId: setupTraceId, helperPid: process.pid, status: setupStatus,
+            }).catch(error => {
+              if (setupStatus === "completed") throw error;
+            });
+          }
+        } finally {
+          activeChatGptBrowserTurns = Math.max(0, activeChatGptBrowserTurns - 1);
+        }
+        log("finished", { status: setupStatus, durationMs: Date.now() - startedAt });
       }
     });
   }
@@ -2697,12 +2818,10 @@ export class ChatGptBrowserWorker {
     projectId: string,
     captureDiagnostic?: (checkpoint: string) => Promise<void>,
   ): Promise<Locator> {
-    if (!/^g-p-[A-Za-z0-9_-]{16,128}$/.test(projectId)) {
-      throw new Error("Image Factory project id is invalid");
-    }
+    if (!projectId.trim()) throw new Error("Image Factory project_id is not configured");
     const expectedPrefix = `https://chatgpt.com/g/${projectId}`;
-    if (!page.url().startsWith(expectedPrefix)) {
-      await page.goto(`${expectedPrefix}/project`, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    if (!(page.url().startsWith(`${expectedPrefix}/c/`))) {
+      await openImageFactoryProject(page, projectId);
       await captureDiagnostic?.("persistent-chat-navigation-complete");
     }
     let composer: Locator;
@@ -3560,6 +3679,7 @@ export class ChatGptBrowserWorker {
     submissionLifecycle?: Pick<BrowserTurn, "onSendActivated" | "onSubmitted">,
     completionTracker?: ChatGptCompletionTracker,
     recoverObservation?: ChatGptObservationRecovery,
+    attachmentGuard?: AttachmentGuard,
   ): Promise<ChatGptSubmissionEvidence> {
     const composer = await this.activeComposer(page);
     const sendButton = composer
@@ -3581,8 +3701,11 @@ export class ChatGptBrowserWorker {
       await settleChatGptUi();
     }
     await captureDiagnostic?.("send-ready");
+    await attachmentGuard?.assertReady(abortSignal);
     const initialToolBatchRevision = externalProgress?.snapshot().lastToolBatchRevision ?? 0;
     await submissionLifecycle?.onSendActivated?.();
+    await attachmentGuard?.assertReady(abortSignal);
+    abortSignal?.throwIfAborted();
     await sendButton.press("Enter", {
       noWaitAfter: true,
       signal: abortSignal,
@@ -3884,35 +4007,13 @@ export class ChatGptBrowserWorker {
     return { effort: mode.displayLabel, response: CHATGPT_SMOKE_EXPECTED };
   }
 
-  private async attachFiles(page: Page, prompt: CompiledChatGptWebPrompt): Promise<void> {
+  private async attachFiles(page: Page, prompt: CompiledChatGptWebPrompt, abortSignal: AbortSignal, log: ImageTransferLog): Promise<AttachmentGuard | undefined> {
     const files = chatGptPromptFilePayloads(prompt);
-    if (files.length === 0) return;
+    abortSignal.throwIfAborted();
+    if (files.length === 0) { log("attachments_skipped", { referenceCount: 0, attachmentCount: 0 }); return; }
     const composer = await this.activeComposer(page);
     const composerForm = composer.locator("xpath=ancestor::form[1]");
-    const input = page.locator('input[data-testid="upload-photos-input"]');
-    await input.waitFor({ state: "attached", timeout: 20_000 });
-    await input.setInputFiles(files);
-    try {
-      await Promise.all(files.map(file => (
-        composerForm.getByRole("group", { name: file.name, exact: true })
-          .waitFor({ state: "visible", timeout: 60_000 })
-      )));
-    } catch {
-      const alerts = (await page.locator('[role="alert"]').allInnerTexts().catch(() => []))
-        .map(text => text.replace(/\s+/g, " ").trim())
-        .filter(Boolean);
-      throw new Error(
-        `ChatGPT did not accept all prompt attachments`
-        + (alerts.length > 0 ? `: ${alerts.join(" | ")}` : ""),
-      );
-    }
-    const send = composerForm.getByTestId("send-button");
-    const deadline = Date.now() + 60_000;
-    while (Date.now() < deadline) {
-      if (await send.isEnabled().catch(() => false)) return;
-      await new Promise(resolveSleep => setTimeout(resolveSleep, 100));
-    }
-    throw new Error("ChatGPT accepted the prompt attachments but did not make the message ready to send");
+    return attachPromptFiles({ page, form: composerForm, files, abortSignal, log });
   }
 
   private async responseDomSnapshot(
@@ -4005,7 +4106,12 @@ export class ChatGptBrowserWorker {
       // CHATGPT_COMMENTARY_CLASSIFIER_END
       const classified = selectChatGptAnswerRoots(allMarkdownRoots, streamingStatusContainers);
       const commentaryRoots = classified.commentaryRoots;
-      const renderedRoots = classified.answerRoots;
+      // Image-only answers have no `.markdown` root. Generated cards participate in completion
+      // binding, but their controls (for example "Edit") are UI and must never become answer text.
+      const projectedAnswerRoots = classified.answerRoots;
+      const imageAnswerRoots = [...root.querySelectorAll<HTMLElement>(options.generatedImageCardSelector)]
+        .filter(renderedInDom);
+      const completionRoots = [...projectedAnswerRoots, ...imageAnswerRoots];
       // CHATGPT_MARKDOWN_CONTENT_BEGIN
       const chatGptMarkdownContent = (markdownRoot: HTMLElement): HTMLElement => {
         const content = markdownRoot.cloneNode(true) as HTMLElement;
@@ -4105,7 +4211,7 @@ export class ChatGptBrowserWorker {
           });
         });
       };
-      renderedRoots.map(chatGptMarkdownContent).forEach((markdownRoot) => {
+      projectedAnswerRoots.map(chatGptMarkdownContent).forEach((markdownRoot) => {
         const children = [...markdownRoot.children] as HTMLElement[];
         const hasBlockChildren = children.some(child => blockMarkdownTags.has(child.tagName.toLowerCase()));
         if (!hasBlockChildren) {
@@ -4167,7 +4273,7 @@ export class ChatGptBrowserWorker {
         ...(segment.sourceEnd !== undefined ? { sourceEnd: segment.sourceEnd } : {}),
         streamable: index < segments.length - 1,
       }));
-      const rendered = renderedRoots.at(-1);
+      const rendered = completionRoots.at(-1);
       const completionAction = rendered
         ? [...root.querySelectorAll<HTMLElement>(options.completionActionSelector)]
           .filter(renderedInDom)
@@ -4176,9 +4282,9 @@ export class ChatGptBrowserWorker {
         : undefined;
       const completionActionSet = new Set(completionAction ? [completionAction] : []);
       const candidates = new Map<HTMLElement, ChatGptVisibleTraceBlock["kind"]>();
-      renderedRoots.forEach(candidate => candidates.set(candidate, "answer"));
+      completionRoots.forEach(candidate => candidates.set(candidate, "answer"));
       commentaryRoots.forEach(candidate => candidates.set(candidate, "commentary"));
-      const overlapsRenderedAnswer = (candidate: HTMLElement): boolean => renderedRoots.some(rendered => (
+      const overlapsRenderedAnswer = (candidate: HTMLElement): boolean => completionRoots.some(rendered => (
         candidate.contains(rendered) || rendered.contains(candidate)
       ));
       const overlapsCommentary = (candidate: HTMLElement): boolean => commentaryRoots.some(commentary => (
@@ -4302,17 +4408,21 @@ export class ChatGptBrowserWorker {
         key: observerKey,
         snapshot: {
           responsePresent: true,
-          visibleText: renderedRoots.map(candidate => candidate.innerText.trim()).filter(Boolean).join("\n\n"),
-          fullHtml: renderedRoots.map(candidate => candidate.innerHTML).join(""),
+          visibleText: projectedAnswerRoots.map(candidate => candidate.innerText.trim()).filter(Boolean).join("\n\n"),
+          fullHtml: projectedAnswerRoots.map(candidate => candidate.innerHTML).join(""),
           markdownSegments,
           completionActionVisible: completionAction !== undefined,
           stoppedThinkingVisible,
           traceBlocks,
-          generatedImageKeys: [],
+          // Card identity is enough to classify an image-only assistant response before a hidden
+          // Electron view hydrates the preview URL. outputImageSignature below enriches this when
+          // source/readiness becomes available without making lazy loading a completion gate.
+          generatedImageKeys: imageAnswerRoots.map(candidate => `card:${candidate.id}`),
         },
       };
     }, {
       completionActionSelector: CHATGPT_COMPLETION_ACTION_SELECTOR,
+      generatedImageCardSelector: CHATGPT_GENERATED_IMAGE_CARD_SELECTOR,
       knownKey: cache?.key,
       attributeFilter: [...CHATGPT_DOM_REVISION_ATTRIBUTES],
     }, { timeout: 2_000 }).catch(() => undefined);
@@ -4326,7 +4436,8 @@ export class ChatGptBrowserWorker {
     // Image payload state is intentionally kept out of the Markdown projection. It participates
     // only in completion so image-only replies are first-class responses.
     if (snapshot.responsePresent) {
-      snapshot.generatedImageKeys = await outputImageSignature(responseTurn).catch(() => []);
+      const generatedImageSignature = await outputImageSignature(responseTurn).catch(() => []);
+      if (generatedImageSignature.length > 0) snapshot.generatedImageKeys = generatedImageSignature;
     }
     if (observed.snapshot && cache) {
       cache.key = observed.key;
@@ -4390,6 +4501,9 @@ export class ChatGptBrowserWorker {
   private async runExclusive(turn: BrowserTurn): Promise<string> {
     if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
     if (this.config.browserHost !== "launcher") return this.runBrowserTurn(turn);
+    if (turn.executionTarget?.output === "image" || turn.requireOutputArtifact) {
+      assertLauncherImageDownloadSupport(this.config.browserHostDescriptorPath!);
+    }
 
     const lease = await notifyLauncherTurn(this.config.browserHostDescriptorPath!, {
       phase: "start",
@@ -4926,10 +5040,11 @@ export class ChatGptBrowserWorker {
         }
       }
       await diagnostics.capture(page, "prompt-attachment-complete");
-      await this.runStage(turn.traceId, "file_attachment", browserStageTimeouts.fileAttachment, () => (
-        this.attachFiles(page, prepared)
+      const attachmentGuard = await this.runStage(turn.traceId, "file_attachment", browserStageTimeouts.fileAttachment, stageSignal => (
+        this.attachFiles(page, prepared, turn.abortSignal ? AbortSignal.any([stageSignal, turn.abortSignal]) : stageSignal,
+          imageTransferLog(turn.traceId, turn.outputArtifactTarget?.metadata?.jobId))
       ));
-      await diagnostics.capture(page, "file-attachment-complete");
+      await diagnostics.capture(page, attachmentGuard ? "file-attachment-complete" : "file-attachment-skipped");
       const completionTracker = new ChatGptCompletionTracker();
       const finalSubmissionEvidence = await this.runStage(
         turn.traceId,
@@ -4952,6 +5067,7 @@ export class ChatGptBrowserWorker {
               return recovered;
             }
             : undefined,
+          attachmentGuard,
         ),
       );
       console.info(`[chatgpt-web] browser turn ${turn.traceId} submission accepted evidence=${finalSubmissionEvidence}`);
@@ -5192,10 +5308,16 @@ export class ChatGptBrowserWorker {
                 page, responseTurn: responseTurn.locator, assistantTurnId: responseTurn.identity,
                 traceId: turn.traceId, executionKey: turn.outputArtifactExecutionKey,
                 target: turn.outputArtifactTarget, abortSignal: turn.abortSignal,
+                launcherOwner: launcherSurfaceId ? {
+                  descriptorPath: this.config.browserHostDescriptorPath!, traceId: turn.traceId,
+                  helperPid: process.pid, surfaceId: launcherSurfaceId,
+                  jobId: turn.outputArtifactTarget.metadata?.jobId ?? turn.outputArtifactExecutionKey,
+                } : undefined,
               });
               for (const artifact of capture.artifacts) turn.onOutputArtifact?.(artifact);
               if (capture.failures.length > 0 || capture.artifacts.length === 0) {
-                const message = `Generated image capture failed for ${capture.failures.length} artifact(s)`;
+                const failureCodes = capture.failures.map(failure => `${failure.candidateKey}:${failure.code}`).join(",");
+                const message = `Generated image capture failed for ${capture.failures.length} artifact(s) (${failureCodes || "no_artifact"})`;
                 if (turn.outputArtifactTarget.capturePolicy === "required") throw new Error(message);
                 turn.onOutputArtifactWarning?.(message);
               }

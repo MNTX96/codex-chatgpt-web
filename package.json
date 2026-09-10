@@ -11,7 +11,7 @@
   "bugs": {
     "url": "https://github.com/miuuyy/codex-chatgpt-web/issues"
   },
-  "packageManager": "bun@1.4.0",
+  "packageManager": "bun@1.4.2",
   "type": "module",
   "bin": {
     "codex-chatgpt-web": "./src/cli.ts"
@@ -29,6 +29,7 @@
     "dev:launcher": "bun run src/cli.ts dev launcher",
     "dev:chat": "bun run src/cli.ts dev chat",
     "test": "bun test ./tests",
+    "test:image-transfer:electron": "bun test ./integration/image-transfer-electron.test.ts",
     "audit": "bun audit",
     "check-version": "bun run scripts/check-version.ts",
     "typecheck": "bun x --no-install --bun tsc --noEmit",
@@ -65,17 +66,17 @@
     "zod": "4.4.3"
   },
   "devDependencies": {
-    "@types/bun": "1.4.0",
+    "@types/bun": "1.4.2",
     "@types/turndown": "5.0.5",
     "typescript": "5.9.3"
   },
   "engines": {
-    "bun": "1.4.0"
+    "bun": "1.4.2"
   },
   "overrides": {
     "@hono/node-server": "2.0.12",
     "fast-uri": "3.1.6",
-    "hono": "4.12.34",
+    "hono": "4.13.7",
     "qs": "6.16.0",
     "zod-to-json-schema": "3.25.1"
   },

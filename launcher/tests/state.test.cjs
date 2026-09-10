@@ -19,14 +19,13 @@ test("launcher state persists onboarding, language, and autostart atomically", (
       version: 1,
       language: null,
       onboardingComplete: false,
-      githubOpened: false,
-      xOpened: false,
       autoStart: true,
       keepRunningOnClose: true,
       showBrowserDuringTurns: true,
       browserInteractionMode: "automatic",
       experimentalBiggerContext: false,
       zeroRiskProEnabled: false,
+      imageFactoryProjectId: null,
       browserSmokePassed: false,
       browserSmokeVersion: null,
       sidebarOpen: true,
@@ -45,14 +44,13 @@ test("launcher state persists onboarding, language, and autostart atomically", (
       version: 1,
       language: "zh-CN",
       onboardingComplete: true,
-      githubOpened: false,
-      xOpened: false,
       autoStart: true,
       keepRunningOnClose: false,
       showBrowserDuringTurns: true,
       browserInteractionMode: "automatic",
       experimentalBiggerContext: false,
       zeroRiskProEnabled: false,
+      imageFactoryProjectId: null,
       browserSmokePassed: true,
       browserSmokeVersion: "0.2.0",
       sidebarOpen: true,
@@ -96,6 +94,8 @@ test("persisted sidebar corruption is repaired without changing the rest of laun
       version: 1,
       language: "zh-CN",
       onboardingComplete: "yes",
+      githubOpened: true,
+      xOpened: true,
       autoStart: "yes",
       bridgeEnabled: false,
       browserSmokePassed: "yes",
@@ -110,14 +110,13 @@ test("persisted sidebar corruption is repaired without changing the rest of laun
       version: 1,
       language: "zh-CN",
       onboardingComplete: false,
-      githubOpened: false,
-      xOpened: false,
       autoStart: true,
       keepRunningOnClose: true,
       showBrowserDuringTurns: true,
       browserInteractionMode: "automatic",
       experimentalBiggerContext: false,
       zeroRiskProEnabled: false,
+      imageFactoryProjectId: null,
       browserSmokePassed: false,
       browserSmokeVersion: null,
       sidebarOpen: true,
@@ -125,6 +124,24 @@ test("persisted sidebar corruption is repaired without changing the rest of laun
       mcpGuideStep: 0,
       sessionRefreshReminderAt: null,
     });
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Image Factory project id is launcher-local, trimmed, and clearable", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-image-factory-state-"));
+  const file = path.join(root, "state.json");
+  try {
+    const store = createStateStore(file);
+    store.update({ imageFactoryProjectId: "  custom-project-id  " });
+    assert.equal(createStateStore(file).read().imageFactoryProjectId, "custom-project-id");
+    store.update({ imageFactoryProjectId: null });
+    assert.equal(createStateStore(file).read().imageFactoryProjectId, null);
+    fs.writeFileSync(file, JSON.stringify({ version: 1, imageFactoryProjectId: 123 }));
+    assert.equal(createStateStore(file).read().imageFactoryProjectId, null);
+    fs.writeFileSync(file, JSON.stringify({ version: 1, imageFactoryProjectId: "   " }));
+    assert.equal(createStateStore(file).read().imageFactoryProjectId, null);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

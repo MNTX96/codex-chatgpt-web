@@ -183,7 +183,7 @@ async function run(message: RunMessage): Promise<void> {
     throw new Error("Browser helper chat surface is invalid");
   }
   if (message.turn.surface === "persistent"
-    && (typeof message.turn.persistentProjectId !== "string" || !/^g-p-[A-Za-z0-9_-]{16,128}$/.test(message.turn.persistentProjectId))) {
+    && (typeof message.turn.persistentProjectId !== "string" || !message.turn.persistentProjectId.trim())) {
     throw new Error("Browser helper persistent project id is invalid");
   }
   if (message.turn.executionTarget?.output === "image"
@@ -578,5 +578,6 @@ writeProtocol({
     "multipart-stage-ack",
     "output-artifact-v1",
     "image-factory-v1",
+    "image-transfer-v1",
   ],
 });

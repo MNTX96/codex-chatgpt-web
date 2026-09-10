@@ -7,6 +7,14 @@ function processRunning(pid) {
   if (!Number.isInteger(pid) || pid < 1) return false;
   try {
     process.kill(pid, 0);
+    if (process.platform !== "win32") {
+      const result = spawnSync("ps", ["-o", "stat=", "-p", String(pid)], {
+        encoding: "utf8",
+        timeout: 2_000,
+        windowsHide: true,
+      });
+      if (!result.error && result.status === 0 && /^\s*Z/.test(result.stdout || "")) return false;
+    }
     return true;
   } catch (error) {
     // EPERM proves the process exists even though this user cannot signal it.

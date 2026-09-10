@@ -1004,6 +1004,77 @@ describe("ChatGPT outer-native harness v4", () => {
     sessions.clear();
   });
 
+  test("an interrupted native turn cannot restart through a delayed request with a different revision", async () => {
+    const sessions = new ChatGptTurnSessions();
+    const runtime = () => ({
+      mode: "read-only" as const,
+      browser: Promise.resolve("old result"),
+      physicalSettlement: Promise.resolve(),
+      trace: new ChatGptTraceFeed(),
+      text: new ChatGptTextFeed(),
+      cancel: () => {},
+    });
+    const previous = sessions.getOrCreate("old", runtime, "trace", "owner", "paused");
+    await previous.browserOutcome;
+    expect(sessions.retireAbortedOwnerTurns("owner", new Set(["paused"]), "next")).toBe(1);
+    await expect(sessions.getOrCreateAfterOwnerRetirement("late-revision", "owner", runtime,
+      "late", undefined, "paused")).rejects.toMatchObject({ code: "client_cancelled" });
+    expect((await sessions.getOrCreateAfterOwnerRetirement("next", "owner", runtime,
+      "next", undefined, "new")).nativeTurnId).toBe("new");
+    sessions.clear();
+  });
+
+  test.each(["Inspect the project", "Continue with the new request"])("automatic pause retires the old browser without an Interrupt hook: %s", async instruction => {
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://pause-successor-${Date.now()}-${encodeURIComponent(instruction)}`,
+      chatgptWeb: { localToolsEnabled: false, solAvailable: true, proAvailable: true },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    let started!: () => void;
+    const ready = new Promise<void>(resolve => { started = resolve; });
+    let starts = 0;
+    let cancelled = false;
+    worker.run = turn => {
+      starts += 1;
+      if (starts > 1) {
+        turn.onTextDelta("new response");
+        return Promise.resolve("new response");
+      }
+      started();
+      return new Promise<string>((_resolve, reject) => {
+        turn.abortSignal!.addEventListener("abort", () => {
+          cancelled = true;
+          reject(turn.abortSignal!.reason);
+        }, { once: true });
+      });
+    };
+    const controller = new AbortController();
+    const original = rawWireRequest(environmentXml);
+    try {
+      const first = createChatGptWebAdapter(provider).runTurn!(original,
+        { headers: new Headers(), abortSignal: controller.signal }, () => {});
+      await ready;
+      controller.abort();
+      await expect(first).rejects.toThrow();
+      const successor = structuredClone(original);
+      const raw = successor._rawBody as { client_metadata: Record<string, string>; input: Array<Record<string, unknown>> };
+      raw.client_metadata["x-codex-turn-metadata"] = JSON.stringify({ thread_id: "thread_test_123", turn_id: "turn_next" });
+      raw.input.push({ type: "message", role: "user", content: [{ type: "input_text", text: "<turn_aborted>Paused</turn_aborted>" }],
+        internal_chat_message_metadata_passthrough: { turn_id: "turn_test_123" } });
+      raw.input.push({ ...structuredClone(raw.input[1]!), content: [{ type: "input_text", text: instruction }],
+        internal_chat_message_metadata_passthrough: { turn_id: "turn_next" } });
+      await createChatGptWebAdapter(provider).runTurn!(successor, { headers: new Headers() }, () => {});
+      expect(cancelled).toBeTrue();
+      expect(starts).toBe(2);
+      await expect(createChatGptWebAdapter(provider).runTurn!(original, { headers: new Headers() }, () => {})).rejects.toMatchObject({ code: "client_cancelled" });
+      expect(starts).toBe(2);
+    } finally {
+      worker.run = originalRun;
+    }
+  });
+
   test("a client disconnect detaches only its stream and the same round reconnects without another browser submission", async () => {
     const socketPath = brokerTestEndpoint(`cgw-h4-abort-retry-${process.pid}-${Date.now()}`);
     const provider: CodexProviderConfig = {

@@ -238,6 +238,25 @@ test("launcher browser ownership is explicit in provider configuration", () => {
   });
 });
 
+test("Image Factory project_id is optional, trimmed, and forwarded without pattern validation", () => {
+  const root = join(tmpdir(), `codex-chatgpt-web-image-factory-project-${process.pid}-${Date.now()}`);
+  roots.push(root);
+  process.env.CODEX_CHATGPT_WEB_HOME = root;
+  mkdirSync(root, { recursive: true });
+
+  const blank = defaultConfig("browser-only");
+  blank.imageFactoryProjectId = "   ";
+  writeFileSync(join(root, "config.json"), `${JSON.stringify(blank)}\n`);
+  expect(loadConfig().imageFactoryProjectId).toBeUndefined();
+
+  const configured = defaultConfig("browser-only");
+  configured.imageFactoryProjectId = "  custom-project-id  ";
+  writeFileSync(join(root, "config.json"), `${JSON.stringify(configured)}\n`);
+  const loaded = loadConfig();
+  expect(loaded.imageFactoryProjectId).toBe("custom-project-id");
+  expect(providerConfig(loaded).chatgptWeb?.imageFactoryProjectId).toBe("custom-project-id");
+});
+
 test("Luna-only provider configuration exposes only the Luna backend", () => {
   const config = defaultConfig("browser-only");
   config.solAvailable = false;

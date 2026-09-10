@@ -1,12 +1,17 @@
 import { describe, expect, test, afterEach } from "bun:test";
 import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { join } from "node:path";
 import { IMAGE_TOOL_NAMES, imageGenerateSchema, imageJobSchema, imageToolInventory, assertWebImageToolRouting } from "../src/adapters/chatgpt-web/image-factory/contracts";
 import { IMAGE_FACTORY_INSTRUCTIONS, mergeImageFactoryInstructions } from "../src/adapters/chatgpt-web/image-factory/instructions";
 import { ensureImageFactoryProject } from "../src/adapters/chatgpt-web/image-factory/project-manager";
+import { isImageFactoryProjectRow, openImageFactoryProject, readProjectRowLabel } from "../src/adapters/chatgpt-web/image-factory/project-navigation";
 import { ImageFactoryService } from "../src/adapters/chatgpt-web/image-factory/service";
 import { ImageFactoryStore, imageKey } from "../src/adapters/chatgpt-web/image-factory/state";
+import { configuredImageFactoryProjectId, resolveImageFactoryProjectId } from "../src/adapters/chatgpt-web/index";
 import { callTurnBroker, TurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
+import { LAUNCHER_BROWSER_HOST_KIND, LAUNCHER_BROWSER_IDLE_URL } from "../src/launcher-browser-host";
+import type { CodexProviderConfig } from "../src/types";
 
 const temporaryDirectories: string[] = [];
 afterEach(() => {
@@ -14,6 +19,190 @@ afterEach(() => {
 });
 
 describe("Image Factory contract", () => {
+  test("runtime project_id gate only requires a non-empty configured value", () => {
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: "browser://image-factory-project-id-test",
+      chatgptWeb: { localToolsEnabled: true, solAvailable: true, proAvailable: true },
+    };
+    expect(() => configuredImageFactoryProjectId(provider)).toThrow(
+      "Image Factory is not configured. Set project_id in Configuration → Image Factory.",
+    );
+    expect(configuredImageFactoryProjectId({
+      ...provider,
+      chatgptWeb: { ...provider.chatgptWeb, imageFactoryProjectId: "  custom-project-id  " },
+    })).toBe("custom-project-id");
+  });
+
+  test("launcher Image Factory project_id is resolved live for every job", async () => {
+    let currentProjectId: string | null = "first-project-id";
+    const server = createServer(async (request, response) => {
+      for await (const _chunk of request) {
+        // Drain the authenticated local control request.
+      }
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(`${JSON.stringify({ ok: true, projectId: currentProjectId })}\n`);
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("test server has no port");
+      const directory = mkdtempSync(join(process.env.TMPDIR ?? "/tmp", "image-factory-live-config-"));
+      temporaryDirectories.push(directory);
+      const descriptorPath = join(directory, "launcher-browser.json");
+      writeFileSync(descriptorPath, `${JSON.stringify({
+        version: 3,
+        kind: LAUNCHER_BROWSER_HOST_KIND,
+        profile: "development",
+        pid: process.pid,
+        endpoint: "http://127.0.0.1:39110",
+        control: {
+          endpoint: `http://127.0.0.1:${address.port}`,
+          token: "launcher-control-token-0123456789abcdefghijklmnop",
+        },
+        helper: { executable: process.execPath, script: import.meta.path },
+        partition: "persist:codex-web-gpt-dev-chatgpt",
+        idleUrl: LAUNCHER_BROWSER_IDLE_URL,
+        surfaceId: "launcher_surface_id_0123456789AB",
+        surfaceTargets: { launcher_surface_id_0123456789AB: "native-owned-target" },
+        createdAt: new Date().toISOString(),
+      })}\n`, { mode: 0o600 });
+      const provider: CodexProviderConfig = {
+        adapter: "chatgpt-web",
+        baseUrl: "browser://image-factory-live-project-id-test",
+        chatgptWeb: {
+          browserHost: "launcher",
+          browserHostDescriptorPath: descriptorPath,
+          imageFactoryProjectId: "stale-runtime-config-id",
+        },
+      };
+      await expect(resolveImageFactoryProjectId(provider)).resolves.toBe("first-project-id");
+      currentProjectId = "second-project-id";
+      await expect(resolveImageFactoryProjectId(provider)).resolves.toBe("second-project-id");
+      currentProjectId = null;
+      await expect(resolveImageFactoryProjectId(provider)).rejects.toThrow(
+        "Image Factory is not configured. Set project_id in Configuration → Image Factory.",
+      );
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  });
+
+  test("configured Image Factory project opens from Projects and verifies the clicked row by project_id", async () => {
+    let currentUrl = "https://chatgpt.com/projects";
+    const navigations: Array<{ url: string; options: unknown }> = [];
+    const events: string[] = [];
+    const projects = [
+      { id: "g-p-other", name: "Other project" },
+      { id: "custom-project-id", name: "Image Factory" },
+    ];
+    const rows = {
+      count: async () => projects.length,
+      nth: (index: number) => ({
+        locator: () => ({
+          first: () => ({
+            getAttribute: async (name: string) => name === "aria-label"
+              ? `Open project options for ${projects[index].name}`
+              : null,
+          }),
+        }),
+        getByRole: () => ({ textContent: async () => projects[index].name }),
+        click: async () => {
+          currentUrl = `https://chatgpt.com/g/${projects[index].id}/project`;
+        },
+      }),
+      last: () => ({ scrollIntoViewIfNeeded: async () => {} }),
+    };
+    const page = {
+      url: () => currentUrl,
+      goto: async (url: string, options: unknown) => {
+        navigations.push({ url, options });
+        currentUrl = url;
+      },
+      locator: () => rows,
+      getByRole: () => ({ waitFor: async () => {} }),
+      waitForTimeout: async () => {},
+      waitForURL: async (matcher: string | RegExp | ((url: URL) => boolean)) => {
+        const matched = typeof matcher === "function"
+          ? matcher(new URL(currentUrl))
+          : matcher instanceof RegExp
+            ? matcher.test(currentUrl)
+            : currentUrl === matcher;
+        if (!matched) throw new Error(`URL did not match: ${currentUrl}`);
+      },
+    } as unknown as Parameters<typeof openImageFactoryProject>[0];
+
+    await openImageFactoryProject(page, "  custom-project-id  ", event => events.push(event));
+    expect(navigations).toEqual([]);
+    expect(currentUrl).toBe("https://chatgpt.com/g/custom-project-id/project");
+    expect(events).toEqual([
+      "project_directory_ready",
+      "project_directory_candidate_opened",
+      "project_directory_match_opened",
+    ]);
+
+    await openImageFactoryProject(page, "custom-project-id", event => events.push(event));
+    expect(navigations).toHaveLength(0);
+    expect(events.at(-1)).toBe("project_document_reused");
+    await expect(openImageFactoryProject(page, "   ")).rejects.toThrow("Image Factory project_id is not configured");
+  });
+
+  test("adapter rounds share live image jobs within a namespace", async () => {
+    const directory = mkdtempSync(join(process.env.TMPDIR ?? "/tmp", "image-factory-shared-"));
+    temporaryDirectories.push(directory);
+    let created = 0;
+    const create = () => {
+      created += 1;
+      return new ImageFactoryService(new ImageFactoryStore(directory), "shared", async ({ signal }) => new Promise<never>((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      }), () => true);
+    };
+    const first = ImageFactoryService.shared(directory, "shared", create);
+    const parent = { threadId: "thread", signal: new AbortController().signal, activity: () => () => {},
+      environment: { cwd: directory, roots: [directory], writableRoots: [directory], tools: [], sandboxPolicy: { type: "dangerFullAccess" as const } } };
+    const job = await first.call(parent, "chatgpt_image_generate", { request_id: "request", prompt: "draw" });
+    const nextRound = ImageFactoryService.shared(directory, "shared", create);
+    expect((await nextRound.call(parent, "chatgpt_image_cancel", { job_id: job.jobId })).status).toBe("cancelled");
+    expect(created).toBe(1);
+    expect(ImageFactoryService.shared(directory, "other", create)).not.toBe(first);
+  });
+
+  test("project row matching isolates the exact title from rendered metadata", async () => {
+    const projectRow = (projectName: string, cellText = `${projectName}Today`) => {
+      const expectedButton = {
+        first() { return this; },
+        isVisible: async () => projectName === "Image Factory",
+      };
+      const cell = {
+        textContent: async () => cellText,
+      };
+      return {
+        locator: () => ({
+          first() { return this; },
+          getAttribute: async () => `Open project options for ${projectName}`,
+        }),
+        getByRole: (role: string, options?: { name?: string; exact?: boolean }) => {
+          if (role === "button") {
+            expect(options).toEqual({ name: "Open project options for Image Factory", exact: true });
+            return expectedButton;
+          }
+          return { first: () => cell };
+        },
+      } as unknown as Parameters<typeof readProjectRowLabel>[0];
+    };
+
+    const observedProductionShape = projectRow("Image Factory");
+    expect(await readProjectRowLabel(observedProductionShape)).toBe("Image Factory");
+    expect(await isImageFactoryProjectRow(observedProductionShape)).toBe(true);
+    expect(await readProjectRowLabel(projectRow("Image Factory 2"))).toBe("Image Factory 2");
+    expect(await isImageFactoryProjectRow(projectRow("Image Factory 2"))).toBe(false);
+    expect(await readProjectRowLabel(projectRow("VFMU · universe", "VFMU · universePinnedYesterday"))).toBe("VFMU · universe");
+    expect(await isImageFactoryProjectRow(projectRow("VFMU · universe"))).toBe(false);
+  });
+
   test("strict arguments cannot smuggle workspace or project authority", () => {
     expect(imageGenerateSchema.parse({ request_id: "one", prompt: " Draw " }).prompt).toBe("Draw");
     for (const key of ["workspaceRoot", "projectId", "account", "permissions"]) {
@@ -47,21 +236,13 @@ describe("Image Factory contract", () => {
     const store = new ImageFactoryStore(directory);
     const accountKey = "a".repeat(64);
     const projects = new Map<string, { id: string; memory: "project-only"; instructions: string }>();
-    let creates = 0;
+    projects.set("g-p-0000000000000001", { id: "g-p-0000000000000001", memory: "project-only", instructions: "" });
     const ui = {
       accountKey: async () => accountKey,
       list: async () => [...projects.values()].map(({ id }) => ({ id, name: "Image Factory" })),
       inspect: async (id: string) => {
         const project = projects.get(id);
         if (!project) throw new Error("missing project");
-        return project;
-      },
-      create: async (onCreated: (id: string) => void) => {
-        creates += 1;
-        const project = { id: `g-p-${creates.toString().padStart(16, "0")}`, memory: "project-only" as const, instructions: "" };
-        projects.set(project.id, project);
-        onCreated(project.id);
-        await new Promise(resolve => setTimeout(resolve, 5));
         return project;
       },
       writeInstructions: async (id: string, instructions: string) => {
@@ -75,7 +256,6 @@ describe("Image Factory contract", () => {
       ensureImageFactoryProject(store, ui),
     ]);
     expect(first.projectId).toBe(second.projectId);
-    expect(creates).toBe(1);
     expect(first.instructionsVersion).toBe(1);
     expect(projects.get(first.projectId)?.instructions).toContain("[BEGIN CODEX-CHATGPT-WEB IMAGE FACTORY v1]");
   });
@@ -87,7 +267,6 @@ describe("Image Factory contract", () => {
     const accountKey = "b".repeat(64);
     const projectId = "g-p-1234567890abcdef";
     store.write("project", imageKey("project", accountKey), { accountKey, projectId, phase: "created" });
-    let created = 0;
     const ui = {
       accountKey: async () => accountKey,
       list: async () => {
@@ -96,14 +275,27 @@ describe("Image Factory contract", () => {
       inspect: async () => {
         throw new Error("project UI temporarily unavailable");
       },
-      create: async () => {
-        created += 1;
-        throw new Error("unexpected replacement");
-      },
       writeInstructions: async () => {},
     };
     await expect(ensureImageFactoryProject(store, ui)).rejects.toThrow("previously created Image Factory project");
-    expect(created).toBe(0);
+  });
+
+  test("cancelling project inspection prevents a later instructions write", async () => {
+    const directory = mkdtempSync(join(process.env.TMPDIR ?? "/tmp", "image-factory-setup-abort-"));
+    temporaryDirectories.push(directory);
+    const controller = new AbortController();
+    let writes = 0;
+    const ui = {
+      accountKey: async () => "a".repeat(64),
+      list: async () => [{ id: "g-p-0000000000000001", name: "Image Factory" }],
+      inspect: async (id: string) => {
+        controller.abort();
+        return { id, memory: "project-only" as const, instructions: "" };
+      },
+      writeInstructions: async () => { writes += 1; },
+    };
+    await expect(ensureImageFactoryProject(new ImageFactoryStore(directory), ui, () => {}, controller.signal)).rejects.toThrow();
+    expect(writes).toBe(0);
   });
 
   test("image jobs are idempotent, write through the trusted target, and preserve references", async () => {
@@ -167,6 +359,19 @@ describe("Image Factory contract", () => {
     const cancelled = await service.call(parent, "chatgpt_image_cancel", { job_id: first.jobId });
     expect(cancelled.status).toBe("cancelled");
     expect(readdirSync(join(directory, "state")).some(name => name.startsWith("job-"))).toBe(true);
+  });
+
+  test("a rejected parent activity cannot leave a phantom running job", async () => {
+    const directory = mkdtempSync(join(process.env.TMPDIR ?? "/tmp", "image-factory-activity-"));
+    temporaryDirectories.push(directory);
+    const store = new ImageFactoryStore(join(directory, "state"));
+    const service = new ImageFactoryService(store, "namespace", async () => ({ status: "failed", artifacts: [] }), () => true);
+    const environment = { cwd: directory, roots: [directory], writableRoots: [directory],
+      sandboxPolicy: { type: "dangerFullAccess" as const }, tools: [] };
+    const parent = { threadId: "thread", environment, signal: new AbortController().signal,
+      activity: (): (() => void) => { throw new Error("parent retired"); } };
+    await expect(service.call(parent, "chatgpt_image_generate", { request_id: "request", prompt: "draw" })).rejects.toThrow("parent retired");
+    expect(readdirSync(store.directory)).toHaveLength(0);
   });
 
   test("the turn broker exposes virtual image calls without queuing native tool work", async () => {

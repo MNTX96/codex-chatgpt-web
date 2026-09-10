@@ -186,7 +186,7 @@ export async function assertPersistentChatPage(
   if (url.origin !== "https://chatgpt.com" || url.searchParams.get("temporary-chat") === "true") {
     throw new Error("ChatGPT persistent surface is not a normal authenticated chat page");
   }
-  if (projectId && !url.pathname.includes(`/g/${projectId}`)) {
+  if (projectId && !url.pathname.startsWith(`/g/${projectId}/`)) {
     throw new Error("ChatGPT persistent surface is outside the configured Image Factory project");
   }
   await assertAuthenticatedChatGptPage(page);

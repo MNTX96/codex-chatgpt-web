@@ -499,6 +499,7 @@ export class ChatGptTurnSessions {
   private readonly retirements = new Map<string, Promise<void>>();
   private readonly ownerRetirements = new Map<string, Promise<void>>();
   private readonly conversationRetirements = new Map<string, Promise<void>>();
+  private readonly interruptedTurns = new Map<string, number>();
 
   constructor(
     private readonly ttlMs = 30 * 60_000,
@@ -515,6 +516,7 @@ export class ChatGptTurnSessions {
     instruction?: string,
   ): ChatGptTurnSession {
     this.prune();
+    this.assertTurnNotInterrupted(ownerKey, nativeTurnId);
     const existing = this.entries.get(key);
     if (existing) {
       if (existing.supersededError) throw existing.supersededError;
@@ -547,6 +549,7 @@ export class ChatGptTurnSessions {
   ): Promise<ChatGptTurnSession> {
     for (;;) {
       if (signal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
+      this.assertTurnNotInterrupted(ownerKey, nativeTurnId);
       const existing = this.entries.get(key);
       if (existing) {
         if (existing.supersededError) throw existing.supersededError;
@@ -711,12 +714,12 @@ export class ChatGptTurnSessions {
     abortedTurnIds: ReadonlySet<string>,
     keepKey: string,
   ): number {
+    for (const turnId of abortedTurnIds) this.rememberInterruptedTurn(ownerKey, turnId);
     const matches = [...this.entries].filter(([key, session]) => (
       key !== keepKey
       && session.ownerKey === ownerKey
       && session.nativeTurnId !== undefined
       && abortedTurnIds.has(session.nativeTurnId)
-      && session.isActive()
     ));
     for (const [key, session] of matches) {
       this.entries.delete(key);
@@ -761,6 +764,7 @@ export class ChatGptTurnSessions {
     ));
     for (const [key, session] of matches) {
       if (this.entries.get(key) !== session) continue;
+      if (session.ownerKey) this.rememberInterruptedTurn(session.ownerKey, turnId);
       this.entries.delete(key);
       this.forgetConversationHead(session);
     }
@@ -798,6 +802,21 @@ export class ChatGptTurnSessions {
     }
   }
 
+  private rememberInterruptedTurn(ownerKey: string, turnId: string): void {
+    this.interruptedTurns.set(JSON.stringify([ownerKey, turnId]), Date.now());
+    for (const [key, interruptedAt] of this.interruptedTurns) {
+      if (interruptedAt < Date.now() - this.ttlMs) this.interruptedTurns.delete(key);
+    }
+  }
+
+  private assertTurnNotInterrupted(ownerKey?: string, turnId?: string): void {
+    if (!ownerKey || !turnId) return;
+    const interruptedAt = this.interruptedTurns.get(JSON.stringify([ownerKey, turnId]));
+    if (interruptedAt !== undefined && interruptedAt >= Date.now() - this.ttlMs) {
+      throw chatGptTurnSupersededError();
+    }
+  }
+
   private forgetConversationHead(session: ChatGptTurnSession): void {
     const conversationKey = session.conversationKey();
     if (conversationKey && this.conversationHeads.get(conversationKey) === session) {
@@ -814,7 +833,7 @@ export class ChatGptTurnSessions {
     this.retirements.set(key, retirement);
     void retirement.then(() => {
       if (this.retirements.get(key) === retirement) this.retirements.delete(key);
-    });
+    }, () => {});
     if (session.ownerKey) {
       const previous = this.ownerRetirements.get(session.ownerKey);
       const ownerRetirement = previous
@@ -825,7 +844,7 @@ export class ChatGptTurnSessions {
         if (this.ownerRetirements.get(session.ownerKey!) === ownerRetirement) {
           this.ownerRetirements.delete(session.ownerKey!);
         }
-      });
+      }, () => {});
     }
     if (conversationKey) {
       const previous = this.conversationRetirements.get(conversationKey);

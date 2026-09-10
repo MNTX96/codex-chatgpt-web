@@ -98,6 +98,12 @@ class BrowserControlServer {
       || request.url === "/v1/turn/end";
     const isTurnRelease = request.url === "/v1/turn/release";
     const isSessionInspect = request.url === "/v1/session/inspect";
+    const isImageFactoryConfig = request.url === "/v1/image-factory/config";
+    const imageDownloadAction = new Map([
+      ["/v1/image-download/begin", "begin"],
+      ["/v1/image-download/status", "status"],
+      ["/v1/image-download/release", "release"],
+    ]).get(request.url);
     const manualAction = new Map([
       ["/v1/manual/start", "start"],
       ["/v1/manual/wait-sent", "wait-sent"],
@@ -106,7 +112,7 @@ class BrowserControlServer {
       ["/v1/manual/end", "end"],
       ["/v1/manual/cancel", "cancel"],
     ]).get(request.url);
-    if (request.method !== "POST" || (!isTurn && !isTurnRelease && !isSessionInspect && !manualAction)) {
+    if (request.method !== "POST" || (!isTurn && !isTurnRelease && !isSessionInspect && !isImageFactoryConfig && !manualAction && !imageDownloadAction)) {
       writeJson(response, 404, { error: "not_found" });
       return;
     }
@@ -116,6 +122,13 @@ class BrowserControlServer {
         manualAction === "start" ? MAX_MANUAL_START_BODY_BYTES : MAX_BODY_BYTES,
       );
       const preferences = this.getPreferences();
+      if (isImageFactoryConfig) {
+        const projectId = typeof preferences.imageFactoryProjectId === "string"
+          ? preferences.imageFactoryProjectId.trim()
+          : "";
+        writeJson(response, 200, { ok: true, projectId: projectId || null });
+        return;
+      }
       const host = this.getBrowserHost();
       if (!host) throw new Error("browser host is not ready");
       if (isSessionInspect) {
@@ -144,6 +157,11 @@ class BrowserControlServer {
       }
       if (!Number.isInteger(body.helperPid) || body.helperPid < 1) {
         throw new Error("browser helper pid is invalid");
+      }
+      if (imageDownloadAction) {
+        const result = host.imageDownload(imageDownloadAction, body);
+        writeJson(response, 200, { ok: true, ...result });
+        return;
       }
       if (body.conversationKey !== undefined && !/^[a-f0-9]{64}$/.test(body.conversationKey)) {
         throw new Error("conversationKey is invalid");
@@ -326,6 +344,7 @@ class BrowserControlServer {
           : manualTimedOut ? 408 : 400,
         {
         error: message,
+        ...(typeof error?.code === "string" && /^image_download_[a-z_]+$/.test(error.code) ? { code: error.code } : {}),
         ...(cancelled ? { code: "turn_cancelled" } : {}),
         ...(retainedUnavailable ? { code: "retained_conversation_unavailable" } : {}),
         ...(manualInspectionDisabled ? { code: "manual_browser_inspection_disabled" } : {}),

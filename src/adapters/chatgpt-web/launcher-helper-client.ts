@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";
-import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 import { notifyLauncherTurn, readLauncherBrowserHostDescriptor } from "../../launcher-browser-host";
 import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError } from "./adapter-error";
@@ -263,6 +263,9 @@ export class LauncherBrowserHelperClient {
         "Launcher browser helper does not support Image Factory turns; update or restart the launcher",
       );
     }
+    if ((turn.executionTarget?.output === "image" || turn.requireOutputArtifact) && !this.helperFeatures.has("image-transfer-v1")) {
+      throw new Error("Launcher browser helper does not support image-transfer-v1; load the updated runtime before generating images");
+    }
     return await new Promise<string>((resolveResult, rejectResult) => {
         if (this.pending.has(turn.traceId)) {
           rejectResult(new Error(`Duplicate launcher browser turn: ${turn.traceId}`));
@@ -461,7 +464,7 @@ export class LauncherBrowserHelperClient {
         const artifact = message.artifact;
         const outsideTarget = !target || (() => {
           const result = relative(resolve(target.outputDirectory), resolve(artifact.absolutePath));
-          return result.startsWith(`..${sep}`) || result === "..";
+          return result.startsWith(`..${sep}`) || result === ".." || isAbsolute(result);
         })();
         const expectedRelative = target ? relative(resolve(target.workspaceRoot), resolve(artifact.absolutePath)).replaceAll("\\", "/") : "";
         if (outsideTarget || artifact.relativePath !== expectedRelative) {

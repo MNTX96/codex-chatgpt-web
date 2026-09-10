@@ -1594,6 +1594,71 @@ test("launcher recovers a stale tunnel even when no stale Responses proxy is rea
   }
 });
 
+test("repeated failed Setup preserves the orphaned daemon marker", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "launcher-marker-preserve-"));
+  const descriptorPath = path.join(root, "runtime", "launcher-browser.json");
+  fs.mkdirSync(path.dirname(descriptorPath), { recursive: true });
+  const supervisor = new RuntimeSupervisor({
+    app: { getVersion: () => "0.2.0", isPackaged: false },
+    logger: { info() {}, warn() {}, error() {} },
+    sourceRoot: root, coreHome: root, browserDescriptorPath: descriptorPath,
+  });
+  const state = { version: 1, ownerPid: 999_999_999, daemonPid: process.pid,
+    tunnelPid: null, status: "ready", updatedAt: new Date().toISOString() };
+  fs.writeFileSync(supervisor.statePath, JSON.stringify(state));
+  supervisor.readConfig = () => launcherConfig(descriptorPath);
+  supervisor.proxyHealth = async () => true;
+  supervisor.stopStaleOwnedRuntime = async () => { throw new Error("runtime is busy"); };
+  try {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      await assert.rejects(supervisor.stopForSetup(), /runtime is busy/);
+      assert.deepEqual(supervisor.readState(), state);
+    }
+    assert.equal((await supervisor.forceStopOwnedRuntime(new Error("setup failed"))).status, "forced-partial");
+    assert.deepEqual(supervisor.readState(), state);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("lost child evidence requires authenticated idle drain before recovering a daemon", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "launcher-marker-repair-"));
+  const descriptorPath = path.join(root, "runtime", "launcher-browser.json");
+  fs.mkdirSync(path.dirname(descriptorPath), { recursive: true });
+  const supervisor = new RuntimeSupervisor({
+    app: { getVersion: () => "0.2.0", isPackaged: false },
+    logger: { info() {}, warn() {}, error() {} },
+    sourceRoot: root, coreHome: root, browserDescriptorPath: descriptorPath,
+  });
+  const config = launcherConfig(descriptorPath);
+  const state = { version: 1, ownerPid: process.pid, daemonPid: null,
+    tunnelPid: null, status: "failed", updatedAt: new Date().toISOString() };
+  const actions = [];
+  supervisor.proxyHealthPayload = async () => ({ service: "codex-chatgpt-web", mode: config.mode,
+    version: config.releaseVersion, pid: 123456 });
+  supervisor.proxyHealth = async () => true;
+  supervisor.control = async (_config, action) => { actions.push(action); return { status: "ok" }; };
+  supervisor.waitForProcessExit = async () => {};
+  supervisor.waitForPortRelease = async () => {};
+  try {
+    fs.writeFileSync(supervisor.statePath, JSON.stringify(state));
+    supervisor.acquireDrain = async () => { throw new Error("HTTP 401"); };
+    await assert.rejects(supervisor.stopStaleOwnedRuntime(config), /HTTP 401/);
+    assert.deepEqual(supervisor.readState(), state);
+    assert.deepEqual(actions, []);
+    supervisor.acquireDrain = async () => { actions.push("drain"); return true; };
+    assert.equal(await supervisor.stopStaleOwnedRuntime(config), true);
+    assert.deepEqual(actions, ["drain", "resume", "drain", "shutdown"]);
+    assert.equal(supervisor.readState(), null);
+    fs.writeFileSync(supervisor.statePath, JSON.stringify({ ...state, daemonPid: 654321 }));
+    actions.length = 0;
+    await assert.rejects(supervisor.stopStaleOwnedRuntime(config), /does not match/);
+    assert.deepEqual(actions, []);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("stale ownership recovery stops a managed tmux runtime even though it has no PID", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-stale-tmux-tunnel-"));
   const supervisor = new RuntimeSupervisor({

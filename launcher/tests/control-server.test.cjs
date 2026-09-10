@@ -3,6 +3,34 @@ const assert = require("node:assert/strict");
 const { BrowserHost } = require("../electron/browser-host.cjs");
 const { BrowserControlServer } = require("../electron/control-server.cjs");
 
+test("browser control server exposes live launcher-local Image Factory configuration", async () => {
+  let preferences = { imageFactoryProjectId: null };
+  const server = await new BrowserControlServer({
+    logger: { info() {}, warn() {}, error() {} },
+    getBrowserHost: () => { throw new Error("Image Factory config must not require browser work"); },
+    getPreferences: () => preferences,
+  }).start();
+  const descriptor = server.descriptor();
+  const read = async () => {
+    const response = await fetch(`${descriptor.endpoint}/v1/image-factory/config`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${descriptor.token}`, "content-type": "application/json" },
+      body: "{}",
+    });
+    assert.equal(response.status, 200);
+    return response.json();
+  };
+  try {
+    assert.deepEqual(await read(), { ok: true, projectId: null });
+    preferences = { imageFactoryProjectId: "  custom-project-id  " };
+    assert.deepEqual(await read(), { ok: true, projectId: "custom-project-id" });
+    preferences = { imageFactoryProjectId: null };
+    assert.deepEqual(await read(), { ok: true, projectId: null });
+  } finally {
+    await server.close();
+  }
+});
+
 test("browser control server authenticates and owns turn visibility", async () => {
   const calls = [];
   const logs = [];

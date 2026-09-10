@@ -38,6 +38,7 @@ export class LauncherManualTurnFailedError extends Error {
 
 export interface LauncherBrowserHostDescriptor {
   version: 3;
+  features?: string[];
   kind: typeof LAUNCHER_BROWSER_HOST_KIND;
   profile: LauncherBrowserHostProfile;
   pid: number;
@@ -85,6 +86,10 @@ function assertDescriptorShape(value: unknown): LauncherBrowserHostDescriptor {
   const descriptor = value as Partial<LauncherBrowserHostDescriptor>;
   if (descriptor.version !== 3 || descriptor.kind !== LAUNCHER_BROWSER_HOST_KIND) {
     throw new Error("Launcher browser descriptor has an unsupported identity or version; restart the updated launcher");
+  }
+  if (descriptor.features !== undefined && (!Array.isArray(descriptor.features)
+    || descriptor.features.some(feature => typeof feature !== "string"))) {
+    throw new Error("Launcher browser descriptor has invalid features");
   }
   if (descriptor.profile !== "production" && descriptor.profile !== "development") {
     throw new Error("Launcher browser descriptor has an invalid profile");
@@ -135,6 +140,7 @@ function assertDescriptorShape(value: unknown): LauncherBrowserHostDescriptor {
   }
   return {
     version: 3,
+    ...(descriptor.features ? { features: descriptor.features } : {}),
     kind: LAUNCHER_BROWSER_HOST_KIND,
     profile: descriptor.profile,
     pid: descriptor.pid!,
@@ -354,6 +360,40 @@ export async function inspectLauncherBrowserHost(
 
 export const LAUNCHER_SESSION_INSPECTION_TIMEOUT_MS = 30_000;
 export const LAUNCHER_CAPABILITY_INSPECTION_TIMEOUT_MS = 120_000;
+export const LAUNCHER_IMAGE_FACTORY_CONFIG_TIMEOUT_MS = 5_000;
+
+export async function readLauncherImageFactoryProjectId(
+  descriptorPath: string,
+  timeoutMs = LAUNCHER_IMAGE_FACTORY_CONFIG_TIMEOUT_MS,
+): Promise<string | null> {
+  const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(`${descriptor.control.endpoint}/v1/image-factory/config`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${descriptor.control.token}`,
+        "content-type": "application/json",
+      },
+      body: "{}",
+      signal: controller.signal,
+    });
+    const body = await response.json().catch(() => ({})) as Record<string, unknown>;
+    if (!response.ok) {
+      throw new Error(typeof body.error === "string" ? body.error : `HTTP ${response.status}`);
+    }
+    if (body.projectId === null) return null;
+    if (typeof body.projectId !== "string" || !body.projectId.trim()) {
+      throw new Error("Launcher returned invalid Image Factory configuration");
+    }
+    return body.projectId.trim();
+  } catch (error) {
+    throw new Error(`Launcher Image Factory configuration could not be read: ${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 export type LauncherTurnActivity =
   | {

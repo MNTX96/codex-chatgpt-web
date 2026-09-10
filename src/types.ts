@@ -303,6 +303,8 @@ export interface CodexProviderConfig {
     autoApproveToolCalls?: boolean;
     /** DEV-only experimental transport: adapt one context across one, two, or three ChatGPT messages. */
     experimentalBiggerContext?: boolean;
+    /** ChatGPT project used by the retained Image Factory conversation. */
+    imageFactoryProjectId?: string;
     /** Persist ChatGPT-generated images inside the trusted Codex workspace. */
     generatedImageArtifacts?: {
       mode?: "off" | "workspace";
