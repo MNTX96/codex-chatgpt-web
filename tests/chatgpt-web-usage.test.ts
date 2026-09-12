@@ -54,6 +54,32 @@ test("Bigger Context compaction selects three parts before the legacy inline byt
     .toEqual([parsed.context.messages[0]!.content]);
 });
 
+test("multipart staging keeps the requested effort when its per-message limits fit", () => {
+  expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol",capabilities,90_000,450_000,"max").effort).toBe("max");
+  expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol",capabilities,60_000,300_000,"medium").effort).toBe("medium");
+  expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol",{...capabilities,proAvailable:false},60_000,300_000,"high").effort).toBe("high");
+  expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol",{...capabilities,proAvailable:false},60_000,300_000,"low").effort).toBe("medium");
+});
+
+test("an indivisible oversized record is preserved and rejected instead of silently trimmed or retried", () => {
+  const plus={...capabilities,proAvailable:false};
+  const parsed=request("atomic-record:"+"word ".repeat(100_000));
+  const parts=resolveBiggerContextMultipartParts(parsed,plus);
+  expect(parts).toBe(3);
+  const compiled=compileChatGptWebPrompt(parsed,plus,undefined,{experimentalMultipartParts:parts});
+  const records=compiled.multipart!.parts.flatMap(part=>JSON.parse(part).records);
+  expect(records).toHaveLength(1);
+  expect(records[0].message.content).toBe(parsed.context.messages[0]!.content);
+  expect(compiled.trimmedCompactionMessages).toBeUndefined();
+  const messages=compiledChatGptWebMessages(compiled);
+  const stageTokens=Math.max(...messages.slice(0,-1).map(text=>estimateTokens(text)));
+  const stageChars=Math.max(...messages.slice(0,-1).map(text=>text.length));
+  let failure:unknown;
+  try { resolveChatGptWebMultipartStagingMode(parsed.modelId,plus,stageTokens,stageChars); }
+  catch(error){failure=error;}
+  expect(failure).toMatchObject({code:"context_length_exceeded",retryable:false,status:400});
+},15_000);
+
 test("multipart planning leaves room for final attachments and execution instructions without losing history", () => {
   for (const scenario of [
     { proAvailable: false, images: 3, schema: false },

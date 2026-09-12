@@ -186,8 +186,13 @@ export async function assertPersistentChatPage(
   if (url.origin !== "https://chatgpt.com" || url.searchParams.get("temporary-chat") === "true") {
     throw new Error("ChatGPT persistent surface is not a normal authenticated chat page");
   }
-  if (projectId && !url.pathname.startsWith(`/g/${projectId}/`)) {
-    throw new Error("ChatGPT persistent surface is outside the configured Image Factory project");
+  if (projectId) {
+    const prefix = `/g/${projectId}`;
+    const suffix = url.pathname.startsWith(prefix) ? url.pathname.slice(prefix.length) : "";
+    const belongsToProject = /^(?:-[A-Za-z0-9_-]{1,160})?\/(?:project\/?|c\/[A-Za-z0-9:_-]{8,160}\/?)$/.test(suffix);
+    if (!belongsToProject) {
+      throw new Error("ChatGPT persistent surface is outside the configured Image Factory project");
+    }
   }
   await assertAuthenticatedChatGptPage(page);
   const composer = page.locator(CHATGPT_COMPOSER_SELECTOR).filter({ visible: true });

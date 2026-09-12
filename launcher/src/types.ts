@@ -14,6 +14,7 @@ export interface LauncherState {
   experimentalBiggerContext: boolean;
   zeroRiskProEnabled: boolean;
   imageFactoryProjectId: string | null;
+  imageFactoryProjectName: string | null;
   sidebarOpen: boolean;
   sidebarWidth: number;
   browserSmokePassed?: boolean;
@@ -102,6 +103,7 @@ export interface LauncherSnapshot {
   connectorName: string;
   connectorNames: Record<BrowserInteractionMode, string>;
   imageFactoryProjectId: string | null;
+  imageFactoryProjectName: string | null;
   mcpCredentialsConfigured: boolean;
   logs: LogRecord[];
   urls: {
@@ -143,7 +145,7 @@ export interface LauncherApi {
   cancelTurns(): Promise<{ stdout: string }>;
   uninstallIntegration(): Promise<{ cancelled: true } | { cancelled: false; state: LauncherState }>;
   setupCore(): Promise<{ ok: boolean; stdout: string; restartRequired: boolean }>;
-  setImageFactoryProjectId(projectId: string | null): Promise<LauncherSnapshot>;
+  setImageFactoryProjectId(projectId: string | null, projectName?: string | null): Promise<LauncherSnapshot>;
   setupMcp(input: {
     tunnelId?: string;
     runtimeKey?: string;

@@ -8,6 +8,7 @@ const {
   verifyConnectorWithBrowserHelper,
 } = require("./browser-helper-verifier.cjs");
 const { validateConnectorName } = require("./connector-identity.cjs");
+const { verifiedImageFactoryConversationUrl } = require("./image-factory-conversation.cjs");
 const { processRunning } = require("./process-tree.cjs");
 const { validatePasskeyLoginState } = require("./passkey-login-state.cjs");
 const {
@@ -523,7 +524,7 @@ class BrowserHost {
     return this.turnTabs.get(this.selectedTabId) || null;
   }
 
-  async createTurnTab(traceId, helperPid, conversationKey, connectorIdentity) {
+  async createTurnTab(traceId, helperPid, conversationKey, connectorIdentity, initialUrl = IDLE_BROWSER_URL) {
     if (this.turnTabs.size >= MAX_BROWSER_TABS
       && !BrowserHost.prototype.evictOldestReclaimableTurnTab.call(this)) {
       throw new Error(
@@ -558,7 +559,7 @@ class BrowserHost {
       ordinal,
       label: `ChatGPT ${ordinal}`,
       pageTitle: "ChatGPT",
-      url: IDLE_BROWSER_URL,
+      url: initialUrl,
       loading: true,
       message: "ChatGPT is working",
       interactionMode: "automatic",
@@ -578,7 +579,7 @@ class BrowserHost {
     this.bindShellZoomShortcuts(view.webContents);
     this.bindTurnContents(tab);
     try {
-      await loadCommittedBrowserSurface(view.webContents, IDLE_BROWSER_URL);
+      await loadCommittedBrowserSurface(view.webContents, initialUrl);
       await this.markTurnTabSurface(tab);
       tab.initializingSurface = false;
     } catch (error) {
@@ -1403,6 +1404,16 @@ class BrowserHost {
         evidence,
       });
       this.removeTurnTab(tab, true);
+      // Closing the native view alone cannot settle a helper awaiting prompt preparation. Cancel
+      // the owning runtime trace as well so its HTTP response and active-turn accounting unwind.
+      if (this.cancelTurn) {
+        void Promise.resolve().then(() => this.cancelTurn(tab.traceId)).catch(error => {
+          this.logger.warn("browser.orphan_turn_cancellation_failed", {
+            traceId: tab.traceId,
+            message: error instanceof Error ? error.message : String(error),
+          });
+        });
+      }
     }
   }
 
@@ -2226,12 +2237,24 @@ class BrowserHost {
     conversationKey,
     connectorIdentity,
     requireRetainedConversation = false,
+    resumeConversationUrl,
+    persistentProjectId,
   ) {
     if (this.manualOperation) {
       throw new Error(`ChatGPT browser is busy with ${this.manualOperation}`);
     }
     if (this.userCancelledTurnOwners.has(traceId)) {
       throw new BrowserTurnCancelledError(traceId);
+    }
+    let verifiedRecoveryUrl;
+    if (resumeConversationUrl !== undefined || persistentProjectId !== undefined) {
+      if (!requireRetainedConversation || !conversationKey || connectorIdentity !== undefined) {
+        throw new Error("Retained Image Factory recovery metadata is not valid for this browser turn");
+      }
+      verifiedRecoveryUrl = verifiedImageFactoryConversationUrl(resumeConversationUrl, persistentProjectId);
+      if (!verifiedRecoveryUrl) {
+        throw new Error("Retained Image Factory recovery URL is invalid");
+      }
     }
     const sameTrace = [...this.turnTabs.values()].find((tab) => tab.traceId === traceId);
     if (sameTrace && sameTrace.interactionMode !== "automatic") {
@@ -2297,6 +2320,43 @@ class BrowserHost {
       };
     }
     if (requireRetainedConversation) {
+      if (verifiedRecoveryUrl) {
+        let recovered;
+        try {
+          recovered = await this.createTurnTab(
+            traceId,
+            helperPid,
+            conversationKey,
+            connectorIdentity,
+            verifiedRecoveryUrl,
+          );
+          const committedUrl = recovered.view?.webContents?.getURL?.();
+          if (verifiedImageFactoryConversationUrl(committedUrl, persistentProjectId) !== verifiedRecoveryUrl) {
+            throw new Error("Recovered browser tab did not commit the saved Image Factory conversation");
+          }
+        } catch (cause) {
+          if (recovered && this.turnTabs.has(recovered.id)) this.removeTurnTab(recovered, true);
+          const error = new Error("The retained ChatGPT conversation is no longer available", { cause });
+          error.code = "retained_conversation_unavailable";
+          throw error;
+        }
+        this.selectedTabId = recovered.id;
+        if (reveal) this.show();
+        else this.syncViewVisibility();
+        this.publishState?.(this.snapshot());
+        this.logger.info("browser.tab_recovered", {
+          tabId: recovered.id,
+          traceId,
+          projectId: persistentProjectId,
+        });
+        this.writeDescriptor();
+        return {
+          surfaceId: recovered.surfaceId,
+          tabId: recovered.id,
+          reused: true,
+          connectorBound: false,
+        };
+      }
       const error = new Error("The retained ChatGPT conversation is no longer available");
       error.code = "retained_conversation_unavailable";
       throw error;

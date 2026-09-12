@@ -56,7 +56,7 @@ export class MissingTrustedCodexEnvironmentError extends Error {
   }
 }
 
-function contentText(content: string | CodexContentPart[]): string {
+export function contentText(content: string | CodexContentPart[]): string {
   if (typeof content === "string") return content;
   return content.filter(part => part.type === "text").map(part => part.text).join("\n");
 }

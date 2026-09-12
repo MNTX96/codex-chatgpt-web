@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
 import { ChatGptBrowserWorker } from "../src/adapters/chatgpt-web/browser-worker";
-import { ChatGptCompactionHandoffAccepted, chatGptRetainedConversationUnavailableError } from "../src/adapters/chatgpt-web/adapter-error";
+import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError, chatGptRetainedConversationUnavailableError } from "../src/adapters/chatgpt-web/adapter-error";
 import {
   MAX_COMPACTION_HANDOFF_TIMEOUT_MS,
   cancelAllStructuredCompactions,
@@ -1495,6 +1495,32 @@ test("structured compact rebuilds canonical context when its retained browser di
     chatGptTurnSessions.clear();
     await TurnBroker.forSocket(provider.chatgptWeb!.brokerSocketPath!).close();
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test.each(["context_length_exceeded", "prompt_preparation_timeout", "model_controls_unavailable", "multipart_context_unavailable"])("fallback compaction preserves actionable %s errors", async code => {
+  const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-actionable-compact-"));
+  const provider: CodexProviderConfig = { adapter:"chatgpt-web",baseUrl:`browser://${root}`,chatgptWeb:{
+    browserHost:"launcher",browserHostDescriptorPath:join(root,"launcher.json"),brokerSocketPath:defaultBrokerEndpoint(root),
+    localToolsEnabled:true,solAvailable:true,proAvailable:true,
+  } };
+  const worker = ChatGptBrowserWorker.forProvider(provider);
+  const run = worker.run;
+  const status = code === "context_length_exceeded" ? 400 : code === "multipart_context_unavailable" ? 409 : 504;
+  (worker as any).run = async () => {
+    if(code === "multipart_context_unavailable")return "CODEX_MULTIPART_CONTEXT_UNAVAILABLE";
+    throw new ChatGptWebAdapterError("Exact preparation failure",{
+    status,errorType:status === 400 ? "invalid_request_error" : "server_error",code,retryable:false,
+  }); };
+  try {
+    const events: AdapterEvent[] = [];
+    await createChatGptWebAdapter(provider).runTurn!(request(true),{headers:new Headers()},event=>events.push(event));
+    expect(events.at(-1)).toMatchObject({type:"error",code,status,retryable:false,
+      ...(code === "multipart_context_unavailable" ? {} : {message:"Exact preparation failure"})});
+  } finally {
+    (worker as any).run = run; chatGptTurnSessions.clear();
+    await TurnBroker.forSocket(provider.chatgptWeb!.brokerSocketPath!).close();
+    rmSync(root,{recursive:true,force:true});
   }
 });
 

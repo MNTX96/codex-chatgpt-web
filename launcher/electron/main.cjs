@@ -435,6 +435,7 @@ function registerIpc({ logger, stateStore }) {
       manual: "Codex Zero Risk",
     },
     imageFactoryProjectId: stateStore.read().imageFactoryProjectId,
+    imageFactoryProjectName: stateStore.read().imageFactoryProjectName,
     mcpCredentialsConfigured: runtimeHost?.mcpCredentialsConfigured() ?? false,
     logs: logger.recent(),
     urls: { connectors: CONNECTORS_URL, tunnels: TUNNELS_URL, keys: KEYS_URL },
@@ -698,12 +699,18 @@ function registerIpc({ logger, stateStore }) {
     if (!IS_DEV_PROFILE) startCatalogVerificationMonitor({ logger, stateStore });
     return { ok: true, stdout: result.stdout, restartRequired: !IS_DEV_PROFILE };
   });
-  handle("launcher:image-factory-project", (_event, projectId) => {
+  handle("launcher:image-factory-project", (_event, projectId, projectName) => {
     if (projectId !== null && projectId !== undefined && typeof projectId !== "string") {
       throw new Error("Image Factory project_id must be a string");
     }
     const imageFactoryProjectId = typeof projectId === "string" ? projectId.trim() || null : null;
-    stateStore.update({ imageFactoryProjectId });
+    if (projectName !== null && projectName !== undefined && typeof projectName !== "string") {
+      throw new Error("Image Factory project name must be a string");
+    }
+    stateStore.update({
+      imageFactoryProjectId,
+      ...(projectName !== undefined ? { imageFactoryProjectName: projectName?.trim() || null } : {}),
+    });
     return launcherSnapshot();
   });
   handle("launcher:setup-mcp", async (_event, input) => {

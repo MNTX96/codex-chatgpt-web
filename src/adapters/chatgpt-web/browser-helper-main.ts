@@ -9,7 +9,13 @@ import { createBrowserHelperPromptSelection } from "./browser-helper-prompt-sele
 import type { CompiledChatGptWebPrompt } from "./prompt";
 import { ChatGptMirroredTurnProgress } from "./turn-progress";
 import type { ChatGptExternalTurnProgressSnapshot } from "./turn-progress";
-import type { OutputArtifactTarget } from "./artifacts/types";
+import type { OutputArtifactTarget, OutputImageSource } from "./artifacts/types";
+import { verifiedImageFactoryConversationUrl } from "./image-factory/project-navigation";
+import {
+  assertChatGptFollowUpRequest,
+  ChatGptFollowUpChannel,
+  type ChatGptFollowUpRequest,
+} from "./follow-up";
 
 interface RunMessage {
   type: "run";
@@ -30,9 +36,11 @@ interface RunMessage {
     resumeAvailable?: boolean;
     retainConversation?: boolean;
     requireRetainedConversation?: boolean;
+    resumeConversationUrl?: string;
     conversationKey?: string;
     surface?: "temporary" | "persistent";
     persistentProjectId?: string;
+    persistentProjectName?: string;
     executionTarget?: BrowserTurn["executionTarget"];
     skipConnectorIdentity?: boolean;
     compaction?: boolean;
@@ -40,7 +48,12 @@ interface RunMessage {
     externalProgress?: boolean;
     outputArtifactTarget?: OutputArtifactTarget;
     outputArtifactExecutionKey?: string;
+    outputArtifactLimit?: number;
+    outputArtifactExistingTotalBytes?: number;
+    outputArtifactWriteManifest?: boolean;
     requireOutputArtifact?: boolean;
+    imageEditSource?: OutputImageSource;
+    followUp?: boolean;
   };
 }
 
@@ -74,6 +87,7 @@ type InputMessage = RunMessage
   | { type: "completion_fence_begin_ack"; id: string; requestId: number; revision: number | null }
   | { type: "completion_fence_commit_ack"; id: string; requestId: number; committed: boolean }
   | { type: "progress"; id: string; snapshot: ChatGptExternalTurnProgressSnapshot }
+  | { type: "follow_up"; id: string; request: ChatGptFollowUpRequest }
   | { type: "abort"; id: string; reason?: "compaction_handoff_accepted" }
   | { type: "shutdown" };
 
@@ -97,6 +111,7 @@ console.error = diagnostic;
 
 const abortControllers = new Map<string, AbortController>();
 const turnProgress = new Map<string, ChatGptMirroredTurnProgress>();
+const followUpChannels = new Map<string, ChatGptFollowUpChannel>();
 const preparedSelections = new Map<string, ReturnType<typeof createBrowserHelperPromptSelection>>();
 const sendActivationWaiters = new Map<string, {
   resolve: () => void;
@@ -126,6 +141,8 @@ function requestShutdown(): Promise<void> {
   protocolOutput.close();
   diagnosticOutput.close();
   for (const controller of abortControllers.values()) controller.abort();
+  for (const channel of followUpChannels.values()) channel.close();
+  followUpChannels.clear();
   for (const selection of preparedSelections.values()) selection.cancel();
   preparedSelections.clear();
   for (const waiter of sendActivationWaiters.values()) {
@@ -176,6 +193,19 @@ async function run(message: RunMessage): Promise<void> {
     && typeof message.turn.requireRetainedConversation !== "boolean") {
     throw new Error("Browser helper retained-conversation requirement is invalid");
   }
+  if (message.turn.resumeConversationUrl !== undefined) {
+    const projectId = message.turn.persistentProjectId;
+    if (typeof message.turn.resumeConversationUrl !== "string"
+      || !message.turn.requireRetainedConversation
+      || !message.turn.resumeAvailable
+      || message.turn.surface !== "persistent"
+      || message.turn.executionTarget?.output !== "image"
+      || typeof projectId !== "string"
+      || message.turn.executionTarget.projectId !== projectId
+      || verifiedImageFactoryConversationUrl(message.turn.resumeConversationUrl, projectId) === undefined) {
+      throw new Error("Browser helper retained Image Factory recovery URL is invalid");
+    }
+  }
   if (message.turn.conversationKey !== undefined && !/^[a-f0-9]{64}$/.test(message.turn.conversationKey)) {
     throw new Error("Browser helper conversation key is invalid");
   }
@@ -185,6 +215,9 @@ async function run(message: RunMessage): Promise<void> {
   if (message.turn.surface === "persistent"
     && (typeof message.turn.persistentProjectId !== "string" || !message.turn.persistentProjectId.trim())) {
     throw new Error("Browser helper persistent project id is invalid");
+  }
+  if (message.turn.persistentProjectName !== undefined && typeof message.turn.persistentProjectName !== "string") {
+    throw new Error("Browser helper persistent project name is invalid");
   }
   if (message.turn.executionTarget?.output === "image"
     && (message.turn.executionTarget.surface !== "persistent"
@@ -204,6 +237,12 @@ async function run(message: RunMessage): Promise<void> {
   if (message.turn.externalProgress !== undefined && typeof message.turn.externalProgress !== "boolean") {
     throw new Error("Browser helper external progress flag is invalid");
   }
+  if (message.turn.followUp !== undefined && typeof message.turn.followUp !== "boolean") {
+    throw new Error("Browser helper follow-up flag is invalid");
+  }
+  if (message.turn.followUp && (!message.turn.retainConversation || !message.turn.externalProgress)) {
+    throw new Error("Browser helper follow-up requires a retained automatic tool turn");
+  }
   const artifactTarget = message.turn.outputArtifactTarget;
   if (message.turn.requireOutputArtifact !== undefined && typeof message.turn.requireOutputArtifact !== "boolean") {
     throw new Error("Browser helper output artifact requirement is invalid");
@@ -216,6 +255,32 @@ async function run(message: RunMessage): Promise<void> {
     || !Number.isSafeInteger(artifactTarget.maxTotalBytes) || artifactTarget.maxTotalBytes <= 0
     || !["required", "best-effort"].includes(artifactTarget.capturePolicy))) {
     throw new Error("Browser helper output artifact target is invalid");
+  }
+  if (message.turn.outputArtifactLimit !== undefined
+    && (!Number.isSafeInteger(message.turn.outputArtifactLimit) || message.turn.outputArtifactLimit <= 0
+      || !artifactTarget || message.turn.outputArtifactLimit > artifactTarget.maxArtifacts)) {
+    throw new Error("Browser helper output artifact limit is invalid");
+  }
+  if (message.turn.outputArtifactExistingTotalBytes !== undefined
+    && (!Number.isSafeInteger(message.turn.outputArtifactExistingTotalBytes)
+      || message.turn.outputArtifactExistingTotalBytes < 0
+      || !artifactTarget
+      || message.turn.outputArtifactExistingTotalBytes > artifactTarget.maxTotalBytes)) {
+    throw new Error("Browser helper existing output artifact byte count is invalid");
+  }
+  if (message.turn.outputArtifactWriteManifest !== undefined
+    && typeof message.turn.outputArtifactWriteManifest !== "boolean") {
+    throw new Error("Browser helper output artifact manifest flag is invalid");
+  }
+  const imageEditSource = message.turn.imageEditSource;
+  if (imageEditSource && (
+    message.turn.executionTarget?.output !== "image"
+    || !message.turn.resumeAvailable
+    || typeof imageEditSource.assistantTurnId !== "string" || !imageEditSource.assistantTurnId
+    || typeof imageEditSource.candidateKey !== "string" || !imageEditSource.candidateKey
+    || (typeof imageEditSource.cardId !== "string" && typeof imageEditSource.fileIdentity !== "string")
+  )) {
+    throw new Error("Browser helper image edit source is invalid");
   }
   const provider: CodexProviderConfig = {
     adapter: "chatgpt-web",
@@ -243,6 +308,23 @@ async function run(message: RunMessage): Promise<void> {
     })
     : undefined;
   if (progress) turnProgress.set(message.id, progress);
+  const followUp = message.turn.followUp ? new ChatGptFollowUpChannel() : undefined;
+  const releaseFollowUpEvents = followUp?.onEvent(event => {
+    const written = writeProtocol({
+      type: "event",
+      id: message.id,
+      event: "follow_up",
+      phase: event.type,
+      requestId: event.requestId,
+      revision: event.revision,
+      ...(event.type === "submitted" && event.conversationUrl
+        ? { conversationUrl: event.conversationUrl }
+        : {}),
+      ...(event.type === "rejected" ? { message: event.message } : {}),
+    });
+    if (!written) throw new Error("Browser helper could not report follow-up lifecycle evidence");
+  });
+  if (followUp) followUpChannels.set(message.id, followUp);
   const promptSelection = createBrowserHelperPromptSelection();
   preparedSelections.set(message.id, promptSelection);
   const prepareSelected = async () => ({ ...await promptSelection.wait(), release: () => {} });
@@ -256,9 +338,11 @@ async function run(message: RunMessage): Promise<void> {
     ...(message.turn.resumeAvailable ? { prepareResume: prepareSelected } : {}),
     ...(message.turn.retainConversation ? { retainConversation: true } : {}),
     ...(message.turn.requireRetainedConversation ? { requireRetainedConversation: true } : {}),
+    ...(message.turn.resumeConversationUrl ? { resumeConversationUrl: message.turn.resumeConversationUrl } : {}),
     ...(message.turn.conversationKey ? { conversationKey: message.turn.conversationKey } : {}),
     ...(message.turn.surface ? { surface: message.turn.surface } : {}),
     ...(message.turn.persistentProjectId ? { persistentProjectId: message.turn.persistentProjectId } : {}),
+    ...(message.turn.persistentProjectName ? { persistentProjectName: message.turn.persistentProjectName } : {}),
     ...(message.turn.executionTarget ? { executionTarget: message.turn.executionTarget } : {}),
     ...(message.turn.skipConnectorIdentity ? { skipConnectorIdentity: true } : {}),
     abortSignal: abortController.signal,
@@ -266,11 +350,25 @@ async function run(message: RunMessage): Promise<void> {
     ...(artifactTarget ? {
       outputArtifactTarget: artifactTarget,
       outputArtifactExecutionKey: message.turn.outputArtifactExecutionKey!,
+      ...(message.turn.outputArtifactLimit !== undefined ? { outputArtifactLimit: message.turn.outputArtifactLimit } : {}),
+      ...(message.turn.outputArtifactExistingTotalBytes !== undefined
+        ? { outputArtifactExistingTotalBytes: message.turn.outputArtifactExistingTotalBytes }
+        : {}),
+      ...(message.turn.outputArtifactWriteManifest !== undefined
+        ? { outputArtifactWriteManifest: message.turn.outputArtifactWriteManifest }
+        : {}),
       onOutputArtifact: artifact => {
         if (!writeProtocol({ type: "event", id: message.id, event: "output_artifact", artifact })) throw new Error("Browser helper could not report output artifact");
       },
+      onOutputArtifactCapture: capture => {
+        if (!writeProtocol({ type: "event", id: message.id, event: "output_artifact_capture", capture })) {
+          throw new Error("Browser helper could not report output artifact capture summary");
+        }
+      },
     } : {}),
+    ...(imageEditSource ? { imageEditSource } : {}),
     ...(message.turn.requireOutputArtifact ? { requireOutputArtifact: true } : {}),
+    ...(followUp ? { followUp } : {}),
     ...(progress ? {
       externalProgress: progress,
       completionFence: {
@@ -321,6 +419,12 @@ async function run(message: RunMessage): Promise<void> {
       }
     }),
     onSubmitted: url => {
+      // The target crossed IPC before Send. Update the helper's own copy before it captures files;
+      // changing the daemon's target cannot update this process's artifact provenance.
+      if (artifactTarget?.metadata?.output === "image" && artifactTarget.metadata.projectId) {
+        const conversationUrl = verifiedImageFactoryConversationUrl(url, artifactTarget.metadata.projectId);
+        if (conversationUrl) artifactTarget.metadata.conversationUrl = conversationUrl;
+      }
       if (!writeProtocol({ type: "event", id: message.id, event: "submitted", ...(url ? { url } : {}) })) {
         throw new Error("Browser helper could not persist ChatGPT submission evidence");
       }
@@ -366,6 +470,9 @@ async function run(message: RunMessage): Promise<void> {
       } : {}),
     });
   } finally {
+    releaseFollowUpEvents?.();
+    followUp?.close(new DOMException("Browser helper turn ended", "AbortError"));
+    followUpChannels.delete(message.id);
     preparedSelections.get(message.id)?.cancel();
     preparedSelections.delete(message.id);
     const sendWaiter = sendActivationWaiters.get(message.id);
@@ -514,7 +621,35 @@ input.on("line", line => {
         error instanceof Error ? error.message : String(error),
       );
     }
+  } else if (message.type === "follow_up") {
+    const channel = followUpChannels.get(message.id);
+    try {
+      assertChatGptFollowUpRequest(message.request);
+    } catch (error) {
+      writeProtocol({
+        type: "error",
+        id: message.id,
+        message: error instanceof Error ? error.message : String(error),
+      });
+      return;
+    }
+    if (!channel) {
+      writeProtocol({
+        type: "event",
+        id: message.id,
+        event: "follow_up",
+        phase: "rejected",
+        requestId: message.request.requestId,
+        revision: message.request.revision,
+        message: "Browser helper has no active retained follow-up channel",
+      });
+      return;
+    }
+    void channel.enqueue(message.request).catch(() => {
+      // The channel emits a rejected lifecycle event for dispatch/timeout failures.
+    });
   } else if (message.type === "abort") {
+    followUpChannels.get(message.id)?.close(new DOMException("Browser helper turn aborted", "AbortError"));
     abortControllers.get(message.id)?.abort(message.reason === "compaction_handoff_accepted"
       ? new ChatGptCompactionHandoffAccepted()
       : undefined);
@@ -578,6 +713,8 @@ writeProtocol({
     "multipart-stage-ack",
     "output-artifact-v1",
     "image-factory-v1",
+    "image-factory-v2",
     "image-transfer-v1",
+    "follow-up-v1",
   ],
 });

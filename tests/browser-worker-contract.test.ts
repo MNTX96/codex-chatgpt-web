@@ -17,6 +17,35 @@ import { estimateCompiledChatGptWebInputTokens } from "../src/adapters/chatgpt-w
 import { estimateTokens } from "../src/lib/token-estimate";
 import { chatGptHtmlToMarkdown } from "../src/adapters/chatgpt-web/markdown";
 import { detectOutputImages, outputImageSignature } from "../src/adapters/chatgpt-web/artifacts/image/image-detector";
+import { ChatGptFollowUpChannel } from "../src/adapters/chatgpt-web/follow-up";
+
+function emptyAttachmentTilesLocator() {
+  return {
+    filter() { return this; },
+    count: async () => 0,
+    evaluateAll: async () => [],
+  };
+}
+
+function mutableAttachmentTilesLocator(
+  state: { names: string[] },
+  removableControls = 1,
+) {
+  const controls = {
+    filter() { return this; },
+    evaluateAll: async () => Array.from({ length: removableControls }, (_value, index) => index),
+    nth: (_index: number) => ({
+      click: async () => { state.names.shift(); },
+    }),
+  };
+  const tile = { locator: () => controls };
+  return {
+    filter() { return this; },
+    count: async () => state.names.length,
+    evaluateAll: async () => [...state.names],
+    first: () => tile,
+  };
+}
 
 test("image-only assistant output is a completed ChatGPT turn", () => {
   expect(chatGptTurnIsComplete({ responsePresent: true, running: false, currentText: "", completionActionVisible: true, generatedImageKeys: ["image-1:ready"] })).toBe(true);
@@ -59,6 +88,139 @@ test("generated image card is detected before a hidden preview source hydrates",
     completionActionVisible: true,
     generatedImageKeys: signature,
   })).toBe(true);
+});
+
+test("generated image detection counts cards rather than presentation images", async () => {
+  const { createDocument } = require("@mixmark-io/domino") as {
+    createDocument: (html: string) => { body: HTMLElement };
+  };
+  const document = createDocument(
+    '<section data-turn-id="assistant-multi">'
+    + '<div id="image-front" class="group/imagegen-image relative w-full">'
+    + '<img alt="decorative preview"><img alt="Generated image: front view">'
+    + '<button aria-label="Edit image">Edit</button></div>'
+    + '<div id="image-side" class="group/imagegen-image relative w-full">'
+    + '<img alt="Generated image: side view"><img alt="gallery thumbnail">'
+    + '<span aria-label="Edit image">Edit</span></div>'
+    + '<div id="image-back" class="group/imagegen-image relative w-full">'
+    + '<img alt="Generated image: back view"><button aria-label="Edit image">Edit</button></div>'
+    + '</section>',
+  );
+  const root = document.body.firstElementChild as HTMLElement;
+  const nodeListPrototype = Object.getPrototypeOf(root.querySelectorAll("*"));
+  nodeListPrototype[Symbol.iterator] ??= Array.prototype[Symbol.iterator];
+  const responseTurn = {
+    evaluate: async (callback: Function, argument?: unknown) => callback(root, argument),
+  } as unknown as Locator;
+
+  const candidates = await detectOutputImages(responseTurn);
+  expect(candidates.map(candidate => candidate.key)).toEqual(["image-front", "image-side", "image-back"]);
+  expect(candidates).toHaveLength(3);
+  expect(candidates.every(candidate => candidate.assistantTurnId === "assistant-multi")).toBeTrue();
+});
+
+test("generated image detection keeps distinct file identities when ChatGPT duplicates card ids", async () => {
+  const { createDocument } = require("@mixmark-io/domino") as {
+    createDocument: (html: string) => { body: HTMLElement };
+  };
+  const duplicateId = "image-c1ed2645-ad0a-4139-9942-cb3b6f929870";
+  const identities = [
+    "file_00000000e9fc81f5850294685990c6c0",
+    "file_0000000040f082118988a8739504ca54",
+    "file_00000000f9288211b1d61a9c7cf531e4",
+  ];
+  const document = createDocument(
+    '<section data-turn-id="assistant-gallery">'
+    + identities.map((identity, index) => `<div id="${duplicateId}" class="group/imagegen-image relative w-full">`
+      + `<img alt="Generated image: view ${index + 1}" src="https://chatgpt.com/backend-api/files/${identity}/image.png">`
+      + (index === 0 ? '<button aria-label="Edit image">Edit</button>' : "")
+      + '</div>').join("")
+    + '</section>',
+  );
+  const root = document.body.firstElementChild as HTMLElement;
+  const nodeListPrototype = Object.getPrototypeOf(root.querySelectorAll("*"));
+  nodeListPrototype[Symbol.iterator] ??= Array.prototype[Symbol.iterator];
+  const responseTurn = {
+    evaluate: async (callback: Function, argument?: unknown) => callback(root, argument),
+  } as unknown as Locator;
+
+  const candidates = await detectOutputImages(responseTurn);
+  expect(candidates).toHaveLength(3);
+  expect(candidates.map(candidate => candidate.key)).toEqual(identities);
+  expect(candidates.map(candidate => candidate.fileIdentity)).toEqual(identities);
+  expect(candidates.every(candidate => candidate.cardId === duplicateId)).toBeTrue();
+});
+
+test("one ChatGPT gallery card emits one candidate per stable gallery output", async () => {
+  const { createDocument } = require("@mixmark-io/domino") as {
+    createDocument: (html: string) => { body: HTMLElement };
+  };
+  const cardId = "image-c1ed2645-ad0a-4139-9942-cb3b6f929870";
+  const identities = [
+    "file_00000000e9fc81f5850294685990c6c0",
+    "file_0000000040f082118988a8739504ca54",
+    "file_00000000f9288211b1d61a9c7cf531e4",
+  ];
+  const source = (identity: string, suffix: string) => `https://chatgpt.com/backend-api/files/${identity}/${suffix}.png`;
+  const document = createDocument(
+    '<section data-turn-id="assistant-gallery">'
+    + `<div id="${cardId}" class="group/imagegen-image relative w-full">`
+    + `<button aria-label="Generated image"><img alt="Generated image" src="${source(identities[0]!, "preview")}"></button>`
+    + '<button aria-label="Edit image">Edit</button>'
+    + identities.map((identity, index) => '<button aria-label="Generated image Generated image Generated image">'
+      + `<img alt="Generated image" src="${source(identity, `thumb-${index}-1`)}">`
+      + `<img alt="Generated image" src="${source(identity, `thumb-${index}-2`)}">`
+      + `<img alt="Generated image" src="${source(identity, `thumb-${index}-3`)}">`
+      + '</button>').join("")
+    + '</div></section>',
+  );
+  const root = document.body.firstElementChild as HTMLElement;
+  const nodeListPrototype = Object.getPrototypeOf(root.querySelectorAll("*"));
+  nodeListPrototype[Symbol.iterator] ??= Array.prototype[Symbol.iterator];
+  const responseTurn = {
+    evaluate: async (callback: Function, argument?: unknown) => callback(root, argument),
+  } as unknown as Locator;
+
+  const candidates = await detectOutputImages(responseTurn);
+  expect(candidates).toHaveLength(3);
+  expect(candidates.map(candidate => candidate.key)).toEqual(identities);
+  expect(candidates.map(candidate => candidate.fileIdentity)).toEqual(identities);
+  expect(candidates.every(candidate => candidate.cardId === cardId)).toBeTrue();
+});
+
+test("one ChatGPT gallery card keeps opaque gallery controls as transient outputs", async () => {
+  const { createDocument } = require("@mixmark-io/domino") as {
+    createDocument: (html: string) => { body: HTMLElement };
+  };
+  const cardId = "image-opaque-gallery";
+  const previewIdentity = "file_00000000111111111111111111111111";
+  const document = createDocument(
+    '<section data-turn-id="assistant-gallery">'
+    + `<div id="${cardId}" class="group/imagegen-image relative w-full">`
+    + `<button aria-label="Generated image"><img alt="Generated image" src="https://chatgpt.com/backend-api/files/${previewIdentity}/preview.png"></button>`
+    + '<button aria-label="Edit image">Edit</button>'
+    + [1, 2, 3].map(index => '<button aria-label="Generated image Generated image Generated image">'
+      + `<img alt="Generated image" src="https://cdn.example.test/gallery-${index}-a.webp">`
+      + `<img alt="Generated image" src="https://cdn.example.test/gallery-${index}-b.webp">`
+      + '</button>').join("")
+    + '</div></section>',
+  );
+  const root = document.body.firstElementChild as HTMLElement;
+  const nodeListPrototype = Object.getPrototypeOf(root.querySelectorAll("*"));
+  nodeListPrototype[Symbol.iterator] ??= Array.prototype[Symbol.iterator];
+  const responseTurn = {
+    evaluate: async (callback: Function, argument?: unknown) => callback(root, argument),
+  } as unknown as Locator;
+
+  const candidates = await detectOutputImages(responseTurn);
+  expect(candidates).toHaveLength(3);
+  expect(candidates.map(candidate => candidate.fileIdentity)).toEqual([undefined, undefined, undefined]);
+  expect(candidates.map(candidate => candidate.transientGalleryOrdinal)).toEqual([0, 1, 2]);
+  expect(candidates.map(candidate => candidate.key)).toEqual([
+    `gallery-pending:${cardId}:0`,
+    `gallery-pending:${cardId}:1`,
+    `gallery-pending:${cardId}:2`,
+  ]);
 });
 
 function personalizedTemporaryChatRole(
@@ -557,8 +719,12 @@ test("an accepted Full-mode send survives one stalled DOM probe and a later MCP 
     isEnabled: async () => true,
     press: async () => { sendPresses += 1; },
   };
+  const form = {
+    locator: () => emptyAttachmentTilesLocator(),
+    getByTestId: () => sendButton,
+  };
   const composer = {
-    locator: () => ({ getByTestId: () => sendButton }),
+    locator: () => form,
   };
   worker.activeComposer = async () => composer;
 
@@ -680,7 +846,10 @@ test("Bigger Context send activation keeps the outer stage budget instead of res
     },
   };
   worker.activeComposer = async () => ({
-    locator: () => ({ getByTestId: () => sendButton }),
+    locator: () => ({
+      locator: () => emptyAttachmentTilesLocator(),
+      getByTestId: () => sendButton,
+    }),
   });
   worker.waitForSubmissionAcceptedWithRecovery = async () => "user_turn";
 
@@ -1008,8 +1177,10 @@ test("prompt verification accepts Lexical NBSP preservation without weakening ot
 
   expect(promptTextEquivalent.call(worker, expected, observed)).toBeTrue();
 
-  // The allowance is intentionally directional and restricted to repeated ASCII-space runs.
+  // The allowance is intentionally directional and restricted to repeated ASCII-space runs or a
+  // single line-leading space, which Lexical also preserves as NBSP.
   expect(promptTextEquivalent.call(worker, "a  b", "a\u00A0 b")).toBeTrue();
+  expect(promptTextEquivalent.call(worker, "a\n b", "a\n\u00A0b")).toBeTrue();
   expect(promptTextEquivalent.call(worker, "a b", "a\u00A0b")).toBeFalse();
   expect(promptTextEquivalent.call(worker, "a\u00A0b", "a b")).toBeFalse();
 
@@ -1032,7 +1203,7 @@ test("prompt verification accepts Lexical NBSP preservation without weakening ot
   ).resolves.toBeUndefined();
 });
 
-test("large Markdown-rich context uses one plain-text editing command before exact verification", async () => {
+test("Browser-only prompt attachment clears a stale composer before one plain-text insertion", async () => {
   const prompt = [
     "Act as the model backend for the Codex task encoded below.",
     "```ts",
@@ -1043,7 +1214,6 @@ test("large Markdown-rich context uses one plain-text editing command before exa
   const calls: Array<[string, unknown?]> = [];
   let asserted = "";
   const composer = {
-    fill: async (value: string) => { calls.push(["fill", value]); },
     focus: async () => { calls.push(["focus"]); },
     evaluate: async (fn: unknown, value: string, options: unknown) => {
       calls.push(["evaluate", value]);
@@ -1061,16 +1231,212 @@ test("large Markdown-rich context uses one plain-text editing command before exa
 
   await attachPrompt.call({
     activeComposer: async () => composer,
+    clearChatGptComposerState: async () => { calls.push(["clearVerifiedEmpty"]); },
     insertPromptText,
     assertPromptAttached: async (_page: unknown, value: string) => { asserted = value; },
   }, {}, prompt, false);
 
-  expect(calls[0]).toEqual(["fill", ""]);
+  expect(calls[0]).toEqual(["clearVerifiedEmpty"]);
   expect(calls.filter(call => call[0] === "evaluate")).toEqual([["evaluate", prompt]]);
   expect(calls.filter(call => call[0] === "evaluateOptions")).toEqual([
     ["evaluateOptions", { timeout: 20_000 }],
   ]);
   expect(asserted).toBe(prompt);
+});
+
+test("image generation selects and proves the real Create image picture_v2 pill", async () => {
+  const checkpoints: string[] = [];
+  const calls: string[] = [];
+  let selected = false;
+  let highlighted = false;
+
+  const beforeComposer = {
+    fill: async (text: string) => {
+      expect(text).toBe("");
+      calls.push("clear-image-composer");
+    },
+    focus: async () => {
+      calls.push("focus-image-composer");
+    },
+    pressSequentially: async (text: string) => {
+      expect(text).toBe("@image");
+      calls.push("type-image-mention");
+    },
+    press: async (key: string) => {
+      calls.push(`press-${key}`);
+      if (key === "ArrowDown") highlighted = true;
+      if (key === "Enter") selected = true;
+    },
+  };
+
+  const pill = {
+    filter: (options: unknown) => {
+      expect(options).toEqual({ visible: true });
+      return pill;
+    },
+    waitFor: async (options: unknown) => {
+      expect(options).toMatchObject({ state: "visible" });
+      calls.push("picture-v2-visible");
+    },
+    evaluateAll: async () => selected ? [{
+      id: "picture_v2",
+      symbol: "ecosystemMention",
+      keyword: "Create image",
+      hint: "picture_v2",
+    }] : [],
+  };
+  const selectedComposer = {
+    locator: (selector: string) => {
+      expect(selector).toContain('[data-id="picture_v2"]');
+      expect(selector).toContain('[data-system-hint-type="picture_v2"]');
+      return pill;
+    },
+  };
+
+  const imageResult = {
+    first() { return this; },
+    waitFor: async (options: unknown) => {
+      expect(options).toMatchObject({ state: "visible" });
+      calls.push("create-image-row-visible");
+    },
+    count: async () => 1,
+    getAttribute: async (name: string) => {
+      expect(name).toBe("data-highlighted");
+      return highlighted ? "true" : null;
+    },
+  };
+  const exactText = {};
+  const menuRows = {
+    filter: (options: { has?: unknown; visible?: boolean }) => {
+      if (options.visible === true) {
+        return { count: async () => 1 };
+      }
+      expect(options).toEqual({ has: exactText });
+      return imageResult;
+    },
+  };
+  const page = {
+    locator: (selector: string) => {
+      expect(selector).toBe('.popover[aria-busy="false"]');
+      return { filter: () => ({
+        count: async () => 1,
+        locator: (rowSelector: string) => {
+          expect(rowSelector).toBe('.__menu-item[tabindex="0"]');
+          return menuRows;
+        },
+      }) };
+    },
+    getByText: (text: string, options: unknown) => {
+      expect(text).toBe("Create image");
+      expect(options).toEqual({ exact: true });
+      return exactText;
+    },
+  };
+
+  let composerReads = 0;
+  const selectImageGenerationTool = (ChatGptBrowserWorker.prototype as unknown as {
+    selectImageGenerationTool(
+      page: unknown,
+      captureDiagnostic?: (checkpoint: string) => Promise<void>,
+    ): Promise<unknown>;
+  }).selectImageGenerationTool;
+
+  await expect(selectImageGenerationTool.call({
+    clearChatGptComposerState: async () => { calls.push("clear-composer"); },
+    activeComposer: async () => composerReads++ < 2 ? beforeComposer : selectedComposer,
+    selectedImageGenerationControl: (ChatGptBrowserWorker.prototype as unknown as {
+      selectedImageGenerationControl(composer: unknown): unknown;
+    }).selectedImageGenerationControl,
+    imageGenerationToolIsSelected: async (composer: unknown) => composer === beforeComposer ? false
+      : (ChatGptBrowserWorker.prototype as unknown as { imageGenerationToolIsSelected(composer: unknown): Promise<boolean> }).imageGenerationToolIsSelected.call({
+        selectedImageGenerationControl: (ChatGptBrowserWorker.prototype as any).selectedImageGenerationControl,
+      }, composer),
+  }, page, async checkpoint => { checkpoints.push(checkpoint); })).resolves.toBe(selectedComposer);
+
+  expect(calls).toEqual([
+    "clear-composer",
+    "clear-image-composer",
+    "focus-image-composer",
+    "type-image-mention",
+    "create-image-row-visible",
+    "press-ArrowDown",
+    "press-Enter",
+    "picture-v2-visible",
+  ]);
+  expect(checkpoints).toEqual([
+    "create-image-mention-triggered",
+    "create-image-menu-visible",
+    "create-image-choice-activated",
+    "create-image-tool-selected",
+  ]);
+});
+
+test("image generation fails closed when @image exposes duplicate Create image rows", async () => {
+  const calls: string[] = [];
+  const composer = {
+    fill: async (text: string) => {
+      expect(text).toBe("");
+      calls.push("clear-image-composer");
+    },
+    focus: async () => {
+      calls.push("focus-image-composer");
+    },
+    pressSequentially: async (text: string) => {
+      expect(text).toBe("@image");
+      calls.push("type-image-mention");
+    },
+  };
+  const imageResult = {
+    first() { return this; },
+    waitFor: async (options: unknown) => {
+      expect(options).toMatchObject({ state: "visible" });
+      calls.push("create-image-row-visible");
+    },
+    count: async () => 2,
+  };
+  const exactText = {};
+  const menuRows = {
+    filter: (options: { has?: unknown }) => {
+      expect(options).toEqual({ has: exactText });
+      return imageResult;
+    },
+  };
+  const page = {
+    locator: (selector: string) => {
+      expect(selector).toBe('.popover[aria-busy="false"]');
+      return { filter: () => ({
+        count: async () => 1,
+        locator: (rowSelector: string) => {
+          expect(rowSelector).toBe('.__menu-item[tabindex="0"]');
+          return menuRows;
+        },
+      }) };
+    },
+    getByText: (text: string, options: unknown) => {
+      expect(text).toBe("Create image");
+      expect(options).toEqual({ exact: true });
+      return exactText;
+    },
+  };
+
+  const selectImageGenerationTool = (ChatGptBrowserWorker.prototype as unknown as {
+    selectImageGenerationTool(page: unknown): Promise<unknown>;
+  }).selectImageGenerationTool;
+
+  await expect(selectImageGenerationTool.call({
+    clearChatGptComposerState: async () => { calls.push("clear-composer"); },
+    activeComposer: async () => composer,
+    imageGenerationToolIsSelected: async () => false,
+  }, page)).rejects.toThrow("ChatGPT @image menu did not expose one exact Create image row");
+
+  expect(calls).toEqual([
+    "clear-composer",
+    "clear-image-composer",
+    "focus-image-composer",
+    "type-image-mention",
+    "create-image-row-visible",
+    "clear-composer",
+  ]);
 });
 
 test("plain-text editing command fails closed when the focused composer rejects it", async () => {
@@ -1856,6 +2222,7 @@ test("an aborted connector proof clears its mention before the preflight release
       return composer;
     },
     connectorIsSelected: async () => false,
+    imageGenerationToolIsSelected: async () => false,
     clearChatGptComposerState: prototype.clearChatGptComposerState,
   }, page, undefined, false, { triggerAttempts: 0 }, controller.signal);
 
@@ -1959,6 +2326,7 @@ test("an aborted real connector selection clears the typed mention before return
     config: { appName: "Codex Native2" },
     activeComposer: async () => composer,
     connectorIsSelected: async () => false,
+    imageGenerationToolIsSelected: async () => false,
     clearChatGptComposerState: prototype.clearChatGptComposerState,
   }, page, undefined, false, { triggerAttempts: 0 }, controller.signal);
 
@@ -1994,6 +2362,7 @@ test("connector cleanup uses native editor deletion when contenteditable fill wo
   await clearChatGptComposerState.call({
     activeComposer: async () => composer,
     connectorIsSelected: async () => false,
+    imageGenerationToolIsSelected: async () => false,
   }, {
     locator: (selector: string) => {
       expect(selector).toBe("body");
@@ -2004,6 +2373,52 @@ test("connector cleanup uses native editor deletion when contenteditable fill wo
   expect(fillCalls).toBe(0);
   expect(pressed).toEqual([CHATGPT_COMPOSER_SELECT_ALL_KEY, "Backspace"]);
   expect(composerText).toBe("");
+});
+
+test("composer cleanup removes a retained Create image pill before the next Image Factory submission", async () => {
+  let imageGenerationSelected = true;
+  let selectedAll = false;
+  let caretAtEnd = false;
+  const pressed: string[] = [];
+  const composer = {
+    focus: async () => {},
+    press: async (key: string) => {
+      pressed.push(key);
+      if (key === CHATGPT_COMPOSER_SELECT_ALL_KEY) {
+        selectedAll = true;
+        return;
+      }
+      if (key === CHATGPT_COMPOSER_DOCUMENT_END_KEY) {
+        caretAtEnd = true;
+        return;
+      }
+      expect(key).toBe("Backspace");
+      if (selectedAll) {
+        // ChatGPT clears editable prompt text but leaves the contenteditable=false picture_v2 pill.
+        selectedAll = false;
+        return;
+      }
+      if (caretAtEnd) imageGenerationSelected = false;
+    },
+    evaluate: async () => imageGenerationSelected ? "Create image" : "",
+  };
+  const clearChatGptComposerState = (ChatGptBrowserWorker.prototype as unknown as {
+    clearChatGptComposerState(page: unknown): Promise<void>;
+  }).clearChatGptComposerState;
+
+  await clearChatGptComposerState.call({
+    activeComposer: async () => composer,
+    connectorIsSelected: async () => false,
+    imageGenerationToolIsSelected: async () => imageGenerationSelected,
+  }, {
+    locator: (selector: string) => {
+      expect(selector).toBe("body");
+      return { press: async (key: string) => { expect(key).toBe("Escape"); } };
+    },
+  });
+
+  expect(imageGenerationSelected).toBeFalse();
+  expect(pressed).toEqual([CHATGPT_COMPOSER_SELECT_ALL_KEY, "Backspace", CHATGPT_COMPOSER_DOCUMENT_END_KEY, "Backspace"]);
 });
 
 test("an abort after connector activation removes the selected pill before returning", async () => {
@@ -2052,6 +2467,7 @@ test("an abort after connector activation removes the selected pill before retur
     config: { appName: CHATGPT_CONNECTOR_NAME },
     activeComposer: async () => composer,
     connectorIsSelected: async () => connectorSelected,
+    imageGenerationToolIsSelected: async () => false,
     clearChatGptComposerState: prototype.clearChatGptComposerState,
   }, page, async (checkpoint: string) => {
     if (checkpoint === "connector-choice-activated") controller.abort();
@@ -2136,6 +2552,8 @@ test("retained tool turns insert into the connector-bound composer without selec
 test("image attachment readiness uses exact file tiles and returns a pre-Send guard without localized button lookup", async () => {
   const imageUrl = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
   const calls: Array<[string, string?]> = [];
+  const attachmentState = { names: ["stale-task-a.png"] };
+  const attachmentTiles = mutableAttachmentTilesLocator(attachmentState);
   const send = {
     count: async () => 1,
     isVisible: async () => true,
@@ -2145,6 +2563,7 @@ test("image attachment readiness uses exact file tiles and returns a pre-Send gu
     },
   };
   const composerForm = {
+    locator: () => attachmentTiles,
     getByRole: (role: string, options: { name: string; exact: boolean }) => {
       expect(role).toBe("group");
       expect(options).toEqual({ name: "codex-input-image-1.png", exact: true });
@@ -2179,6 +2598,7 @@ test("image attachment readiness uses exact file tiles and returns a pre-Send gu
     setInputFiles: async (files: Array<{ name: string }>, options: { signal: AbortSignal; timeout: number }) => {
       expect(options.signal.aborted).toBeFalse();
       expect(options.timeout).toBeGreaterThan(0);
+      attachmentState.names = files.map(file => file.name);
       calls.push(["setFiles", files.map(file => file.name).join(",")]);
     },
   };
@@ -2205,6 +2625,43 @@ test("image attachment readiness uses exact file tiles and returns a pre-Send gu
   expect(calls.filter(([name]) => name === "setFiles")).toEqual([["setFiles", "codex-input-image-1.png"]]);
   expect(calls.filter(([name]) => name === "fileTile").length).toBeGreaterThanOrEqual(3);
   expect(calls.filter(([name]) => name === "sendEnabled").length).toBeGreaterThanOrEqual(3);
+  expect(attachmentState.names).toEqual(["codex-input-image-1.png"]);
+});
+
+test("a no-file turn removes stale composer attachments before returning its Send guard", async () => {
+  const attachmentState = { names: ["task-a.png"] };
+  const attachmentTiles = mutableAttachmentTilesLocator(attachmentState);
+  const composerForm = { locator: () => attachmentTiles };
+  const composer = { locator: () => composerForm };
+  const attachFiles = (ChatGptBrowserWorker.prototype as unknown as {
+    attachFiles(page: unknown, prompt: unknown, signal: AbortSignal, log: () => void): Promise<{ assertReady(signal?: AbortSignal): Promise<void> }>;
+  }).attachFiles;
+  const signal = new AbortController().signal;
+
+  const guard = await attachFiles.call({ activeComposer: async () => composer }, {}, { images: [] }, signal, () => {});
+  await guard.assertReady(signal);
+
+  expect(attachmentState.names).toEqual([]);
+});
+
+test("ambiguous stale attachment controls block Send instead of leaking a file into the next task", async () => {
+  const attachmentState = { names: ["task-a.png"] };
+  const attachmentTiles = mutableAttachmentTilesLocator(attachmentState, 2);
+  const composerForm = { locator: () => attachmentTiles };
+  const composer = { locator: () => composerForm };
+  let presses = 0;
+  const worker = {
+    activeComposer: async () => composer,
+  };
+  const send = (ChatGptBrowserWorker.prototype as unknown as {
+    sendAttachedPrompt(page: unknown, baseline: unknown): Promise<unknown>;
+  }).sendAttachedPrompt;
+
+  await expect(send.call(worker, {}, {})).rejects.toMatchObject({
+    code: "attachment_cleanup_control_ambiguous",
+  });
+  expect(attachmentState.names).toEqual(["task-a.png"]);
+  expect(presses).toBe(0);
 });
 
 test("effort slider ARIA state fails closed on malformed and unsupported ranges", () => {
@@ -2347,6 +2804,67 @@ test("Think attachment runs after fresh connector selection and rechecks retaine
   }
 });
 
+test("follow-up submission types into the retained composer and uses only the exact send-button", async () => {
+  const request = {
+    requestId: "follow-up-request",
+    revision: 2,
+    instructionId: "a".repeat(64),
+    text: "Add one more constraint",
+  };
+  const channel = new ChatGptFollowUpChannel(1_000);
+  const accepted = channel.enqueue(request);
+  const state = { draft: "", testIds: [] as string[], presses: 0, attachments: ["previous-task.png"] };
+  const attachmentTiles = mutableAttachmentTilesLocator({
+    get names() { return state.attachments; },
+    set names(names: string[]) { state.attachments = names; },
+  });
+  const sendButton = {
+    count: async () => 1,
+    waitFor: async () => {},
+    isEnabled: async () => true,
+    press: async (key: string) => {
+      expect(key).toBe("Enter");
+      state.presses += 1;
+    },
+  };
+  const form = {
+    locator: () => attachmentTiles,
+    getByTestId: (testId: string) => {
+      state.testIds.push(testId);
+      return sendButton;
+    },
+  };
+  const composer = {
+    fill: async (text: string) => { state.draft = text; },
+    focus: async () => {},
+    locator: (selector: string) => {
+      expect(selector).toBe("xpath=ancestor::form[1]");
+      return form;
+    },
+  };
+  const worker = {
+    activeComposer: async () => composer,
+    insertPromptText: async (_page: unknown, text: string) => { state.draft = text; },
+    assertPromptAttached: async (_page: unknown, text: string) => { expect(state.draft).toBe(text); },
+    waitForSubmissionAcceptedWithRecovery: async () => "user_turn" as const,
+  };
+  const page = { url: () => "https://chatgpt.com/c/WEB:retained" };
+  const submit = (ChatGptBrowserWorker.prototype as unknown as {
+    sendFollowUpPrompt: (...args: unknown[]) => Promise<string>;
+  }).sendFollowUpPrompt;
+
+  await expect(submit.call(worker, page, {}, request, channel)).resolves.toBe("user_turn");
+  await expect(accepted).resolves.toBeUndefined();
+  await expect(channel.waitForTerminal(request)).resolves.toMatchObject({
+    type: "submitted",
+    conversationUrl: "https://chatgpt.com/c/WEB:retained",
+  });
+  expect(state.draft).toBe(request.text);
+  expect(state.attachments).toEqual([]);
+  expect(state.presses).toBe(1);
+  expect(state.testIds).toEqual(["send-button"]);
+});
+
 test("Think attachment rolls back a lost connector and never inserts the prompt", async () => {
   const ui = thinkSlashFixture();
   ui.state.loseConnector = true;
@@ -2414,7 +2932,7 @@ test("an unrelated Continue dialog is never auto-accepted", async () => {
   expect(lookedForButton).toBeFalse();
 });
 
-function dialogPage(text: string, buttonText = "Got it", errorActionVisible = false): { page: Page; pressed: string[] } {
+function dialogPage(text: string, buttonText = "Got it", errorActionVisible = false, historyRateLimit = false): { page: Page; pressed: string[] } {
   const pressed: string[] = [];
   const createDialog = () => {
     let matches = true;
@@ -2442,7 +2960,13 @@ function dialogPage(text: string, buttonText = "Got it", errorActionVisible = fa
   };
   return {
     page: {
-      locator: () => createDialog(),
+      locator: (selector: string) => {
+        if (selector.includes("modal-conversation-history-rate-limit")) {
+          const dialog = createDialog();
+          return { ...dialog, last: () => ({ ...dialog, isVisible: async () => historyRateLimit }) };
+        }
+        return createDialog();
+      },
       getByText: (hasText: string | RegExp) => createDialog().filter({ hasText }),
       getByTestId: (testId: string) => {
         const action = {
@@ -2468,6 +2992,13 @@ test("the known ChatGPT rate-limit dialog is acknowledged and returns a structur
     message: "ChatGPT rate limit: too many requests. Try again in a few minutes.",
   });
   expect(fixture.pressed).toEqual(["Enter"]);
+});
+
+test("history rate limit is detected by test id without depending on translated wording", async () => {
+  const fixture = dialogPage("Bạn đã truy cập lịch sử quá nhanh", "Đã hiểu", false, true);
+  await expect(throwIfChatGptRateLimitDialog(fixture.page)).rejects.toMatchObject({
+    status: 429, errorType: "rate_limit_error", code: "rate_limit_exceeded", retryable: true,
+  });
 });
 
 test("submission acceptance reports a rate-limit dialog that appears after Enter", async () => {
@@ -2678,6 +3209,7 @@ test("effort menu waiting stops when ChatGPT reports an expired session", async 
     last() { return this; },
     isVisible: async () => true,
     locator: () => effortChoices,
+    getByRole: () => hiddenDialog,
   };
   const effortSlider = {
     filter() { return this; },
@@ -2714,6 +3246,7 @@ test("effort menu waiting stops when ChatGPT reports an expired session", async 
       if (selector.includes('[role="alert"]')) return sessionAlert;
       if (selector.includes('[role="menu"]') || selector.includes("composer-intelligence-picker-content")) return effortMenu;
       if (selector.includes("data-model-reasoning-effort-slider")) return effortSlider;
+      if (selector.includes("modal-conversation-history-rate-limit")) return hiddenDialog;
       if (selector.includes('[role="dialog"]')) return hiddenDialog;
       return effortMenu;
     },
@@ -3546,6 +4079,38 @@ test("the launcher helper transport carries MCP progress into the out-of-process
   expect(helper).toMatch(/externalProgress: progress/);
 });
 
+test("image edit composer binds structurally inside the verified image viewer", () => {
+  const worker = readFileSync("src/adapters/chatgpt-web/browser-worker.ts", "utf8");
+  const start = worker.indexOf("private async sendImageEditPrompt(");
+  const end = worker.indexOf("private async", start + 1);
+  const method = worker.slice(start, end > start ? end : undefined);
+
+  // ChatGPT's visible "Describe edits" hint is not guaranteed to be exposed as an aria or
+  // placeholder attribute. Scope by the already verified image viewer, then require one visible
+  // editor and its own form/send control so the page-level composer cannot be selected.
+  expect(method).toContain("viewer.scope.locator('form [contenteditable=\"true\"]')");
+  expect(method).toContain('editor.locator("xpath=ancestor::form[1]")');
+  expect(method).toContain('form.getByTestId("send-button")');
+  expect(method).not.toContain("/describe edits|mô tả chỉnh sửa/i");
+});
+
+test("image edit rebinds a persisted source image after the conversation reloads", () => {
+  const worker = readFileSync("src/adapters/chatgpt-web/browser-worker.ts", "utf8");
+  const start = worker.indexOf("private async sendImageEditPrompt(");
+  const end = worker.indexOf("private async", start + 1);
+  const method = worker.slice(start, end > start ? end : undefined);
+
+  // ChatGPT can assign a different data-turn-id when a persisted conversation is reloaded.
+  // Re-identify the source only from the stored card/file identity and then bind its current turn.
+  expect(method).toContain("candidate.cardId === source.cardId");
+  expect(method).toContain("candidate.fileIdentity === source.fileIdentity");
+  expect(method).toContain("page.locator(CHATGPT_ASSISTANT_TURN_SELECTOR)");
+  expect(method).toContain("await detectOutputImages(turn)");
+  expect(method).toContain("Image edit source assistant turn is ambiguous");
+  expect(method).not.toContain("source.title");
+  expect(method).not.toContain("galleryIndex");
+});
+
 test("both response loops check explicit Stopped thinking before acknowledging further MCP work", () => {
   const worker = readFileSync("src/adapters/chatgpt-web/browser-worker.ts", "utf8");
   for (const method of ["private async waitForMultipartAcknowledgement(", "private async runBrowserTurn("]) {
@@ -3965,7 +4530,7 @@ test("the bundled helper is adopted only for the packaged runtime layout", () =>
   // recorded for an earlier turn that happened to share the id.
   const helper = readFileSync("src/adapters/chatgpt-web/browser-helper-main.ts", "utf8");
   expect(helper).toContain("const progress = message.turn.externalProgress");
-  expect(helper).toContain("? new ChatGptMirroredTurnProgress(revision => {");
+  expect(helper).toContain("? new ChatGptMirroredTurnProgress(");
 
   // A consumer callback must not be retried as though the page could not be read.
   const worker = readFileSync("src/adapters/chatgpt-web/browser-worker.ts", "utf8");

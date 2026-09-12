@@ -1587,8 +1587,9 @@ test("a viewport-refresh heartbeat reapplies hidden emulation before CDP reconne
   assert.equal(tab.deviceEmulationDirty, false);
 });
 
-test("an uninitialized browser surface is reaped instead of remaining as a gray orphan tab", () => {
+test("an uninitialized browser surface is reaped and its runtime owner is cancelled", async () => {
   const closed = [];
+  const cancelled = [];
   const warnings = [];
   const tab = {
     id: "tab-orphan",
@@ -1615,15 +1616,19 @@ test("an uninitialized browser surface is reaped instead of remaining as a gray 
     snapshot: () => ({ tabs: [] }),
     publishState() {},
     writeDescriptor() {},
+    cancelTurn: async traceId => { cancelled.push(traceId); },
     logger: { warn: (event, detail) => warnings.push([event, detail]) },
   });
 
   BrowserHost.prototype.reapExpiredTurnTabs.call(fixture, 101);
+  await Promise.resolve();
+  BrowserHost.prototype.reapExpiredTurnTabs.call(fixture, 102);
 
   assert.equal(fixture.turnTabs.size, 0);
   assert.equal(fixture.selectedTabId, "home");
   assert.equal(fixture.closedTurnOwners.get(tab.traceId), tab.helperPid);
   assert.deepEqual(closed, ["view", "contents"]);
+  assert.deepEqual(cancelled, [tab.traceId]);
   assert.deepEqual(warnings, [["browser.orphan_turn_reaped", {
     tabId: tab.id,
     traceId: tab.traceId,
@@ -2285,6 +2290,104 @@ test("a required retained conversation fails before creating a browser tab", asy
     ),
     (error) => error?.code === "retained_conversation_unavailable"
       && /retained ChatGPT conversation is no longer available/.test(error.message),
+  );
+  assert.equal(created, false);
+});
+
+test("a required Image Factory conversation recovers from its saved URL after launcher restart", async () => {
+  const conversationKey = "e".repeat(64);
+  const projectId = "g-p-recovery123";
+  const conversationUrl = `https://chatgpt.com/g/${projectId}-image-factory/c/6aa36a93-7164-83ec-8342-0441376d4255`;
+  const events = [];
+  let createdArgs;
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    manualOperation: null,
+    turnTabs: new Map(),
+    userCancelledTurnOwners: new Map(),
+    selectedTabId: "home",
+    createTurnTab: async (...args) => {
+      createdArgs = args;
+      const tab = {
+        id: "recovered-tab",
+        surfaceId: "recovered-surface",
+        view: { webContents: { getURL: () => conversationUrl } },
+      };
+      fixture.turnTabs.set(tab.id, tab);
+      return tab;
+    },
+    syncViewVisibility: () => events.push("visible"),
+    snapshot: () => ({ tabs: [] }),
+    publishState: () => events.push("published"),
+    writeDescriptor: () => events.push("descriptor"),
+    logger: { info: (event) => events.push(event) },
+  });
+
+  const lease = await BrowserHost.prototype.beginTurn.call(
+    fixture,
+    "trace_recovered",
+    false,
+    222,
+    conversationKey,
+    undefined,
+    true,
+    conversationUrl,
+    projectId,
+  );
+
+  assert.deepEqual(createdArgs, [
+    "trace_recovered",
+    222,
+    conversationKey,
+    undefined,
+    conversationUrl,
+  ]);
+  assert.deepEqual(lease, {
+    surfaceId: "recovered-surface",
+    tabId: "recovered-tab",
+    reused: true,
+    connectorBound: false,
+  });
+  assert.equal(fixture.selectedTabId, "recovered-tab");
+  assert.deepEqual(events, ["visible", "published", "browser.tab_recovered", "descriptor"]);
+});
+
+test("retained Image Factory recovery rejects non-ChatGPT and wrong-project URLs", async () => {
+  let created = false;
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    manualOperation: null,
+    turnTabs: new Map(),
+    userCancelledTurnOwners: new Map(),
+    createTurnTab: () => {
+      created = true;
+      throw new Error("must not create a tab for invalid recovery metadata");
+    },
+  });
+  const baseArgs = [
+    "trace_invalid_recovery",
+    false,
+    222,
+    "f".repeat(64),
+    undefined,
+    true,
+  ];
+
+  await assert.rejects(
+    BrowserHost.prototype.beginTurn.call(
+      fixture,
+      ...baseArgs,
+      "https://example.com/g/g-p-target/c/12345678",
+      "g-p-target",
+    ),
+    /recovery URL is invalid/,
+  );
+  await assert.rejects(
+    BrowserHost.prototype.beginTurn.call(
+      fixture,
+      ...baseArgs,
+      "https://chatgpt.com/g/g-p-other/c/12345678",
+      "g-p-target",
+    ),
+    /recovery URL is invalid/,
   );
   assert.equal(created, false);
 });

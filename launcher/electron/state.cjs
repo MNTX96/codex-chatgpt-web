@@ -15,6 +15,7 @@ const DEFAULT_STATE = Object.freeze({
   experimentalBiggerContext: false,
   zeroRiskProEnabled: false,
   imageFactoryProjectId: null,
+  imageFactoryProjectName: null,
   browserSmokePassed: false,
   browserSmokeVersion: null,
   sidebarOpen: true,
@@ -54,12 +55,8 @@ function readState(filePath) {
     if (state.browserInteractionMode !== "automatic" && state.browserInteractionMode !== "manual") {
       state.browserInteractionMode = DEFAULT_STATE.browserInteractionMode;
     }
-    if (state.imageFactoryProjectId !== null) {
-      if (typeof state.imageFactoryProjectId !== "string") {
-        state.imageFactoryProjectId = DEFAULT_STATE.imageFactoryProjectId;
-      } else {
-        state.imageFactoryProjectId = state.imageFactoryProjectId.trim() || null;
-      }
+    for (const key of ["imageFactoryProjectId", "imageFactoryProjectName"]) {
+      state[key] = typeof state[key] === "string" ? state[key].trim() || null : null;
     }
     if (state.coreSetupComplete !== true) {
       if (state.onboardingComplete !== true) state.browserInteractionMode = "automatic";

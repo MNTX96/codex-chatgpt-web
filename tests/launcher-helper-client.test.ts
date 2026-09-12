@@ -5,6 +5,8 @@ import { join } from "node:path";
 import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-error";
 import { LauncherBrowserHelperClient } from "../src/adapters/chatgpt-web/launcher-helper-client";
 import type { BrowserTurn, ResolvedBrowserConfig } from "../src/adapters/chatgpt-web/browser-worker";
+import { ChatGptFollowUpChannel, type ChatGptFollowUpEvent } from "../src/adapters/chatgpt-web/follow-up";
+import { ChatGptExternalTurnProgress } from "../src/adapters/chatgpt-web/turn-progress";
 import { LAUNCHER_BROWSER_HOST_KIND, LAUNCHER_BROWSER_IDLE_URL } from "../src/launcher-browser-host";
 
 const roots: string[] = [];
@@ -23,10 +25,15 @@ test("daemon streams browser lifecycle through the real helper process", async (
       await turn.onPreparedSelected(false);
       const prepared = await turn.prepare();
       if (prepared.multipart.parts.length !== 3) throw new Error("Multipart context was lost");
+      if (turn.persistentProjectName !== "Art studio") throw new Error("Project name was lost across helper IPC");
       await turn.onMultipartStageAcknowledged?.(1);
       await turn.onMultipartStageAcknowledged?.(2);
       await turn.onSendActivated();
-      turn.onSubmitted();
+      const conversationUrl = "https://chatgpt.com/g/g-p-configured-project/c/conversation-12345678";
+      turn.onSubmitted(conversationUrl);
+      if (turn.outputArtifactTarget.metadata.conversationUrl !== conversationUrl) {
+        throw new Error("Helper artifact provenance kept the pre-Send project URL");
+      }
       turn.onReasoningSummary("Reading project");
       turn.onReasoningSummary(" files", true);
       turn.onTextDelta("done");
@@ -87,6 +94,16 @@ test("daemon streams browser lifecycle through the real helper process", async (
   try {
     const result = await client.run({
       traceId: "abcdef123456",
+      surface: "persistent",
+      persistentProjectId: "g-p-configured-project",
+      persistentProjectName: "Art studio",
+      outputArtifactTarget: {
+        workspaceRoot: root, outputDirectory: join(root, "artifacts"), writableRoots: [root],
+        maxArtifacts: 1, maxBytesPerArtifact: 1024, maxTotalBytes: 1024, capturePolicy: "required",
+        metadata: { output: "image", surface: "persistent", projectId: "g-p-configured-project",
+          conversationUrl: "https://chatgpt.com/g/g-p-configured-project/project" },
+      },
+      outputArtifactExecutionKey: "a".repeat(64),
       modelId: "gpt-5.6-sol",
       reasoning: "high",
       capabilities: { localToolsEnabled: false, solAvailable: true, proAvailable: false },
@@ -124,6 +141,109 @@ test("daemon streams browser lifecycle through the real helper process", async (
       },
     }]);
     expect(released).toBe(true);
+  } finally {
+    await client.close();
+  }
+});
+
+test("follow-up lifecycle crosses the real launcher helper process", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-launcher-helper-follow-up-"));
+  roots.push(root);
+  const helper = join(root, "helper.ts");
+  writeFileSync(helper, `
+    import { ChatGptBrowserWorker } from ${JSON.stringify(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url).href)};
+    ChatGptBrowserWorker.prototype.run = async turn => {
+      await turn.onPreparedSelected(false);
+      await turn.prepare();
+      if (!turn.followUp) throw new Error("Follow-up channel was not transported to the helper");
+      let resolveFollowUp;
+      const followUpSubmitted = new Promise(resolve => { resolveFollowUp = resolve; });
+      const release = turn.followUp.bind(async request => {
+        turn.followUp.recordEvent({ type: "send_activated", requestId: request.requestId, revision: request.revision });
+        turn.followUp.recordEvent({
+          type: "submitted",
+          requestId: request.requestId,
+          revision: request.revision,
+          conversationUrl: "https://chatgpt.com/c/follow-up-ipc-fixture",
+        });
+        resolveFollowUp();
+      });
+      await turn.onSendActivated();
+      turn.onSubmitted("https://chatgpt.com/c/follow-up-ipc-fixture");
+      await followUpSubmitted;
+      release();
+      turn.onTextDelta("follow-up complete");
+      return "follow-up complete";
+    };
+    await import(${JSON.stringify(new URL("../src/adapters/chatgpt-web/browser-helper-main.ts", import.meta.url).href)});
+  `, { mode: 0o700 });
+  const descriptorHelper = join(root, "descriptor-helper.cjs");
+  writeFileSync(descriptorHelper, "process.exit(99);\n", { mode: 0o700 });
+  const descriptorPath = join(root, "launcher.json");
+  writeFileSync(descriptorPath, `${JSON.stringify({
+    version: 3,
+    kind: LAUNCHER_BROWSER_HOST_KIND,
+    profile: "production",
+    pid: process.pid,
+    endpoint: "http://127.0.0.1:39001",
+    control: {
+      endpoint: "http://127.0.0.1:39002",
+      token: "launcher-control-token-0123456789abcdefghijklmnop",
+    },
+    helper: { executable: process.execPath, script: descriptorHelper },
+    partition: "persist:codex-web-gpt-chatgpt",
+    idleUrl: LAUNCHER_BROWSER_IDLE_URL,
+    surfaceId: "launcher_surface_id_0123456789AB",
+    surfaceTargets: { ["launcher_surface_id_0123456789AB"]: "native-owned-target" },
+    createdAt: new Date().toISOString(),
+  })}\n`, { mode: 0o600 });
+  const client = new LauncherBrowserHelperClient({
+    appName: "Codex Native2",
+    browserHost: "launcher",
+    browserHostDescriptorPath: descriptorPath,
+    browserHelperScriptPath: helper,
+    storageStatePath: join(root, "unused-state.json"),
+    chromeExecutablePath: join(root, "unused-chrome"),
+    turnTimeoutMs: 60_000,
+    headed: true,
+    autoApproveToolCalls: false,
+  });
+  const followUp = new ChatGptFollowUpChannel(5_000);
+  const events: ChatGptFollowUpEvent[] = [];
+  followUp.onEvent(event => events.push(event));
+  let resolveInitialSubmission!: () => void;
+  const initialSubmission = new Promise<void>(resolve => { resolveInitialSubmission = resolve; });
+  try {
+    const run = client.run({
+      traceId: "follow-up-helper-ipc",
+      modelId: "gpt-5.6-sol",
+      reasoning: "high",
+      capabilities: { localToolsEnabled: true, solAvailable: true, proAvailable: false },
+      retainConversation: true,
+      requireRetainedConversation: true,
+      externalProgress: new ChatGptExternalTurnProgress(),
+      followUp,
+      prepare: async () => ({ text: "start", images: [], release() {} }),
+      onSendActivated() {},
+      onSubmitted: () => resolveInitialSubmission(),
+      onTextDelta() {},
+    });
+    await initialSubmission;
+    const request = {
+      requestId: "follow-up-ipc-request",
+      revision: 2,
+      instructionId: "f".repeat(64),
+      text: "Continue with this steering instruction",
+    };
+    await followUp.enqueue(request);
+    expect(await followUp.waitForTerminal(request)).toEqual({
+      type: "submitted",
+      requestId: request.requestId,
+      revision: request.revision,
+      conversationUrl: "https://chatgpt.com/c/follow-up-ipc-fixture",
+    });
+    expect(events.map(event => event.type)).toEqual(["queued", "send_activated", "submitted"]);
+    expect(await run).toBe("follow-up complete");
   } finally {
     await client.close();
   }
@@ -197,7 +317,8 @@ test("accepted compaction retires through the helper as completed without hiding
     const run = ChatGptBrowserWorker.prototype.run;
     ChatGptBrowserWorker.prototype.run = function(turn) {
       // Substitute the browser wait only. Actual worker catch/finally, IPC and launcher end run.
-      this.runStage = async () => {
+      this.runStage = async (_traceId, name, _timeout, action) => {
+        if (name === "prompt_preparation") return action(turn.abortSignal);
         const stopped = new Promise((resolve, reject) => {
           turn.abortSignal.addEventListener("abort", () => reject(
             turn.traceId === "compaction_real_failure"
@@ -295,6 +416,7 @@ test("launcher helper protocol preserves multipart context and the compaction fl
   const internal = client as unknown as {
     pending: Map<string, { resolve(value: string): void }>;
     child?: unknown;
+    helperFeatures: Set<string>;
     ensureChild(): Promise<void>;
     send(message: Record<string, unknown>): Promise<void>;
     finish(id: string): void;

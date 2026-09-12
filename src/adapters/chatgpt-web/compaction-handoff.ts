@@ -7,6 +7,7 @@ import type {
 import { extractChatGptCompactionSourceRevision } from "./environment";
 import type { ChatGptBrowserWorker } from "./browser-worker";
 import { ChatGptCompactionHandoffAccepted } from "./adapter-error";
+import { assertChatGptMultipartContextAvailable } from "./prompt";
 import type { CompactionTransactionHandle } from "./compaction-transaction";
 import type { ChatGptWebCapabilities } from "./model";
 import {
@@ -99,6 +100,7 @@ export function canonicalizeCompactionHandoff(
   summary: string,
 ): string {
   const normalized = summary.trim();
+  assertChatGptMultipartContextAvailable(normalized);
   if (!normalized) throw new Error("ChatGPT returned an empty structured compaction handoff");
   const latestUserPrompt = userPromptText(extractChatGptCompactionSourceRevision(parsed).content);
   if (latestUserPrompt === undefined) {

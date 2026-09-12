@@ -13,6 +13,7 @@ import { OutputImageAdapter } from "../src/adapters/chatgpt-web/artifacts/image/
 import { resolveOutputArtifactTarget } from "../src/adapters/chatgpt-web/artifacts/artifact-target";
 import { attachPromptFiles, type AttachmentGuard } from "../src/adapters/chatgpt-web/file-attachments";
 import { ChatGptBrowserWorker } from "../src/adapters/chatgpt-web/browser-worker";
+import { ChatGptFollowUpChannel, type ChatGptFollowUpRequest } from "../src/adapters/chatgpt-web/follow-up";
 import type { LauncherImageDownloadOwner } from "../src/adapters/chatgpt-web/artifacts/image/download-transaction";
 import type { OutputImageCandidate } from "../src/adapters/chatgpt-web/artifacts/types";
 
@@ -110,13 +111,13 @@ async function cards(page: Page, key: string, options: { menu?: boolean; overlay
   await page.setContent(`<!doctype html><style>
     .card { display:inline-block; position:relative; margin:10px; }
     .card img { width:180px; height:180px; }
-    .overlay { position:absolute; inset:35px 0 0; }
+    .overlay { position:absolute; inset:35px 0 0; pointer-events:none; }
     [role=dialog] { position:fixed; inset:0; background:white; z-index:10; }
     [role=dialog] img { width:400px; height:400px; display:block; }
     [role=menu] { position:fixed; top:100px; right:20px; z-index:20; background:white; }
   </style><button onclick="window.wrongClicks++">Download unrelated</button><section id="assistant">
   ${Array.from({ length: count }, (_, i) => `<div class="card group/imagegen-image" id="image-${i + 1}">
-    <button onclick="window.wrongClicks++">Share</button><button onclick="window.wrongClicks++">Edit</button>
+    <button onclick="window.wrongClicks++">Share</button><button aria-label="Edit image" onclick="openViewer(${i + 1})">Edit</button>
     <img src="${preview(i + 1)}" onclick="openViewer(${i + 1})">
     ${options.overlay ? `<button class="overlay" onclick="openViewer(${i + 1})"></button>` : ""}
   </div>`).join("")}</section><script>
@@ -154,7 +155,38 @@ function capture(page: Page, owner: LauncherImageDownloadOwner, options: { maxBy
     launcherOwner: owner, abortSignal: options.signal, budget: options.budget, log: trace });
 }
 
-test("Electron: overlay activation and multiple toolbar buttons select the correct viewer and download", async () => {
+test("Electron: accepted image edit waits for the source thumbnail to hydrate", async () => {
+  const { page, key } = await newPage();
+  await cards(page, key);
+  await page.locator("#assistant").evaluate(element => element.setAttribute("data-turn-id", "source-turn-123"));
+  await page.locator("#image-1 img").click();
+  await page.evaluate(source => {
+    const form = document.createElement("form");
+    form.innerHTML = '<div contenteditable="true"></div><button type="button" data-testid="send-button">Send</button>';
+    form.querySelector("button")!.onclick = () => {
+      const user = document.createElement("section");
+      user.setAttribute("data-turn-id", "new-edit-user");
+      user.textContent = "Change the color";
+      document.body.append(user);
+      setTimeout(() => {
+        const image = document.createElement("img"); image.alt = "Edited image"; image.src = source; user.append(image);
+      }, 300);
+    };
+    document.querySelector('[role="dialog"]')!.append(form);
+  }, preview());
+  let submitted = false;
+  const method = (ChatGptBrowserWorker.prototype as any).sendImageEditPrompt;
+  await method.call({
+    waitForSubmissionAcceptedWithRecovery: async () => "user_turn",
+    submissionDomState: async () => ({ userIdentities: ["old-user", "new-edit-user"] }),
+  }, page, { initialTurnIdentities: ["old-user"], domCache: {} }, {
+    assistantTurnId: "source-turn-123", candidateKey: "image-1", cardId: "image-1",
+  }, "Change the color", undefined, { onSubmitted: () => { submitted = true; } });
+  expect(submitted).toBe(true);
+  expect(await page.locator('[data-turn-id="new-edit-user"] img').count()).toBe(1);
+}, 15_000);
+
+test("Electron: scoped Edit image opener ignores unrelated overlay and toolbar controls", async () => {
   const { page, owner, key } = await newPage(); await cards(page, key, { overlay: true });
   expect((await capture(page, owner)).equals(payload())).toBeTrue();
   expect(await page.evaluate(() => [ (window as any).wrongClicks, (window as any).openClicks, (window as any).downloadClicks ])).toEqual([0, 1, 1]);
@@ -263,6 +295,176 @@ test("Electron: a remounted viewer has exactly one binding even when the old dia
   } finally { budget.dispose(); }
 });
 
+test("Electron: duplicate gallery card ids are selected by file identity before Edit image opens", async () => {
+  const { page, key } = await newPage();
+  const first = "file_00000000000000000000000000000001";
+  const second = "file_00000000000000000000000000000002";
+  const third = "file_00000000000000000000000000000003";
+  await page.setContent(`<!doctype html><style>
+    [class*="imagegen-image"] { display:block; width:180px; height:180px; }
+    [class*="imagegen-image"] img { width:180px; height:180px; }
+    [role=dialog] { position:fixed; inset:0; background:white; z-index:10; }
+    [role=dialog] img { width:400px; height:400px; display:block; }
+  </style><section id="assistant">
+    <div id="image-duplicate" class="group/imagegen-image" data-primary="true" data-file-id="${first}">
+      <button aria-label="Edit image" onclick="openViewer()">Edit</button>
+      <img data-file-id="${first}" src="${preview(1)}">
+    </div>
+    <button id="gallery-1" aria-label="Image 1 of 3" onclick="selectImage(1, '${first}')"><div id="image-duplicate" class="group/imagegen-image"><img data-file-id="${first}" src="${preview(1)}"></div></button>
+    <button id="gallery-2" aria-label="Image 2 of 3" onclick="selectImage(2, '${second}')"><div id="image-duplicate" class="group/imagegen-image"><img data-file-id="${second}" src="${preview(2)}"></div></button>
+    <button id="gallery-3" aria-label="Image 3 of 3" onclick="selectImage(3, '${third}')"><div id="image-duplicate" class="group/imagegen-image"><img data-file-id="${third}" src="${preview(3)}"></div></button>
+  </section><script>
+    window.galleryClicks=[]; window.openClicks=0;
+    window.selectImage=(index, identity)=>{
+      window.galleryClicks.push(index);
+      const card=document.querySelector('#assistant > [data-primary]');
+      const image=card.querySelector('img');
+      card.setAttribute('data-file-id', identity); image.setAttribute('data-file-id', identity);
+      image.src=document.querySelector('#gallery-'+index+' img').src;
+    };
+    window.openViewer=()=>{
+      window.openClicks++;
+      const source=document.querySelector('#assistant > [data-primary] img');
+      const viewer=document.createElement('div'); viewer.setAttribute('role','dialog');
+      viewer.innerHTML='<button aria-label="Close" onclick="this.parentElement.remove()">Close</button>'
+        + '<img data-file-id="'+source.getAttribute('data-file-id')+'" src="'+source.src+'">';
+      document.body.append(viewer);
+    };
+  </script>`);
+  const budget = new ImageTransferDeadline(Date.now() + 5_000);
+  try {
+    const viewer = await openBoundImageViewer({
+      page,
+      responseTurn: page.locator("#assistant"),
+      candidate: { key: second, cardId: "image-duplicate", fileIdentity: second, imageSrc: preview(2), readiness: "ready" },
+      budget,
+      log: trace,
+    });
+    expect(await page.evaluate(() => [(window as any).galleryClicks, (window as any).openClicks])).toEqual([[2], 1]);
+    await viewer.scope.locator("img").evaluate((image, source) => {
+      (image as HTMLImageElement).src = source;
+    }, preview(3));
+    await viewer.assertCurrent();
+    await viewer.close();
+  } finally { budget.dispose(); }
+  expect(requests.get(key)).toBeUndefined();
+});
+
+test("Electron: one shared gallery card selects a nested output before Edit image opens", async () => {
+  const { page, key } = await newPage();
+  const first = "file_00000000000000000000000000000011";
+  const second = "file_00000000000000000000000000000012";
+  const third = "file_00000000000000000000000000000013";
+  await page.setContent(`<!doctype html><style>
+    [class*="imagegen-image"] { display:block; width:520px; min-height:180px; }
+    #preview img { width:180px; height:180px; }
+    .gallery img { width:44px; height:44px; }
+    [role=dialog] { position:fixed; inset:0; background:white; z-index:10; }
+    [role=dialog] img { width:400px; height:400px; display:block; }
+  </style><section id="assistant">
+    <div id="image-shared" class="group/imagegen-image" data-file-id="${first}">
+      <button id="preview" aria-label="Generated image"><img alt="Generated image" data-file-id="${first}" src="${preview(1)}"></button>
+      <button aria-label="Edit image" onclick="openViewer()">Edit</button>
+      <button id="gallery-1" class="gallery" aria-label="Generated image" onclick="selectImage(1, '${first}')"><img data-file-id="${first}" src="${preview(1)}"></button>
+      <button id="gallery-2" class="gallery" aria-label="Generated image" onclick="selectImage(2, '${second}')"><img data-file-id="${second}" src="${preview(2)}"></button>
+      <button id="gallery-3" class="gallery" aria-label="Generated image" onclick="selectImage(3, '${third}')"><img data-file-id="${third}" src="${preview(3)}"></button>
+    </div>
+  </section><script>
+    window.galleryClicks=[]; window.openClicks=0;
+    window.selectImage=(index, identity)=>{
+      window.galleryClicks.push(index);
+      const card=document.querySelector('#image-shared');
+      const image=document.querySelector('#preview img');
+      const selected=document.querySelector('#gallery-'+index+' img');
+      card.setAttribute('data-file-id', identity); image.setAttribute('data-file-id', identity); image.src=selected.src;
+    };
+    window.openViewer=()=>{
+      window.openClicks++;
+      const source=document.querySelector('#preview img');
+      const viewer=document.createElement('div'); viewer.setAttribute('role','dialog');
+      viewer.innerHTML='<button aria-label="Close" onclick="this.parentElement.remove()">Close</button>'
+        + '<img data-file-id="'+source.getAttribute('data-file-id')+'" src="'+source.src+'">';
+      document.body.append(viewer);
+    };
+  </script>`);
+  const budget = new ImageTransferDeadline(Date.now() + 5_000);
+  try {
+    const viewer = await openBoundImageViewer({
+      page,
+      responseTurn: page.locator("#assistant"),
+      candidate: { key: second, cardId: "image-shared", fileIdentity: second, imageSrc: preview(2), readiness: "ready" },
+      budget,
+      log: trace,
+    });
+    expect(await page.evaluate(() => [(window as any).galleryClicks, (window as any).openClicks])).toEqual([[2], 1]);
+    await viewer.assertCurrent();
+    await viewer.close();
+  } finally { budget.dispose(); }
+  expect(requests.get(key)).toBeUndefined();
+});
+
+test("Electron: an opaque gallery output resolves stable identity before Edit image opens", async () => {
+  const { page, key } = await newPage();
+  const first = "file_00000000000000000000000000000021";
+  const second = "file_00000000000000000000000000000022";
+  const third = "file_00000000000000000000000000000023";
+  await page.setContent(`<!doctype html><style>
+    [class*="imagegen-image"] { display:block; width:520px; min-height:180px; }
+    #preview img { width:180px; height:180px; }
+    .gallery img { width:44px; height:44px; }
+    [role=dialog] { position:fixed; inset:0; background:white; z-index:10; }
+    [role=dialog] img { width:400px; height:400px; display:block; }
+  </style><section id="assistant">
+    <div id="image-shared-opaque" class="group/imagegen-image" data-file-id="${first}">
+      <button id="preview" aria-label="Generated image"><img alt="Generated image" data-file-id="${first}" src="${preview(1)}"></button>
+      <button aria-label="Edit image" onclick="openViewer()">Edit</button>
+      <button id="gallery-1" class="gallery" aria-label="Generated image" onclick="selectImage(1, '${first}')"><img alt="Generated image" src="${preview(1)}"></button>
+      <button id="gallery-2" class="gallery" aria-label="Generated image" onclick="selectImage(2, '${second}')"><img alt="Generated image" src="${preview(2)}"></button>
+      <button id="gallery-3" class="gallery" aria-label="Generated image" onclick="selectImage(3, '${third}')"><img alt="Generated image" src="${preview(3)}"></button>
+    </div>
+  </section><script>
+    window.galleryClicks=[]; window.openClicks=0;
+    window.selectImage=(index, identity)=>{
+      window.galleryClicks.push(index);
+      const card=document.querySelector('#image-shared-opaque');
+      const image=document.querySelector('#preview img');
+      const selected=document.querySelector('#gallery-'+index+' img');
+      card.setAttribute('data-file-id', identity); image.setAttribute('data-file-id', identity); image.src=selected.src;
+    };
+    window.openViewer=()=>{
+      window.openClicks++;
+      const source=document.querySelector('#preview img');
+      const viewer=document.createElement('div'); viewer.setAttribute('role','dialog');
+      viewer.innerHTML='<button aria-label="Close" onclick="this.parentElement.remove()">Close</button>'
+        + '<img data-file-id="'+source.getAttribute('data-file-id')+'" src="'+source.src+'">';
+      document.body.append(viewer);
+    };
+  </script>`);
+  const budget = new ImageTransferDeadline(Date.now() + 5_000);
+  const candidate: OutputImageCandidate = {
+    key: "gallery-pending:image-shared-opaque:1",
+    cardId: "image-shared-opaque",
+    transientGalleryOrdinal: 1,
+    readiness: "loading" as const,
+  };
+  try {
+    const viewer = await openBoundImageViewer({
+      page,
+      responseTurn: page.locator("#assistant"),
+      candidate,
+      budget,
+      log: trace,
+    });
+    expect(await page.evaluate(() => [(window as any).galleryClicks, (window as any).openClicks])).toEqual([[2], 1]);
+    expect(candidate.key).toBe(second);
+    expect(candidate.fileIdentity).toBe(second);
+    expect(candidate.transientGalleryOrdinal).toBeUndefined();
+    await viewer.assertCurrent();
+    await viewer.close();
+  } finally { budget.dispose(); }
+  expect(requests.get(key)).toBeUndefined();
+});
+
 test("Electron: a matching thumbnail cannot disguise a different selected image", async () => {
   const { page, key } = await newPage(); await cards(page, key, { count: 2 });
   const budget = new ImageTransferDeadline(Date.now() + 5_000);
@@ -297,6 +499,44 @@ async function uploadForm(page: Page, mode: "explicit" | "implicit" | "rejected"
 }
 const reference = (name = "reference.png") => ({ name, mimeType: "image/png", buffer: png });
 
+async function seedStaleAttachment(
+  page: Page,
+  name: string,
+  removeLabel = "Remove attachment",
+  removeControls = 1,
+) {
+  await page.locator("#attachments").evaluate((root, options) => {
+    const group = document.createElement("div");
+    group.setAttribute("role", "group");
+    group.setAttribute("aria-label", options.name);
+    group.setAttribute("data-upload-state", "uploaded");
+    const image = document.createElement("img");
+    image.src = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    image.width = 40;
+    image.height = 40;
+    group.append(image);
+    for (let index = 0; index < options.removeControls; index++) {
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.setAttribute("aria-label", `${options.removeLabel}${index === 0 ? "" : ` ${index + 1}`}`);
+      remove.textContent = "×";
+      remove.onclick = () => group.remove();
+      group.append(remove);
+    }
+    root.append(group);
+  }, { name, removeLabel, removeControls });
+}
+
+function attachmentWorker(page: Page) {
+  const worker = Object.create(ChatGptBrowserWorker.prototype) as unknown as {
+    activeComposer(page: Page): Promise<Locator>;
+    attachFiles(page: Page, prompt: { images: Array<{ ref: string; imageUrl: string }> }, signal: AbortSignal,
+      log: (stage: string, fields?: Record<string, unknown>) => void): Promise<AttachmentGuard>;
+  };
+  worker.activeComposer = async () => page.locator("#prompt-textarea");
+  return worker;
+}
+
 test("Electron upload: one/multiple references require accepted previews and guard removal before Send", async () => {
   for (const mode of ["explicit", "implicit"] as const) {
     const { page } = await newPage(); await uploadForm(page, mode);
@@ -323,6 +563,82 @@ test("Electron upload: cancellation during an upload never reaches Send", async 
   await page.getByRole("group", { name: "reference.png", exact: true }).waitFor({ timeout: 5_000 }); controller.abort();
   expect(await outcome).toMatchObject({ ok: false });
   expect(await page.evaluate(() => (window as any).sends)).toBe(0);
+});
+
+test("Electron upload: a no-file turn clears a stale attachment left by the previous task", async () => {
+  const { page } = await newPage();
+  await uploadForm(page);
+  await seedStaleAttachment(page, "task-a.png", "添付ファイルを削除");
+  const worker = attachmentWorker(page);
+  const guard = await worker.attachFiles(page, { images: [] }, new AbortController().signal, trace);
+  await guard.assertReady();
+
+  expect(await page.locator('form [role="group"][aria-label]').count()).toBe(0);
+  expect(await page.evaluate(() => (window as any).sends)).toBe(0);
+});
+
+test("Electron upload: a new file replaces a stale attachment instead of being appended beside it", async () => {
+  const { page } = await newPage();
+  await uploadForm(page);
+  await seedStaleAttachment(page, "task-a.png");
+  const worker = attachmentWorker(page);
+  const freshImage = `data:image/png;base64,${png.toString("base64")}`;
+  const guard = await worker.attachFiles(page, {
+    images: [{ ref: "task-b", imageUrl: freshImage }],
+  }, new AbortController().signal, trace);
+  await guard.assertReady();
+
+  expect(await page.locator('form [role="group"][aria-label]').evaluateAll(elements => elements.map(element => element.getAttribute("aria-label")))).toEqual(["task-b.png"]);
+  expect(await page.evaluate(() => (window as any).sends)).toBe(0);
+});
+
+test("Electron upload: ambiguous stale-attachment cleanup fails closed before Send", async () => {
+  const { page } = await newPage();
+  await uploadForm(page);
+  await seedStaleAttachment(page, "ambiguous.png", "Remove attachment", 2);
+  const worker = Object.create(ChatGptBrowserWorker.prototype) as unknown as {
+    activeComposer(page: Page): Promise<Locator>;
+    sendAttachedPrompt(page: Page, baseline: unknown): Promise<unknown>;
+  };
+  worker.activeComposer = async () => page.locator("#prompt-textarea");
+
+  expect(await rejection(worker.sendAttachedPrompt(page, {}))).toMatchObject({
+    code: "attachment_cleanup_control_ambiguous",
+  });
+  expect(await page.evaluate(() => (window as any).sends)).toBe(0);
+});
+
+test("Electron upload: follow-up removes a stale attachment before using the retained composer", async () => {
+  const { page } = await newPage();
+  await uploadForm(page);
+  await seedStaleAttachment(page, "previous-turn.png", "添付ファイルを削除");
+  const request: ChatGptFollowUpRequest = {
+    requestId: "follow-up-stale-attachment",
+    revision: 2,
+    instructionId: "b".repeat(64),
+    text: "Apply the follow-up without the previous file",
+  };
+  const channel = new ChatGptFollowUpChannel(5_000);
+  void channel.enqueue(request);
+  const worker = Object.create(ChatGptBrowserWorker.prototype) as unknown as {
+    activeComposer(page: Page): Promise<Locator>;
+    insertPromptText(page: Page, text: string): Promise<void>;
+    assertPromptAttached(page: Page, text: string): Promise<void>;
+    waitForSubmissionAcceptedWithRecovery(): Promise<"user_turn">;
+    sendFollowUpPrompt(page: Page, baseline: unknown, request: ChatGptFollowUpRequest, channel: ChatGptFollowUpChannel): Promise<unknown>;
+  };
+  worker.activeComposer = async () => page.locator("#prompt-textarea");
+  worker.insertPromptText = async (_page: Page, text: string) => { await page.locator("#prompt-textarea").fill(text); };
+  worker.assertPromptAttached = async (_page: Page, text: string) => {
+    expect(await page.locator("#prompt-textarea").inputValue()).toBe(text);
+  };
+  worker.waitForSubmissionAcceptedWithRecovery = async () => "user_turn";
+
+  await worker.sendFollowUpPrompt(page, {}, request, channel);
+
+  expect(await page.locator('form [role="group"][aria-label]').count()).toBe(0);
+  expect(await page.evaluate(() => (window as any).sends)).toBe(1);
+  expect(await channel.waitForTerminal(request)).toMatchObject({ type: "submitted", revision: 2 });
 });
 
 test("Electron upload: the production send boundary rechecks references and cancellation after its callback", async () => {

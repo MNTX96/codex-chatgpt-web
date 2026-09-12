@@ -1,5 +1,6 @@
 const { createServer } = require("node:http");
 const { randomBytes, timingSafeEqual } = require("node:crypto");
+const { verifiedImageFactoryConversationUrl } = require("./image-factory-conversation.cjs");
 const { releaseRetainedConversation } = require("./retained-turn-release.cjs");
 
 const MAX_BODY_BYTES = 16 * 1024;
@@ -126,7 +127,10 @@ class BrowserControlServer {
         const projectId = typeof preferences.imageFactoryProjectId === "string"
           ? preferences.imageFactoryProjectId.trim()
           : "";
-        writeJson(response, 200, { ok: true, projectId: projectId || null });
+        const projectName = typeof preferences.imageFactoryProjectName === "string"
+          ? preferences.imageFactoryProjectName.trim()
+          : "";
+        writeJson(response, 200, { ok: true, projectId: projectId || null, projectName: projectName || null });
         return;
       }
       const host = this.getBrowserHost();
@@ -178,6 +182,30 @@ class BrowserControlServer {
       }
       if (body.requireRetainedConversation === true && body.conversationKey === undefined) {
         throw new Error("requireRetainedConversation requires conversationKey");
+      }
+      let resumeConversationUrl;
+      let persistentProjectId;
+      if (body.resumeConversationUrl !== undefined || body.persistentProjectId !== undefined) {
+        if (body.requireRetainedConversation !== true || body.conversationKey === undefined) {
+          throw new Error("retained Image Factory recovery requires a retained conversation key");
+        }
+        if (body.connectorIdentity !== undefined) {
+          throw new Error("retained Image Factory recovery cannot bind a connector identity");
+        }
+        if (typeof body.resumeConversationUrl !== "string" || typeof body.persistentProjectId !== "string") {
+          throw new Error("retained Image Factory recovery metadata is invalid");
+        }
+        const configuredProjectId = typeof preferences.imageFactoryProjectId === "string"
+          ? preferences.imageFactoryProjectId.trim()
+          : "";
+        persistentProjectId = body.persistentProjectId.trim();
+        if (!configuredProjectId || persistentProjectId !== configuredProjectId) {
+          throw new Error("retained Image Factory recovery project does not match launcher configuration");
+        }
+        resumeConversationUrl = verifiedImageFactoryConversationUrl(body.resumeConversationUrl, persistentProjectId);
+        if (!resumeConversationUrl) {
+          throw new Error("retained Image Factory recovery URL is invalid");
+        }
       }
       if (body.connectorIdentity !== undefined && body.conversationKey === undefined) {
         throw new Error("connectorIdentity requires conversationKey");
@@ -298,14 +326,16 @@ class BrowserControlServer {
         if (host.browserInteractionMode() === "manual") {
           throw new Error("Automatic browser interaction is disabled");
         }
-        const lease = await host.beginTurn(
+        const beginTurnArgs = [
           body.traceId,
           preferences.showBrowserDuringTurns === true,
           body.helperPid,
           body.conversationKey,
           body.connectorIdentity,
           body.requireRetainedConversation === true,
-        );
+        ];
+        if (resumeConversationUrl) beginTurnArgs.push(resumeConversationUrl, persistentProjectId);
+        const lease = await host.beginTurn(...beginTurnArgs);
         this.logger.info("browser.turn_started", { traceId: body.traceId });
         writeJson(response, 200, { ok: true, ...lease });
         return;

@@ -245,7 +245,7 @@ function reasoningPicker(options: { max?: string; delay?: number; missing?: bool
   };
   const composer = { filter() { return this; }, last() { return this; }, locator: () => ({ locator: () => control }) };
   const modelRows = { count: async () => 3, first() { return this; }, waitFor: async () => {}, nth: () => { throw new Error("Model rows are not effort choices"); } };
-  const menu = { filter() { return this; }, last() { return this; }, isVisible: async () => true, locator: () => modelRows };
+  const menu = { filter() { return this; }, last() { return this; }, isVisible: async () => true, locator: () => modelRows, getByRole: () => hidden };
   const page = {
     locator: (selector: string) => {
       if (selector === CHATGPT_COMPOSER_SELECTOR) return composer;

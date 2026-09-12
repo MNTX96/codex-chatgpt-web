@@ -258,6 +258,9 @@ function validateConfig(config, descriptorPath, platform = process.platform, lau
   if (config.imageFactoryProjectId !== undefined && typeof config.imageFactoryProjectId !== "string") {
     throw new Error("Runtime configuration has an invalid imageFactoryProjectId");
   }
+  if (config.imageFactoryProjectName !== undefined && typeof config.imageFactoryProjectName !== "string") {
+    throw new Error("Runtime configuration has an invalid imageFactoryProjectName");
+  }
   if (config.stallTimeoutSec !== undefined
     && (!Number.isFinite(config.stallTimeoutSec) || config.stallTimeoutSec <= 0)) {
     throw new Error("Runtime configuration has an invalid stallTimeoutSec");

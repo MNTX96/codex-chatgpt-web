@@ -44,8 +44,10 @@ connects ChatGPT back to the tools of that same Codex task until its next compac
 
 In automatic Full mode, image requests use the bridge's Image Factory tools. The parent text/vision
 turn remains in Temporary Chat; the image child runs in a regular ChatGPT conversation inside the
-Project-only-memory `Image Factory` project and saves verified artifacts in the workspace. This uses
-the signed-in ChatGPT account's image availability and limits and does not add an Images model.
+Project-only-memory `Image Factory` project and saves verified artifacts in the workspace. A single
+job can request 1–4 separate images, download each verified card, and edit a saved Image Factory
+artifact into 1–4 variants in that same retained image conversation. This uses the signed-in ChatGPT
+account's image availability and limits and does not add an Images model.
 
 > [!TIP]
 > I also built **[ChatGPT Persona Voice](https://github.com/miuuyy/ChatGPT-Persona-Voice)**, a local
@@ -60,7 +62,9 @@ the signed-in ChatGPT account's image availability and limits and does not add a
 - **The full Codex harness over MCP.** Full mode gives every effort exposed by the signed-in account,
   including Pro, the active task's filesystem, shell, images, approvals, and configured tools/apps.
 - **Continuous task sessions and native compaction.** Sequential messages reuse one task-bound
-  Temporary Chat. At the context boundary, the retained agent writes the checkpoint before Codex
+  Temporary Chat. In automatic Full mode, a new Codex instruction can also be queued into the same
+  retained ChatGPT conversation while the current response is still Thinking, once the composer is
+  safe to submit. At the context boundary, the retained agent writes the checkpoint before Codex
   starts a clean chat; if that chat was closed, canonical Codex history supplies the fallback.
 - **One cross-platform launcher.** The macOS, Windows, and Linux app owns sign-in, model setup, MCP
   guidance, health checks, safe diagnostics, and up to five visible task-bound browser tabs.

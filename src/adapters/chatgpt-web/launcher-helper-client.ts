@@ -6,11 +6,16 @@ import { notifyLauncherTurn, readLauncherBrowserHostDescriptor } from "../../lau
 import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError } from "./adapter-error";
 import type { CompiledChatGptWebPrompt } from "./prompt";
 import type { BrowserTurn, ResolvedBrowserConfig } from "./browser-worker";
-import type { OutputArtifact } from "./artifacts/types";
+import type { OutputArtifact, OutputImageCaptureResult } from "./artifacts/types";
 import {
   parseChatGptLunaCheckpoint,
   type ChatGptLunaCheckpoint,
 } from "./rolling-checkpoint";
+import {
+  chatGptFollowUpKey,
+  type ChatGptFollowUpEvent,
+  type ChatGptFollowUpRequest,
+} from "./follow-up";
 
 interface PendingTurn {
   turn: BrowserTurn;
@@ -22,6 +27,11 @@ interface PendingTurn {
   localFailure?: Error;
   progressForwarding?: AbortController;
   acknowledgedMultipartStage?: number;
+  releaseFollowUp?: () => void;
+  followUpQueuedAcks?: Map<string, {
+    resolve: () => void;
+    reject: (error: Error) => void;
+  }>;
 }
 
 type HelperMessage =
@@ -34,6 +44,17 @@ type HelperMessage =
   | { type: "event"; id: string; event: "prepared_selected"; reused: boolean }
   | { type: "event"; id: string; event: "luna_checkpoint"; checkpoint: ChatGptLunaCheckpoint; answerHash: string }
   | { type: "event"; id: string; event: "output_artifact"; artifact: OutputArtifact }
+  | { type: "event"; id: string; event: "output_artifact_capture"; capture: OutputImageCaptureResult }
+  | {
+      type: "event";
+      id: string;
+      event: "follow_up";
+      phase: ChatGptFollowUpEvent["type"];
+      requestId: string;
+      revision: number;
+      conversationUrl?: string;
+      message?: string;
+    }
   | { type: "result"; id: string; text: string }
   | {
       type: "error";
@@ -120,6 +141,59 @@ function parseHelperMessage(line: string): HelperMessage {
         throw new Error("Launcher browser helper output artifact is invalid");
       }
       return { type: "event", id: message.id, event, artifact: artifact as OutputArtifact };
+    }
+    if (event === "output_artifact_capture") {
+      const capture = message.capture as Partial<OutputImageCaptureResult> | undefined;
+      const validFailures = Array.isArray(capture?.failures) && capture.failures.every(failure => (
+        failure && typeof failure === "object"
+        && typeof failure.candidateKey === "string"
+        && typeof failure.code === "string"
+      ));
+      const validCandidateKeys = Array.isArray(capture?.candidateKeys)
+        && capture.candidateKeys.every(key => typeof key === "string");
+      const validExcess = Array.isArray(capture?.excessCandidateKeys)
+        && capture.excessCandidateKeys.every(key => typeof key === "string");
+      if (!capture || !Array.isArray(capture.artifacts) || !validFailures || !validCandidateKeys || !validExcess
+        || !Number.isSafeInteger(capture.detectedCandidates) || (capture.detectedCandidates ?? -1) < 0
+        || !Number.isSafeInteger(capture.ignoredCandidates) || (capture.ignoredCandidates ?? -1) < 0) {
+        throw new Error("Launcher browser helper output artifact capture summary is invalid");
+      }
+      return { type: "event", id: message.id, event, capture: capture as OutputImageCaptureResult };
+    }
+    if (event === "follow_up") {
+      const phase = message.phase;
+      const requestId = message.requestId;
+      const revision = message.revision;
+      const conversationUrl = message.conversationUrl;
+      const eventMessage = message.message;
+      if (!["queued", "send_activated", "submitted", "rejected"].includes(String(phase))
+        || typeof requestId !== "string" || !requestId
+        || !Number.isSafeInteger(revision) || (revision as number) <= 0
+        || (conversationUrl !== undefined && typeof conversationUrl !== "string")
+        || (eventMessage !== undefined && typeof eventMessage !== "string")
+        || (phase === "rejected" && typeof eventMessage !== "string")
+        || (phase !== "rejected" && eventMessage !== undefined)
+        || (phase !== "submitted" && conversationUrl !== undefined)) {
+        throw new Error("Launcher browser helper follow-up lifecycle event is invalid");
+      }
+      if (conversationUrl !== undefined) {
+        let parsedUrl: URL;
+        try { parsedUrl = new URL(conversationUrl as string); }
+        catch { throw new Error("Launcher browser helper follow-up conversation URL is invalid"); }
+        if (parsedUrl.origin !== "https://chatgpt.com" || parsedUrl.username || parsedUrl.password || parsedUrl.hash) {
+          throw new Error("Launcher browser helper follow-up conversation URL is invalid");
+        }
+      }
+      return {
+        type: "event",
+        id: message.id,
+        event,
+        phase: phase as ChatGptFollowUpEvent["type"],
+        requestId,
+        revision: revision as number,
+        ...(conversationUrl !== undefined ? { conversationUrl: conversationUrl as string } : {}),
+        ...(eventMessage !== undefined ? { message: eventMessage as string } : {}),
+      };
     }
     const text = message.text;
     const continuation = message.continuation;
@@ -263,8 +337,16 @@ export class LauncherBrowserHelperClient {
         "Launcher browser helper does not support Image Factory turns; update or restart the launcher",
       );
     }
+    if ((turn.imageEditSource || turn.outputArtifactLimit !== undefined || turn.outputArtifactExistingTotalBytes !== undefined
+      || turn.outputArtifactWriteManifest !== undefined || turn.onOutputArtifactCapture)
+      && !this.helperFeatures.has("image-factory-v2")) {
+      throw new Error("Launcher browser helper does not support Image Factory multi-image/edit transport; update or restart the launcher");
+    }
     if ((turn.executionTarget?.output === "image" || turn.requireOutputArtifact) && !this.helperFeatures.has("image-transfer-v1")) {
       throw new Error("Launcher browser helper does not support image-transfer-v1; load the updated runtime before generating images");
+    }
+    if (turn.followUp && !this.helperFeatures.has("follow-up-v1")) {
+      throw new Error("Launcher browser helper does not support same-conversation Codex follow-up; update or restart the launcher");
     }
     return await new Promise<string>((resolveResult, rejectResult) => {
         if (this.pending.has(turn.traceId)) {
@@ -307,7 +389,7 @@ export class LauncherBrowserHelperClient {
         pending.sent = true;
         const progressForwarding = new AbortController();
         pending.progressForwarding = progressForwarding;
-        void this.send({
+        const runFrame = this.send({
           type: "run",
           id: turn.traceId,
           config: {
@@ -326,18 +408,55 @@ export class LauncherBrowserHelperClient {
             ...(turn.prepareResume ? { resumeAvailable: true } : {}),
             ...(turn.retainConversation ? { retainConversation: true } : {}),
             ...(turn.requireRetainedConversation ? { requireRetainedConversation: true } : {}),
+            ...(turn.resumeConversationUrl ? { resumeConversationUrl: turn.resumeConversationUrl } : {}),
             ...(turn.conversationKey ? { conversationKey: turn.conversationKey } : {}),
             ...(turn.surface ? { surface: turn.surface } : {}),
             ...(turn.persistentProjectId ? { persistentProjectId: turn.persistentProjectId } : {}),
+            ...(turn.persistentProjectName ? { persistentProjectName: turn.persistentProjectName } : {}),
             ...(turn.executionTarget ? { executionTarget: turn.executionTarget } : {}),
             ...(turn.skipConnectorIdentity ? { skipConnectorIdentity: true } : {}),
             ...(turn.compaction ? { compaction: true } : {}),
             ...(turn.captureLunaCheckpoint ? { captureLunaCheckpoint: true } : {}),
             ...(turn.externalProgress ? { externalProgress: true } : {}),
             ...(turn.outputArtifactTarget ? { outputArtifactTarget: turn.outputArtifactTarget, outputArtifactExecutionKey: turn.outputArtifactExecutionKey } : {}),
+            ...(turn.outputArtifactLimit !== undefined ? { outputArtifactLimit: turn.outputArtifactLimit } : {}),
+            ...(turn.outputArtifactExistingTotalBytes !== undefined
+              ? { outputArtifactExistingTotalBytes: turn.outputArtifactExistingTotalBytes }
+              : {}),
+            ...(turn.outputArtifactWriteManifest !== undefined
+              ? { outputArtifactWriteManifest: turn.outputArtifactWriteManifest }
+              : {}),
             ...(turn.requireOutputArtifact ? { requireOutputArtifact: true } : {}),
+            ...(turn.imageEditSource ? { imageEditSource: turn.imageEditSource } : {}),
+            ...(turn.followUp ? { followUp: true } : {}),
           },
-        })
+        });
+        if (turn.followUp) {
+          pending.followUpQueuedAcks = new Map();
+          pending.releaseFollowUp = turn.followUp.bind(async (request: ChatGptFollowUpRequest) => {
+            await runFrame;
+            if (this.pending.get(turn.traceId) !== pending || pending.localFailure) {
+              throw pending.localFailure ?? new Error("Launcher browser turn ended before follow-up dispatch");
+            }
+            const key = chatGptFollowUpKey(request);
+            const existing = pending.followUpQueuedAcks?.get(key);
+            if (existing) throw new Error("Launcher browser helper follow-up acknowledgement is already pending");
+            let resolveQueued!: () => void;
+            let rejectQueued!: (error: Error) => void;
+            const queued = new Promise<void>((resolve, reject) => {
+              resolveQueued = resolve;
+              rejectQueued = reject;
+            });
+            pending.followUpQueuedAcks!.set(key, { resolve: resolveQueued, reject: rejectQueued });
+            try {
+              await this.send({ type: "follow_up", id: turn.traceId, request });
+              await queued;
+            } finally {
+              pending.followUpQueuedAcks?.delete(key);
+            }
+          });
+        }
+        void runFrame
           // Only mirror once the run frame is on the wire, so the helper never sees progress for a
           // turn it has not been told about and cannot accumulate state for unknown ids.
           .then(() => {
@@ -472,6 +591,34 @@ export class LauncherBrowserHelperClient {
           return;
         }
         pending.turn.onOutputArtifact?.(artifact);
+      }
+      else if (message.event === "output_artifact_capture") {
+        pending.turn.onOutputArtifactCapture?.(message.capture);
+      }
+      else if (message.event === "follow_up") {
+        const event: ChatGptFollowUpEvent = message.phase === "submitted"
+          ? {
+            type: "submitted",
+            requestId: message.requestId,
+            revision: message.revision,
+            ...(message.conversationUrl ? { conversationUrl: message.conversationUrl } : {}),
+          }
+          : message.phase === "rejected"
+            ? {
+              type: "rejected",
+              requestId: message.requestId,
+              revision: message.revision,
+              message: message.message!,
+            }
+            : {
+              type: message.phase,
+              requestId: message.requestId,
+              revision: message.revision,
+            };
+        const queuedAck = pending.followUpQueuedAcks?.get(chatGptFollowUpKey(event));
+        if (event.type === "queued") queuedAck?.resolve();
+        else if (event.type === "rejected") queuedAck?.reject(new Error(event.message));
+        pending.turn.followUp?.recordEvent(event);
       }
       else if (message.event === "tool_batch_observed") {
         const progress = pending.turn.externalProgress;
@@ -691,6 +838,13 @@ export class LauncherBrowserHelperClient {
     }
     pending.progressForwarding?.abort();
     pending.progressForwarding = undefined;
+    pending.releaseFollowUp?.();
+    pending.releaseFollowUp = undefined;
+    for (const waiter of pending.followUpQueuedAcks?.values() ?? []) {
+      waiter.reject(new DOMException("Launcher browser turn ended before follow-up acknowledgement", "AbortError"));
+    }
+    pending.followUpQueuedAcks?.clear();
+    pending.followUpQueuedAcks = undefined;
     pending.prepared?.release();
     pending.prepared = undefined;
     this.pending.delete(id);

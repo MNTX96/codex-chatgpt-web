@@ -16,6 +16,7 @@ test.each([[true, false, true], [false, false, true], [true, true, true], [true,
   const sendBudgets: number[] = [];
   let stage = "";
   let released = false;
+  let selectedEffort: string | undefined;
   const page = { evaluate: async () => ({}), isClosed: () => false };
   const worker = Object.assign(Object.create(ChatGptBrowserWorker.prototype), {
     config: { appName: "Codex Native2", browserDiagnosticsPath: diagnostics, ...(owned ? { browserHostDescriptorPath: "owned-descriptor" } : {}) },
@@ -26,6 +27,7 @@ test.each([[true, false, true], [false, false, true], [true, true, true], [true,
     },
     prepareTemporaryChatSurface: async () => {},
     selectModelAndEffort: async (_page: unknown, model: string, effort: string) => {
+      selectedEffort = effort;
       actions.push(`effort:${effort}`);
       return resolveChatGptWebModelMode(model, effort, capabilities);
     },
@@ -40,6 +42,9 @@ test.each([[true, false, true], [false, false, true], [true, true, true], [true,
     },
     attachFiles: async () => { actions.push("files"); },
     sendAttachedPrompt: async (...args: unknown[]) => {
+      // Reproduce the live UI resetting its selection after each response.
+      expect(selectedEffort).toBe("high");
+      selectedEffort = undefined;
       // Context ingestion cannot mistake tool activity for acknowledgement of a part.
       expect(args[4]).toBe(stage === "send" ? progress : undefined);
       if (stage !== "send") expect(args[5]).toBeUndefined();
@@ -75,8 +80,9 @@ test.each([[true, false, true], [false, false, true], [true, true, true], [true,
     );
     expect(actions).toEqual([
       ...(multipart ? [
-        "effort:low",
+        "effort:high",
         "attach:plain", "send", "observe", "ack",
+        "effort:high",
         "attach:plain", "send", "observe", "ack",
       ] : []),
       "effort:high",

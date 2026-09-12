@@ -85,6 +85,7 @@ export interface AppConfig {
   proAvailable: boolean;
   experimentalBiggerContext: boolean;
   imageFactoryProjectId?: string;
+  imageFactoryProjectName?: string;
   /** Explicitly install the additional Pro-sized model row while Zero Risk is active. */
   zeroRiskProEnabled: boolean;
   /** Optional adapter-silence budget for the Responses watchdog. */
@@ -494,6 +495,9 @@ function parseConfig(value: unknown, path: string): AppConfig {
   if (parsed.imageFactoryProjectId !== undefined && typeof parsed.imageFactoryProjectId !== "string") {
     throw new Error(`Invalid imageFactoryProjectId in ${path}`);
   }
+  if (parsed.imageFactoryProjectName !== undefined && typeof parsed.imageFactoryProjectName !== "string") {
+    throw new Error(`Invalid imageFactoryProjectName in ${path}`);
+  }
   if (parsed.zeroRiskProEnabled !== undefined && typeof parsed.zeroRiskProEnabled !== "boolean") {
     throw new Error(`Invalid zeroRiskProEnabled in ${path}`);
   }
@@ -525,6 +529,7 @@ function parseConfig(value: unknown, path: string): AppConfig {
     proAvailable,
     experimentalBiggerContext,
     imageFactoryProjectId,
+    imageFactoryProjectName: parsed.imageFactoryProjectName?.trim() || undefined,
     zeroRiskProEnabled,
   } as AppConfig;
 }
@@ -580,6 +585,7 @@ export function providerConfig(config: AppConfig): CodexProviderConfig {
       proAvailable: manual ? false : config.proAvailable,
       experimentalBiggerContext: manual ? false : config.experimentalBiggerContext,
       imageFactoryProjectId: config.imageFactoryProjectId,
+      imageFactoryProjectName: config.imageFactoryProjectName,
       ...(config.stallTimeoutSec !== undefined ? { stallTimeoutSec: config.stallTimeoutSec } : {}),
       autoApproveToolCalls: manual ? false : config.autoApproveToolCalls,
     },

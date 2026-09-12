@@ -2,6 +2,8 @@ import { expect, test } from "bun:test";
 import {
   CHATGPT_COMPACTION_PROMPT_JSON_BYTE_BUDGET,
   CHATGPT_BIGGER_CONTEXT_PARTS,
+  CHATGPT_MULTIPART_CONTEXT_UNAVAILABLE,
+  assertChatGptMultipartContextAvailable,
   chatGptPromptJsonBytes,
   chatGptReadOnlyContextWarning,
   compileChatGptWebPrompt,
@@ -11,6 +13,7 @@ import {
 import { CHATGPT_WEB_LUNA_MODEL_ID, CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
 import { biggerContextPartCount } from "../src/adapters/chatgpt-web/usage";
 import type { CodexParsedRequest } from "../src/types";
+import { SUMMARY_PREFIX } from "../src/responses/compaction";
 
 function request(reasoning: "low" | "medium" | "high" | "xhigh" | "max"): CodexParsedRequest {
   return {
@@ -26,6 +29,18 @@ function request(reasoning: "low" | "medium" | "high" | "xhigh" | "max"): CodexP
     options: { reasoning },
   };
 }
+
+test("multipart reports missing context instead of claiming a successful partial checkpoint", () => {
+  const compiled=compileChatGptWebPrompt(request("high"),{localToolsEnabled:false,solAvailable:true,proAvailable:true},undefined,{experimentalMultipartParts:3});
+  const commit=formatChatGptWebMultipartCommit(compiled.multipart!,`ctx_${"a".repeat(32)}`);
+  expect(commit).toContain(CHATGPT_MULTIPART_CONTEXT_UNAVAILABLE);
+  expect(commit).not.toContain("The task context is complete.");
+  for(const text of [CHATGPT_MULTIPART_CONTEXT_UNAVAILABLE,CHATGPT_MULTIPART_CONTEXT_UNAVAILABLE.replaceAll("_","\\_")]) {
+    let failure:unknown;try{assertChatGptMultipartContextAvailable(text);}catch(error){failure=error;}
+    expect(failure).toMatchObject({code:"multipart_context_unavailable",retryable:false,status:409});
+  }
+  expect(()=>assertChatGptMultipartContextAvailable("A normal complete checkpoint")).not.toThrow();
+});
 
 test("Full-mode Pro prompts pass one stable turn token directly to native actions", () => {
   const token = "turn_12345678901234567890123456789012";
@@ -252,6 +267,41 @@ test("Web compaction trims only the oldest history until the browser request fit
   expect(untrimmed.text).toContain("oldest-static");
   expect(untrimmed.text).toContain("newer-static");
   expect(untrimmed.trimmedCompactionMessages).toBeUndefined();
+});
+
+for (const asParts of [false, true]) {
+  test(`fallback compaction preserves the newest cumulative checkpoint (${asParts ? "parts" : "string"})`, () => {
+    const compact = request("high");
+    compact._compactionRequest = true;
+    compact.context.systemPrompt = [];
+    const summary = `${SUMMARY_PREFIX}\n\nEarlier verified progress and original scope: ${"s".repeat(20_000)}`;
+    compact.context.messages = [
+      { role: "user", content: asParts ? [{ type: "text", text: summary }] : summary, timestamp: 1 },
+      { role: "toolResult", toolCallId: "old", toolName: "read", isError: false, content: `old-bulky-output-${"x".repeat(100_000)}`, timestamp: 2 },
+      { role: "assistant", content: [{ type: "text", text: "recent-verified-progress" }], timestamp: 3 },
+      { role: "user", content: "checkpoint-now", timestamp: 4 },
+    ];
+    const compiled = compileChatGptWebPrompt(compact, { localToolsEnabled: false, solAvailable: true, proAvailable: true });
+    expect(compiled.text).toContain("Earlier verified progress and original scope:");
+    expect(compiled.text).toContain("recent-verified-progress");
+    expect(compiled.text).not.toContain("old-bulky-output-");
+    expect(compiled.trimmedCompactionMessages).toBe(1);
+    expect(compiled.text).toContain("1 older history item(s) omitted");
+    expect(compiled.text).not.toContain("The task context is complete.");
+    expect(chatGptPromptJsonBytes(compiled.text)).toBeLessThanOrEqual(CHATGPT_COMPACTION_PROMPT_JSON_BYTE_BUDGET);
+  });
+}
+
+test("fallback compaction refuses to discard an oversized cumulative checkpoint", () => {
+  const compact = request("high");
+  compact._compactionRequest = true;
+  compact.context.systemPrompt = [];
+  compact.context.messages = [
+    { role: "user", content: `${SUMMARY_PREFIX}\n\n${"s".repeat(120_000)}`, timestamp: 1 },
+    { role: "user", content: "checkpoint-now", timestamp: 2 },
+  ];
+  expect(() => compileChatGptWebPrompt(compact, { localToolsEnabled: false, solAvailable: true, proAvailable: true }))
+    .toThrow("cumulative checkpoint and final compaction instruction");
 });
 
 test("Bigger Context compaction preserves history above the retired inline byte budget", () => {

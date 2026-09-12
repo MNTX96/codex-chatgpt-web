@@ -21,11 +21,11 @@ test("browser control server exposes live launcher-local Image Factory configura
     return response.json();
   };
   try {
-    assert.deepEqual(await read(), { ok: true, projectId: null });
-    preferences = { imageFactoryProjectId: "  custom-project-id  " };
-    assert.deepEqual(await read(), { ok: true, projectId: "custom-project-id" });
+    assert.deepEqual(await read(), { ok: true, projectId: null, projectName: null });
+    preferences = { imageFactoryProjectId: "  custom-project-id  ", imageFactoryProjectName: "  Art studio  " };
+    assert.deepEqual(await read(), { ok: true, projectId: "custom-project-id", projectName: "Art studio" });
     preferences = { imageFactoryProjectId: null };
-    assert.deepEqual(await read(), { ok: true, projectId: null });
+    assert.deepEqual(await read(), { ok: true, projectId: null, projectName: null });
   } finally {
     await server.close();
   }
@@ -444,6 +444,53 @@ test("browser control server reports a missing retained conversation as a typed 
   }
 });
 
+test("browser control server forwards validated Image Factory recovery metadata", async () => {
+  const projectId = "g-p-recovery123";
+  const conversationUrl = `https://chatgpt.com/g/${projectId}-image-factory/c/6aa36a93-7164-83ec-8342-0441376d4255`;
+  let beginArgs;
+  const host = {
+    browserInteractionMode: () => "automatic",
+    beginTurn: (...args) => {
+      beginArgs = args;
+      return { surfaceId: "surface", tabId: "tab", reused: true, connectorBound: false };
+    },
+  };
+  const server = await new BrowserControlServer({
+    logger: { info() {}, warn() {} },
+    getBrowserHost: () => host,
+    getPreferences: () => ({ showBrowserDuringTurns: false, imageFactoryProjectId: projectId }),
+  }).start();
+  const descriptor = server.descriptor();
+  try {
+    const response = await fetch(`${descriptor.endpoint}/v1/turn/start`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${descriptor.token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        phase: "start",
+        traceId: "recovery123456",
+        helperPid: process.pid,
+        conversationKey: "c".repeat(64),
+        requireRetainedConversation: true,
+        resumeConversationUrl: conversationUrl,
+        persistentProjectId: projectId,
+      }),
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(beginArgs, [
+      "recovery123456",
+      false,
+      process.pid,
+      "c".repeat(64),
+      undefined,
+      true,
+      conversationUrl,
+      projectId,
+    ]);
+  } finally {
+    await server.close();
+  }
+});
+
 test("browser control server releases only ready tabs for an authenticated conversation key", async () => {
   const removed = [];
   const releaseEvents = [];
@@ -509,7 +556,7 @@ test("browser control server rejects malformed retained-conversation contracts",
   const server = await new BrowserControlServer({
     logger: { info() {}, warn() {} },
     getBrowserHost: () => ({ beginTurn: () => assert.fail("invalid request reached browser host") }),
-    getPreferences: () => ({}),
+    getPreferences: () => ({ imageFactoryProjectId: "g-p-target" }),
   }).start();
   const descriptor = server.descriptor();
   const post = (body) => fetch(`${descriptor.endpoint}/v1/turn/start`, {
@@ -524,6 +571,25 @@ test("browser control server rejects malformed retained-conversation contracts",
     assert.equal((await post({ conversationKey: "ABC" })).status, 400);
     assert.equal((await post({ requireRetainedConversation: true })).status, 400);
     assert.equal((await post({ connectorIdentity: "Codex Native2" })).status, 400);
+    assert.equal((await post({
+      conversationKey: "a".repeat(64),
+      requireRetainedConversation: true,
+      resumeConversationUrl: "https://example.com/g/g-p-target/c/12345678",
+      persistentProjectId: "g-p-target",
+    })).status, 400);
+    assert.equal((await post({
+      conversationKey: "a".repeat(64),
+      requireRetainedConversation: true,
+      resumeConversationUrl: "https://chatgpt.com/g/g-p-other/c/12345678",
+      persistentProjectId: "g-p-other",
+    })).status, 400);
+    assert.equal((await post({
+      conversationKey: "a".repeat(64),
+      connectorIdentity: "Codex Native2",
+      requireRetainedConversation: true,
+      resumeConversationUrl: "https://chatgpt.com/g/g-p-target/c/12345678",
+      persistentProjectId: "g-p-target",
+    })).status, 400);
   } finally {
     await server.close();
   }

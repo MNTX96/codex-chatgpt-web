@@ -36,7 +36,7 @@ contextBridge.exposeInMainWorld("codexWebLauncher", {
   cancelTurns: () => ipcRenderer.invoke("launcher:cancel-turns"),
   uninstallIntegration: () => ipcRenderer.invoke("launcher:uninstall-integration"),
   setupCore: () => ipcRenderer.invoke("launcher:setup-core"),
-  setImageFactoryProjectId: (projectId) => ipcRenderer.invoke("launcher:image-factory-project", projectId),
+  setImageFactoryProjectId: (projectId, projectName) => ipcRenderer.invoke("launcher:image-factory-project", projectId, projectName),
   setupMcp: (input) => ipcRenderer.invoke("launcher:setup-mcp", input),
   setMcpStep: (step) => ipcRenderer.invoke("launcher:set-mcp-step", step),
   setAutostart: (enabled) => ipcRenderer.invoke("launcher:autostart", enabled),

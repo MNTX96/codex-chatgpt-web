@@ -26,6 +26,7 @@ test("launcher state persists onboarding, language, and autostart atomically", (
       experimentalBiggerContext: false,
       zeroRiskProEnabled: false,
       imageFactoryProjectId: null,
+      imageFactoryProjectName: null,
       browserSmokePassed: false,
       browserSmokeVersion: null,
       sidebarOpen: true,
@@ -51,6 +52,7 @@ test("launcher state persists onboarding, language, and autostart atomically", (
       experimentalBiggerContext: false,
       zeroRiskProEnabled: false,
       imageFactoryProjectId: null,
+      imageFactoryProjectName: null,
       browserSmokePassed: true,
       browserSmokeVersion: "0.2.0",
       sidebarOpen: true,
@@ -117,6 +119,7 @@ test("persisted sidebar corruption is repaired without changing the rest of laun
       experimentalBiggerContext: false,
       zeroRiskProEnabled: false,
       imageFactoryProjectId: null,
+      imageFactoryProjectName: null,
       browserSmokePassed: false,
       browserSmokeVersion: null,
       sidebarOpen: true,
@@ -127,6 +130,22 @@ test("persisted sidebar corruption is repaired without changing the rest of laun
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("Image Factory project name survives restart, trims, and clears independently of id", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "image-project-name-"));
+  const file = path.join(root, "state.json");
+  try {
+    const store = createStateStore(file);
+    store.update({ imageFactoryProjectId: "g-p-configured", imageFactoryProjectName: "  Art studio  " });
+    assert.equal(createStateStore(file).read().imageFactoryProjectName, "Art studio");
+    store.update({ imageFactoryProjectName: null });
+    const restored = createStateStore(file).read();
+    assert.equal(restored.imageFactoryProjectName, null);
+    assert.equal(restored.imageFactoryProjectId, "g-p-configured");
+    fs.writeFileSync(file, JSON.stringify({ version: 1, imageFactoryProjectName: 42 }));
+    assert.equal(createStateStore(file).read().imageFactoryProjectName, null);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
 test("Image Factory project id is launcher-local, trimmed, and clearable", () => {

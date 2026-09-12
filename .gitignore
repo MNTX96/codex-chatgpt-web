@@ -15,5 +15,6 @@ launcher/build/
 launcher/release/
 launcher/artifacts/
 .playwright-cli/
+.codex/chatgpt-web-artifacts/
 output/
 notes.md

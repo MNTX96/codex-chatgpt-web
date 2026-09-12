@@ -5,6 +5,103 @@ export interface PromptAttachmentFile { name: string; mimeType: string; buffer: 
 export interface AttachmentGuard { assertReady(signal?: AbortSignal): Promise<void> }
 type AttachmentState = "missing" | "uploading" | "accepted" | "rejected";
 
+const PROMPT_ATTACHMENT_TILE_SELECTOR = [
+  '[role="group"][aria-label][data-upload-state]',
+  '[role="group"][aria-label][data-status]',
+  '[role="group"][aria-label]:has(img)',
+].join(", ");
+
+function promptAttachmentTiles(form: Locator): Locator {
+  return form.locator(PROMPT_ATTACHMENT_TILE_SELECTOR).filter({ visible: true });
+}
+
+async function attachmentInventory(form: Locator, budget: ImageTransferDeadline): Promise<string[]> {
+  return budget.observe(promptAttachmentTiles(form).evaluateAll(elements => elements.map(element => (
+    element.getAttribute("aria-label")?.trim() ?? ""
+  ))));
+}
+
+function exactAttachmentInventory(actual: string[], files: PromptAttachmentFile[]): boolean {
+  if (actual.length !== files.length) return false;
+  const expected = files.map(file => file.name).sort();
+  return [...actual].sort().every((name, index) => name === expected[index]);
+}
+
+function emptyAttachmentGuard(form: Locator): AttachmentGuard {
+  return {
+    async assertReady(signal) {
+      const check = new ImageTransferDeadline(Date.now() + 10_000, signal);
+      try {
+        const inventory = await attachmentInventory(form, check);
+        if (inventory.length !== 0) {
+          throw new ImageTransferError("stale_attachments_present", "before_send");
+        }
+        check.remaining();
+      } finally { check.dispose(); }
+    },
+  };
+}
+
+/**
+ * Remove attachment chips that belong to an earlier turn before the current turn can Send.
+ * The cleanup is scoped to the active composer form and resolves the remove control structurally:
+ * it never depends on localized labels such as "Remove attachment".
+ */
+export async function clearPromptAttachments(options: {
+  form: Locator; abortSignal?: AbortSignal; log: ImageTransferLog;
+}): Promise<AttachmentGuard> {
+  const { form, log } = options;
+  const budget = new ImageTransferDeadline(Date.now() + 10_000, options.abortSignal);
+  let removed = 0;
+  try {
+    for (;;) {
+      const tiles = promptAttachmentTiles(form);
+      const before = await budget.observe(tiles.count());
+      if (before === 0) break;
+      if (removed === 0) log("stale_attachments_found", { attachmentCount: before });
+
+      const tile = tiles.first();
+      const controls = tile.locator('button, [role="button"]').filter({ visible: true });
+      const removableIndexes = await budget.observe(controls.evaluateAll(elements => elements
+        .map((element, index) => {
+          const html = element as HTMLElement;
+          const style = getComputedStyle(html);
+          const visible = style.display !== "none" && style.visibility !== "hidden" && html.getClientRects().length > 0;
+          const disabled = (html as HTMLButtonElement).disabled || html.getAttribute("aria-disabled") === "true";
+          const opensPopup = html.hasAttribute("aria-haspopup") || html.getAttribute("aria-expanded") !== null;
+          const ownsPreview = html.querySelector("img, video, canvas") !== null;
+          return visible && !disabled && !opensPopup && !ownsPreview ? index : -1;
+        })
+        .filter(index => index >= 0)));
+      if (removableIndexes.length !== 1) {
+        throw new ImageTransferError(
+          removableIndexes.length === 0
+            ? "attachment_cleanup_control_missing"
+            : "attachment_cleanup_control_ambiguous",
+          "cleanup",
+        );
+      }
+
+      await controls.nth(removableIndexes[0]!).click({
+        timeout: Math.min(5_000, budget.remaining()),
+        signal: budget.signal,
+      });
+      for (;;) {
+        const after = await budget.observe(promptAttachmentTiles(form).count());
+        if (after < before) break;
+        await budget.pause();
+      }
+      removed += 1;
+      log("stale_attachment_removed", { remainingAttachmentCount: before - 1 });
+    }
+    log("stale_attachments_cleared", { removedCount: removed });
+  } catch (error) {
+    log("stale_attachments_cleanup_failed", { error: redactImageTransferError(error) });
+    throw error;
+  } finally { budget.dispose(); }
+  return emptyAttachmentGuard(form);
+}
+
 async function inspectAttachments(page: Page, form: Locator, files: PromptAttachmentFile[], budget: ImageTransferDeadline) {
   const rejected = await budget.observe(page.locator('[role="alert"]').evaluateAll(alerts => alerts.some(alert => {
     const style = getComputedStyle(alert);
@@ -39,8 +136,10 @@ async function inspectAttachments(page: Page, form: Locator, files: PromptAttach
   const send = form.getByTestId("send-button");
   const sendEnabled = await budget.observe(send.count()) === 1
     && await budget.observe(send.isVisible()) && await budget.observe(send.isEnabled());
+  const inventory = await attachmentInventory(form, budget);
+  const exactInventory = exactAttachmentInventory(inventory, files);
   budget.remaining();
-  return { states, sendEnabled, rejected: rejected || states.includes("rejected") };
+  return { states, sendEnabled, exactInventory, rejected: rejected || states.includes("rejected") };
 }
 
 export async function attachPromptFiles(options: {
@@ -51,7 +150,11 @@ export async function attachPromptFiles(options: {
   log("attachments_started", { referenceCount: files.filter(file => file.mimeType.startsWith("image/")).length, attachmentCount: files.length });
   const report = (snapshot: Awaited<ReturnType<typeof inspectAttachments>>) => {
     snapshot.states.forEach((state, index) => log("attachment_state", { attachmentIndex: index, state }));
-    log("attachments_send_condition", { sendEnabled: snapshot.sendEnabled, rejected: snapshot.rejected });
+    log("attachments_send_condition", {
+      sendEnabled: snapshot.sendEnabled,
+      exactInventory: snapshot.exactInventory,
+      rejected: snapshot.rejected,
+    });
   };
   try {
     budget.remaining();
@@ -67,7 +170,8 @@ export async function attachPromptFiles(options: {
       const key = JSON.stringify(snapshot);
       if (key !== previous) { report(snapshot); previous = key; }
       if (snapshot.rejected) throw new ImageTransferError("attachment_upload_rejected", "upload");
-      stableReady = snapshot.sendEnabled && snapshot.states.every(state => state === "accepted") ? stableReady + 1 : 0;
+      stableReady = snapshot.sendEnabled && snapshot.exactInventory
+        && snapshot.states.every(state => state === "accepted") ? stableReady + 1 : 0;
       if (stableReady >= 2) break;
       await budget.pause();
     }
@@ -84,7 +188,7 @@ export async function attachPromptFiles(options: {
         const snapshot = await inspectAttachments(page, form, files, check);
         report(snapshot);
         if (snapshot.rejected) throw new ImageTransferError("attachment_upload_rejected", "before_send");
-        if (!snapshot.sendEnabled || snapshot.states.some(state => state !== "accepted")) {
+        if (!snapshot.sendEnabled || !snapshot.exactInventory || snapshot.states.some(state => state !== "accepted")) {
           throw new ImageTransferError("attachments_not_ready", "before_send");
         }
         check.remaining();

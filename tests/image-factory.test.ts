@@ -1,14 +1,22 @@
+import { ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-error";
 import { describe, expect, test, afterEach } from "bun:test";
 import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { join } from "node:path";
-import { IMAGE_TOOL_NAMES, imageGenerateSchema, imageJobSchema, imageToolInventory, assertWebImageToolRouting } from "../src/adapters/chatgpt-web/image-factory/contracts";
+import { IMAGE_TOOL_NAMES, imageEditSchema, imageGenerateSchema, imageJobSchema, imageToolInventory, assertWebImageToolRouting } from "../src/adapters/chatgpt-web/image-factory/contracts";
 import { IMAGE_FACTORY_INSTRUCTIONS, mergeImageFactoryInstructions } from "../src/adapters/chatgpt-web/image-factory/instructions";
+import { resolveImageFactoryModelPolicy } from "../src/adapters/chatgpt-web/image-factory/model-policy";
+import { IMAGE_FACTORY_MULTI_IMAGE_PROMPT_TEMPLATE, imageFactoryContinuationPrompt, imageFactoryInitialPrompt } from "../src/adapters/chatgpt-web/image-factory/prompt-template";
 import { ensureImageFactoryProject } from "../src/adapters/chatgpt-web/image-factory/project-manager";
-import { isImageFactoryProjectRow, openImageFactoryProject, readProjectRowLabel } from "../src/adapters/chatgpt-web/image-factory/project-navigation";
+import {
+  isImageFactoryProjectRow,
+  readProjectRowLabel,
+  verifiedImageFactoryConversationUrl,
+  waitForImageFactoryConversationUrl,
+} from "../src/adapters/chatgpt-web/image-factory/project-navigation";
 import { ImageFactoryService } from "../src/adapters/chatgpt-web/image-factory/service";
 import { ImageFactoryStore, imageKey } from "../src/adapters/chatgpt-web/image-factory/state";
-import { configuredImageFactoryProjectId, resolveImageFactoryProjectId } from "../src/adapters/chatgpt-web/index";
+import { configuredImageFactoryProjectId, imageFactoryResumePlan, resolveImageFactoryProjectConfig, resolveImageFactoryProjectId } from "../src/adapters/chatgpt-web/index";
 import { callTurnBroker, TurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
 import { LAUNCHER_BROWSER_HOST_KIND, LAUNCHER_BROWSER_IDLE_URL } from "../src/launcher-browser-host";
 import type { CodexProviderConfig } from "../src/types";
@@ -19,6 +27,32 @@ afterEach(() => {
 });
 
 describe("Image Factory contract", () => {
+  test("Image Factory uses Latest with at least Medium thinking", () => {
+    const plus = { localToolsEnabled: false, solAvailable: true, proAvailable: false };
+    expect(resolveImageFactoryModelPolicy(plus, undefined)).toEqual({
+      modelId: "gpt-5.6-sol",
+      reasoning: "medium",
+    });
+    expect(resolveImageFactoryModelPolicy(plus, "low")).toEqual({
+      modelId: "gpt-5.6-sol",
+      reasoning: "medium",
+    });
+    expect(resolveImageFactoryModelPolicy(plus, "high")).toEqual({
+      modelId: "gpt-5.6-sol",
+      reasoning: "high",
+    });
+  });
+
+  test("Image Factory preserves supported higher thinking and clamps Luna to Think", () => {
+    const pro = { localToolsEnabled: false, solAvailable: true, proAvailable: true };
+    expect(resolveImageFactoryModelPolicy(pro, "xhigh").reasoning).toBe("xhigh");
+    expect(resolveImageFactoryModelPolicy(pro, "max").reasoning).toBe("max");
+    expect(resolveImageFactoryModelPolicy(
+      { localToolsEnabled: false, solAvailable: false, proAvailable: false },
+      "low",
+    )).toEqual({ modelId: "gpt-5.6-luna", reasoning: "medium" });
+  });
+
   test("runtime project_id gate only requires a non-empty configured value", () => {
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web",
@@ -36,12 +70,13 @@ describe("Image Factory contract", () => {
 
   test("launcher Image Factory project_id is resolved live for every job", async () => {
     let currentProjectId: string | null = "first-project-id";
+    let currentProjectName: string | null = "  Design lab  ";
     const server = createServer(async (request, response) => {
       for await (const _chunk of request) {
         // Drain the authenticated local control request.
       }
       response.writeHead(200, { "content-type": "application/json" });
-      response.end(`${JSON.stringify({ ok: true, projectId: currentProjectId })}\n`);
+      response.end(`${JSON.stringify({ ok: true, projectId: currentProjectId, projectName: currentProjectName })}\n`);
     });
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
@@ -80,8 +115,11 @@ describe("Image Factory contract", () => {
         },
       };
       await expect(resolveImageFactoryProjectId(provider)).resolves.toBe("first-project-id");
+      await expect(resolveImageFactoryProjectConfig(provider)).resolves.toEqual({ projectId: "first-project-id", projectName: "Design lab" });
+      currentProjectName = "Studio renamed";
       currentProjectId = "second-project-id";
       await expect(resolveImageFactoryProjectId(provider)).resolves.toBe("second-project-id");
+      await expect(resolveImageFactoryProjectConfig(provider)).resolves.toEqual({ projectId: "second-project-id", projectName: "Studio renamed" });
       currentProjectId = null;
       await expect(resolveImageFactoryProjectId(provider)).rejects.toThrow(
         "Image Factory is not configured. Set project_id in Configuration → Image Factory.",
@@ -91,41 +129,53 @@ describe("Image Factory contract", () => {
     }
   });
 
-  test("configured Image Factory project opens from Projects and verifies the clicked row by project_id", async () => {
-    let currentUrl = "https://chatgpt.com/projects";
-    const navigations: Array<{ url: string; options: unknown }> = [];
-    const events: string[] = [];
-    const projects = [
-      { id: "g-p-other", name: "Other project" },
-      { id: "custom-project-id", name: "Image Factory" },
-    ];
-    const rows = {
-      count: async () => projects.length,
-      nth: (index: number) => ({
-        locator: () => ({
-          first: () => ({
-            getAttribute: async (name: string) => name === "aria-label"
-              ? `Open project options for ${projects[index].name}`
-              : null,
-          }),
-        }),
-        getByRole: () => ({ textContent: async () => projects[index].name }),
-        click: async () => {
-          currentUrl = `https://chatgpt.com/g/${projects[index].id}/project`;
-        },
-      }),
-      last: () => ({ scrollIntoViewIfNeeded: async () => {} }),
-    };
+  test("generate can recover from stale project-only conversation state after launcher restart", () => {
+    const projectId = "g-p-image-factory";
+    expect(imageFactoryResumePlan(
+      "generate",
+      true,
+      `https://chatgpt.com/g/${projectId}/project`,
+      projectId,
+      1,
+    )).toEqual({
+      prepareResume: true,
+      requireRetainedConversation: false,
+    });
+  });
+
+  test("edit and compensation fail closed when no recoverable retained conversation URL exists", () => {
+    const projectId = "g-p-image-factory";
+    const staleProjectUrl = `https://chatgpt.com/g/${projectId}/project`;
+    expect(imageFactoryResumePlan("edit", true, staleProjectUrl, projectId, 1)).toEqual({
+      prepareResume: true,
+      requireRetainedConversation: true,
+    });
+    expect(imageFactoryResumePlan("generate", true, staleProjectUrl, projectId, 2)).toEqual({
+      prepareResume: true,
+      requireRetainedConversation: true,
+    });
+  });
+
+  test("a verified Image Factory conversation URL is supplied for restart recovery", () => {
+    const projectId = "g-p-image-factory";
+    const conversationUrl = `https://chatgpt.com/g/${projectId}-image-factory/c/6aa36a93-7164-83ec-8342-0441376d4255`;
+    expect(imageFactoryResumePlan("generate", true, conversationUrl, projectId, 1)).toEqual({
+      prepareResume: true,
+      requireRetainedConversation: true,
+      resumeConversationUrl: conversationUrl,
+    });
+  });
+
+  test("Image Factory waits for the retained conversation route after first project submission", async () => {
+    const projectId = "custom-project-id";
+    const conversationUrl = `https://chatgpt.com/g/${projectId}-image-factory/c/6aa36a93-7164-83ec-8342-0441376d4255`;
+    let currentUrl = `https://chatgpt.com/g/${projectId}/project`;
+    let waits = 0;
     const page = {
       url: () => currentUrl,
-      goto: async (url: string, options: unknown) => {
-        navigations.push({ url, options });
-        currentUrl = url;
-      },
-      locator: () => rows,
-      getByRole: () => ({ waitFor: async () => {} }),
-      waitForTimeout: async () => {},
       waitForURL: async (matcher: string | RegExp | ((url: URL) => boolean)) => {
+        waits += 1;
+        currentUrl = conversationUrl;
         const matched = typeof matcher === "function"
           ? matcher(new URL(currentUrl))
           : matcher instanceof RegExp
@@ -133,21 +183,30 @@ describe("Image Factory contract", () => {
             : currentUrl === matcher;
         if (!matched) throw new Error(`URL did not match: ${currentUrl}`);
       },
-    } as unknown as Parameters<typeof openImageFactoryProject>[0];
+    } as unknown as Parameters<typeof waitForImageFactoryConversationUrl>[0];
 
-    await openImageFactoryProject(page, "  custom-project-id  ", event => events.push(event));
-    expect(navigations).toEqual([]);
-    expect(currentUrl).toBe("https://chatgpt.com/g/custom-project-id/project");
-    expect(events).toEqual([
-      "project_directory_ready",
-      "project_directory_candidate_opened",
-      "project_directory_match_opened",
-    ]);
+    await expect(waitForImageFactoryConversationUrl(page, projectId)).resolves.toBe(conversationUrl);
+    expect(waits).toBe(1);
+    await expect(waitForImageFactoryConversationUrl(page, projectId)).resolves.toBe(conversationUrl);
+    expect(waits).toBe(1);
+  });
 
-    await openImageFactoryProject(page, "custom-project-id", event => events.push(event));
-    expect(navigations).toHaveLength(0);
-    expect(events.at(-1)).toBe("project_document_reused");
-    await expect(openImageFactoryProject(page, "   ")).rejects.toThrow("Image Factory project_id is not configured");
+  test("a navigation 429 survives the job journal with no Send attempts", async () => {
+    const directory = mkdtempSync(join(process.env.TMPDIR ?? "/tmp", "image-factory-rate-limit-"));
+    temporaryDirectories.push(directory);
+    const service = new ImageFactoryService(new ImageFactoryStore(directory), "rate-test", async () => {
+      throw new ChatGptWebAdapterError("ChatGPT rate limit: too many requests. Try again in a few minutes.", {
+        status: 429, code: "rate_limit_exceeded", errorType: "rate_limit_error", retryable: true,
+      });
+    }, () => true);
+    const parent = { threadId: "thread", signal: new AbortController().signal, activity: () => () => {},
+      environment: { cwd: directory, roots: [directory], writableRoots: [directory], tools: [], sandboxPolicy: { type: "dangerFullAccess" as const } } };
+    const job = await service.call(parent, "chatgpt_image_generate", { request_id: "rate", prompt: "draw" });
+    const result = await service.call(parent, "chatgpt_image_wait", { job_id: job.jobId });
+    expect(result).toMatchObject({ status: "failed", attemptCount: 0, error: {
+      status: 429, code: "rate_limit_exceeded", errorType: "rate_limit_error", retryable: true,
+    } });
+    expect((await service.call(parent, "chatgpt_image_wait", { job_id: job.jobId })).error).toEqual(result.error);
   });
 
   test("adapter rounds share live image jobs within a namespace", async () => {
@@ -205,11 +264,73 @@ describe("Image Factory contract", () => {
 
   test("strict arguments cannot smuggle workspace or project authority", () => {
     expect(imageGenerateSchema.parse({ request_id: "one", prompt: " Draw " }).prompt).toBe("Draw");
+    expect(imageGenerateSchema.parse({ request_id: "one", prompt: "Draw" }).count).toBe(1);
+    expect(imageGenerateSchema.parse({ request_id: "four", prompt: "Draw", count: 4 }).count).toBe(4);
+    expect(imageEditSchema.parse({
+      request_id: "edit",
+      image_session_id: "session",
+      source_artifact_id: "artifact",
+      prompt: "Change shirt",
+    }).count).toBe(1);
+    for (const count of [0, 5, 1.5, Number.NaN]) {
+      expect(() => imageGenerateSchema.parse({ request_id: "one", prompt: "Draw", count })).toThrow();
+      expect(() => imageEditSchema.parse({
+        request_id: "edit",
+        image_session_id: "session",
+        source_artifact_id: "artifact",
+        prompt: "Change shirt",
+        count,
+      })).toThrow();
+    }
     for (const key of ["workspaceRoot", "projectId", "account", "permissions"]) {
       expect(() => imageGenerateSchema.parse({ request_id: "one", prompt: "Draw", [key]: "forged" })).toThrow();
     }
     expect(() => imageJobSchema.parse({ job_id: "../../other" })).toThrow();
     expect(imageToolInventory().map(tool => tool.name)).toEqual([...IMAGE_TOOL_NAMES]);
+  });
+  test("multi-image prompts use one explicit output slot per requested image", () => {
+    const prompt = imageFactoryInitialPrompt("generate", "A studio portrait of the same character.", 3);
+    expect(prompt).toContain("Create 3 separate images.");
+    expect(prompt.match(/^Image \d+:/gm)).toHaveLength(3);
+    expect(prompt.match(/A studio portrait of the same character\./g)).toHaveLength(3);
+    expect(prompt).toContain("Return them as 3 separate image outputs in one response.");
+    expect(prompt).toContain("One Image line must map to one standalone generated-image card/file.");
+    expect(prompt).toContain("Produce exactly 3 standalone generated-image cards/files");
+    expect(prompt).toContain("invoke it 3 times before finishing this response");
+    expect(prompt).toContain("Do NOT combine multiple requested images into a collage");
+
+    const alreadyCanonical = `Create 3 separate images.\nImage 1: front view.\nImage 2: side view.\nImage 3: back view.\nReturn them as 3 separate image outputs, NOT as a collage.`;
+    const reinforcedCanonical = imageFactoryInitialPrompt("generate", alreadyCanonical, 3);
+    expect(reinforcedCanonical).toStartWith(alreadyCanonical);
+    expect(reinforcedCanonical).toContain("Produce exactly 3 standalone generated-image cards/files");
+    expect(imageFactoryInitialPrompt("generate", "Draw one dog", 1)).toBe("Draw one dog");
+    expect(IMAGE_FACTORY_MULTI_IMAGE_PROMPT_TEMPLATE).toContain("Image {N}: {complete description for image N}");
+    expect(IMAGE_FACTORY_MULTI_IMAGE_PROMPT_TEMPLATE).toContain("Produce exactly {N} standalone generated-image cards/files");
+  });
+  test("multi-edit and compensation prompts stay separate and source-stable", () => {
+    const edit = imageFactoryInitialPrompt("edit", "Change the shirt to blue.", 2);
+    expect(edit.match(/^Image \d+:/gm)).toHaveLength(2);
+    expect(edit).toContain("original source image");
+    expect(edit).toContain("not from another generated variant");
+
+    const initial = imageFactoryInitialPrompt(
+      "generate",
+      `Create 3 separate images.\nImage 1: front view.\nImage 2: side view.\nImage 3: back view.\nShared constraints: same character and outfit.\nReturn them as 3 separate image outputs.`,
+      3,
+    );
+    const continuation = imageFactoryContinuationPrompt("generate", initial, 1, 2);
+    expect(continuation.match(/^Image \d+:/gm)).toHaveLength(2);
+    expect(continuation).toContain("2 additional separate images");
+    expect(continuation).toContain("2 separate image outputs");
+    expect(continuation).toContain("originally requested Image 2: side view.");
+    expect(continuation).toContain("originally requested Image 3: back view.");
+    expect(continuation).toContain("Shared constraints: same character and outfit.");
+    expect(continuation).not.toContain("front view.");
+
+    const editContinuation = imageFactoryContinuationPrompt("edit", edit, 1, 1);
+    expect(editContinuation).toContain("original source image");
+    expect(editContinuation).toContain("Shared edit:\nChange the shirt to blue.");
+    expect(() => imageFactoryInitialPrompt("generate", "Draw", 5)).toThrow("integer from 1 through 4");
   });
   test("routing is based on exact tool identity", () => {
     expect(() => assertWebImageToolRouting("image_gen__imagegen")).toThrow("chatgpt_image_generate");
@@ -256,8 +377,8 @@ describe("Image Factory contract", () => {
       ensureImageFactoryProject(store, ui),
     ]);
     expect(first.projectId).toBe(second.projectId);
-    expect(first.instructionsVersion).toBe(1);
-    expect(projects.get(first.projectId)?.instructions).toContain("[BEGIN CODEX-CHATGPT-WEB IMAGE FACTORY v1]");
+    expect(first.instructionsVersion).toBe(3);
+    expect(projects.get(first.projectId)?.instructions).toContain("[BEGIN CODEX-CHATGPT-WEB IMAGE FACTORY v3]");
   });
 
   test("incomplete project setup is retried in place instead of creating duplicates", async () => {
@@ -338,6 +459,165 @@ describe("Image Factory contract", () => {
     expect(releases).toBe(2);
     expect((await service.call(parent, "chatgpt_image_generate", { request_id: "request-1", prompt: "draw a dog", reference_image_paths: [reference] })).jobId).toBe(first.jobId);
     await expect(service.call(parent, "chatgpt_image_generate", { request_id: "request-1", prompt: "different payload" })).rejects.toThrow("idempotency_conflict");
+  });
+
+  test("unknown execution failures preserve a safe pre-Send diagnostic", async () => {
+    const directory = mkdtempSync(join(process.env.TMPDIR ?? "/tmp", "image-factory-pre-send-failure-"));
+    temporaryDirectories.push(directory);
+    const store = new ImageFactoryStore(join(directory, "state"));
+    const environment = {
+      cwd: directory,
+      roots: [directory],
+      writableRoots: [directory],
+      sandboxPolicy: { type: "workspaceWrite" as const, writableRoots: [directory], networkAccess: true },
+      tools: [],
+    };
+    const service = new ImageFactoryService(store, "namespace", async () => {
+      throw new Error("launcher helper exited before ready https://chatgpt.com/c/example?token=secret");
+    }, () => true);
+    const parent = {
+      threadId: "thread-pre-send-failure",
+      environment,
+      signal: new AbortController().signal,
+      activity: () => () => {},
+    };
+
+    const started = await service.call(parent, "chatgpt_image_generate", {
+      request_id: "request-pre-send-failure",
+      prompt: "draw",
+    });
+    const result = await service.call(parent, "chatgpt_image_wait", { job_id: started.jobId });
+    expect(result.status).toBe("failed");
+    expect(result.attemptCount).toBe(0);
+    expect(result.error).toEqual({
+      code: "image_generation_failed",
+      message: "Image Factory execution failed: Error: launcher helper exited before ready https://chatgpt.com/c/example",
+    });
+  });
+
+  test("image edit resolves one stored source artifact and preserves requested variant count", async () => {
+    const directory = mkdtempSync(join(process.env.TMPDIR ?? "/tmp", "image-factory-edit-"));
+    temporaryDirectories.push(directory);
+    const store = new ImageFactoryStore(join(directory, "state"));
+    const namespace = "namespace";
+    const threadId = "thread-edit";
+    const owner = imageKey(namespace, threadId);
+    const imageSessionId = "edit-session";
+    const sourceArtifactId = "img_source";
+    const source = {
+      assistantTurnId: "assistant-source",
+      candidateKey: "image-source",
+      cardId: "image-source",
+      fileIdentity: "file_source",
+      imageSessionId,
+      conversationUrl: "https://chatgpt.com/c/WEB:edit-session",
+      projectId: "project",
+    };
+    store.write("session", imageKey(owner, imageSessionId), {
+      id: imageSessionId,
+      owner,
+      hasConversation: true,
+      conversationUrl: source.conversationUrl,
+      artifacts: { [sourceArtifactId]: source },
+      updatedAt: Date.now(),
+    });
+    const environment = {
+      cwd: directory,
+      roots: [directory],
+      writableRoots: [directory],
+      sandboxPolicy: { type: "workspaceWrite" as const, writableRoots: [directory], networkAccess: true },
+      tools: [],
+    };
+    let executionSource: unknown;
+    let executionCount = 0;
+    const service = new ImageFactoryService(store, namespace, async options => {
+      executionSource = options.sourceArtifact;
+      executionCount = options.requestedCount;
+      const artifacts = [1, 2].map(index => ({
+        kind: "generated_image" as const,
+        id: `img_edit_${index}`,
+        relativePath: `.codex/chatgpt-web-artifacts/edit/image-${index}.png`,
+        absolutePath: join(directory, `image-${index}.png`),
+        mimeType: "image/png" as const,
+        byteLength: 8,
+        sha256: String(index).repeat(64),
+        source: {
+          assistantTurnId: `assistant-edit-${index}`,
+          candidateKey: `image-edit-${index}`,
+          cardId: `image-edit-${index}`,
+          imageSessionId,
+          conversationUrl: source.conversationUrl,
+        },
+      }));
+      return {
+        status: "completed" as const,
+        artifacts,
+        requestedCount: 2,
+        generatedCount: 2,
+        downloadedCount: 2,
+        attemptCount: 1,
+        sourceArtifactId,
+      };
+    }, () => true);
+    const parent = {
+      threadId,
+      environment,
+      signal: new AbortController().signal,
+      activity: () => () => {},
+    };
+
+    const started = await service.call(parent, "chatgpt_image_edit", {
+      request_id: "edit-request",
+      image_session_id: imageSessionId,
+      source_artifact_id: sourceArtifactId,
+      prompt: "Change the shirt to blue",
+      count: 2,
+    });
+    const result = await service.call(parent, "chatgpt_image_wait", { job_id: started.jobId });
+    expect(executionSource).toEqual(source);
+    expect(executionCount).toBe(2);
+    expect(result).toMatchObject({
+      status: "completed",
+      requestedCount: 2,
+      generatedCount: 2,
+      downloadedCount: 2,
+      attemptCount: 1,
+      sourceArtifactId,
+    });
+    expect(result.artifacts).toHaveLength(2);
+  });
+
+  test("image edit fails closed when stored provenance is missing", async () => {
+    const directory = mkdtempSync(join(process.env.TMPDIR ?? "/tmp", "image-factory-edit-missing-"));
+    temporaryDirectories.push(directory);
+    const store = new ImageFactoryStore(join(directory, "state"));
+    const namespace = "namespace";
+    const threadId = "thread-edit-missing";
+    const owner = imageKey(namespace, threadId);
+    const imageSessionId = "edit-session";
+    store.write("session", imageKey(owner, imageSessionId), {
+      id: imageSessionId,
+      owner,
+      hasConversation: true,
+      conversationUrl: "https://chatgpt.com/c/WEB:edit-session",
+      artifacts: {},
+      updatedAt: Date.now(),
+    });
+    const environment = { cwd: directory, roots: [directory], writableRoots: [directory],
+      sandboxPolicy: { type: "dangerFullAccess" as const }, tools: [] };
+    let executions = 0;
+    const service = new ImageFactoryService(store, namespace, async () => {
+      executions += 1;
+      return { status: "failed", artifacts: [] };
+    }, () => true);
+    const parent = { threadId, environment, signal: new AbortController().signal, activity: () => () => {} };
+    await expect(service.call(parent, "chatgpt_image_edit", {
+      request_id: "edit-request",
+      image_session_id: imageSessionId,
+      source_artifact_id: "missing",
+      prompt: "Change the shirt",
+    })).rejects.toThrow("source artifact has no usable Image Factory provenance");
+    expect(executions).toBe(0);
   });
 
   test("cancel stops a child job without deleting its journal", async () => {

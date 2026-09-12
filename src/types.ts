@@ -305,6 +305,7 @@ export interface CodexProviderConfig {
     experimentalBiggerContext?: boolean;
     /** ChatGPT project used by the retained Image Factory conversation. */
     imageFactoryProjectId?: string;
+    imageFactoryProjectName?: string;
     /** Persist ChatGPT-generated images inside the trusted Codex workspace. */
     generatedImageArtifacts?: {
       mode?: "off" | "workspace";

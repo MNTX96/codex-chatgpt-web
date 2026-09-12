@@ -3,7 +3,8 @@ import type { ProviderAdapter } from "../src/adapters/base";
 import { defaultConfig } from "../src/config";
 import { COMPACT_PROMPT, SUMMARY_PREFIX, decodeCompactionSummary, encodeCompactionSummary } from "../src/responses/compaction";
 import { compactRequest, responseRequest as respond } from "../src/server";
-import type { CodexProviderConfig } from "../src/types";
+import type { CodexParsedRequest, CodexProviderConfig } from "../src/types";
+import { ChatGptThreadEnvironmentStore } from "../src/adapters/chatgpt-web/thread-environment";
 import { extractChatGptTurnIdentity, extractChatGptTurnUserRevision } from "../src/adapters/chatgpt-web/environment";
 import { chatGptCompactionSourceExecutionKey, chatGptTurnExecutionKey } from "../src/adapters/chatgpt-web/turn-execution";
 
@@ -223,6 +224,44 @@ for (const format of ["v1", "v2"] as const) test(`${format} pre-turn compaction 
     expect((await send(changed)).status).toBe(400);
   }
   expect(starts).toBe(2);
+});
+
+for (const format of ["v1", "v2"] as const) test(`${format} post-compaction restores the same trusted environment without previous_response_id`, async () => {
+  const config = defaultConfig("full"); config.experimentalBiggerContext = true;
+  const workspace = process.cwd();
+  const threadId = `bc_environment_${format}`;
+  const oldTurn = `bc_source_${format}`;
+  const turnId = `bc_continuation_${format}`;
+  const store = new ChatGptThreadEnvironmentStore();
+  const source = {type:"message",role:"user",id:"original_instruction",content:[{type:"input_text",text:"Continue the original task"}],
+    internal_chat_message_metadata_passthrough:{turn_id:oldTurn}};
+  const first: CodexParsedRequest = {modelId:"gpt-5.6-sol",stream:false,options:{reasoning:"high"},context:{messages:[]},_rawBody:{
+    client_metadata:{"x-codex-turn-metadata":JSON.stringify({thread_id:threadId,turn_id:oldTurn,sandbox:"none",workspaces:{[workspace]:{}}})},
+    input:[{type:"message",role:"user",id:"initial_environment",content:[{type:"input_text",text:
+      `<environment_context><cwd>${workspace}</cwd><filesystem><workspace_roots><root>${workspace}</root></workspace_roots><permission_profile type="disabled"><file_system type="unrestricted" /></permission_profile></filesystem></environment_context>`}]},source],
+  }};
+  expect(store.resolve(first).cwd).toBe(workspace);
+  const original={model,stream:false,input:[source],client_metadata:{"x-codex-turn-metadata":JSON.stringify({thread_id:threadId,turn_id:turnId})}};
+  const compact = format === "v1"
+    ? await compactRequest(new Request("http://127.0.0.1/v1/responses/compact",{method:"POST",body:JSON.stringify(original)}),config,compactionAdapterFactory())
+    : await responseRequest(new Request("http://127.0.0.1/v1/responses",{method:"POST",body:JSON.stringify({...original,input:[source,{type:"compaction_trigger"}]})}),config,compactionAdapterFactory());
+  expect(compact.status).toBe(200);
+  const checkpoint=await compact.json() as {output:unknown[]};
+  const history=Array.from({length:90},(_,index)=>({type:"message",role:"assistant",content:[{type:"output_text",text:`Preserved progress ${index}`}]}));
+  const input=[...(format === "v1"?checkpoint.output:[source,...checkpoint.output]),...history];
+  let continued=false;
+  const resumed=await responseRequest(new Request("http://127.0.0.1/v1/responses",{method:"POST",body:JSON.stringify({...original,input})}),config,()=>({
+    name:"trusted-continuation-probe",async runTurn(parsed,_incoming,emit){
+      expect(parsed.previousResponseId).toBeUndefined();
+      expect(parsed.context.messages.length).toBeGreaterThanOrEqual(92);
+      expect(extractChatGptTurnUserRevision(parsed)).toEqual(source.content);
+      const environment=store.resolve(parsed);
+      expect(environment.cwd).toBe(workspace);
+      expect(environment.writableRoots).toEqual([workspace]);
+      continued=true;emit({type:"text_delta",text:"continued",phase:"final_answer"});emit({type:"done",stopReason:"stop",endTurn:true});
+    },
+  }));
+  expect(resumed.status).toBe(200);expect(continued).toBe(true);
 });
 
 test("v1 goal compaction authorizes the human instruction that native Codex retains", async () => {

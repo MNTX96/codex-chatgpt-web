@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { extensionForImageMime, imageDimensions } from "./image/image-sniffer";
-import type { OutputArtifactTarget, OutputImageArtifact, OutputImageMime } from "./types";
+import type { OutputArtifactTarget, OutputImageArtifact, OutputImageMime, OutputImageSource } from "./types";
 
 function inside(child: string, parent: string): boolean {
   const value = relative(resolve(parent), resolve(child));
@@ -34,6 +34,7 @@ export function persistOutputImage(options: {
   assistantTurnId: string;
   candidateKey: string;
   mimeType: OutputImageMime;
+  source?: Partial<OutputImageSource>;
 }): OutputImageArtifact {
   const sha256 = createHash("sha256").update(options.bytes).digest("hex");
   const filename = `image-${sha256}.${extensionForImageMime(options.mimeType)}`;
@@ -51,7 +52,12 @@ export function persistOutputImage(options: {
     kind: "generated_image", id: `img_${sha256}`, absolutePath,
     relativePath: relative(options.target.workspaceRoot, absolutePath).replaceAll("\\", "/"),
     mimeType: options.mimeType, byteLength: options.bytes.length, sha256,
-    ...dimensions, source: { assistantTurnId: options.assistantTurnId, candidateKey: options.candidateKey },
+    ...dimensions,
+    source: {
+      ...options.source,
+      assistantTurnId: options.assistantTurnId,
+      candidateKey: options.candidateKey,
+    },
   };
 }
 

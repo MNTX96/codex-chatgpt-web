@@ -23,6 +23,7 @@ import { ChatGptTextFeed, ChatGptTraceFeed, ChatGptTurnSessions, chatGptCompacti
 import { callTurnBroker, TurnBroker, type BrokerToolResult } from "../src/adapters/chatgpt-web/turn-broker";
 import { ChatGptExternalTurnProgress, ChatGptMirroredTurnProgress, chatGptExternalProgressIsLive, chatGptExternalToolCallsAreInFlight } from "../src/adapters/chatgpt-web/turn-progress";
 import { CHATGPT_WEB_MCP_INVOCATION_TIMEOUT_MS, chatGptMcpInvocationTimeout } from "../src/adapters/chatgpt-web/mcp-server";
+import { ChatGptFollowUpChannel } from "../src/adapters/chatgpt-web/follow-up";
 import { defaultBrokerEndpoint } from "../src/config";
 import { estimateChatGptWebUsage } from "../src/adapters/chatgpt-web/usage";
 import { decodeCompactionSummary, SUMMARY_PREFIX } from "../src/responses/compaction";
@@ -142,7 +143,8 @@ async function invokeAfterBrowserBoundary<T>(
   while (snapshot.lastToolBatchRevision <= previousBatchRevision) {
     snapshot = await progress.waitForChange(snapshot.revision, turn.abortSignal);
   }
-  await progress.acknowledgeToolBatch(snapshot.lastToolBatchRevision);
+  const toolBatchRevision = snapshot.lastToolBatchRevision;
+  await progress.acknowledgeToolBatch(toolBatchRevision);
   return await invocation;
 }
 
@@ -903,7 +905,7 @@ describe("ChatGPT outer-native harness v4", () => {
     sessions.clear();
   });
 
-  test("steering retires a browser waiting for an old tool result and rejects late older requests", async () => {
+  test("steering reuses the retained browser and rejects late older requests", async () => {
     const sessions = new ChatGptTurnSessions();
     const original = rawWireRequest(environmentXml);
     const originalInput = (original._rawBody as { input: Array<Record<string, unknown>> }).input;
@@ -919,30 +921,40 @@ describe("ChatGPT outer-native harness v4", () => {
     let rejectOld!: (reason: Error) => void;
     let cleanup!: () => void;
     const cancellations: Error[] = [];
-    sessions.getOrCreate(oldKey, () => ({
+    const followUp = new ChatGptFollowUpChannel();
+    const originalSession = sessions.getOrCreate(oldKey, () => ({
       mode: "read-only",
       browser: new Promise<string>((_, reject) => { rejectOld = reject; }),
       physicalSettlement: new Promise<void>(resolve => { cleanup = resolve; }),
       trace: new ChatGptTraceFeed(), text: new ChatGptTextFeed(),
-      cancel: reason => { if (reason) { cancellations.push(reason); rejectOld(reason); } },
+      conversationKey: "conversation",
+      followUp,
+      cancel: reason => {
+        if (reason) cancellations.push(reason);
+        const failure = reason ?? new Error("cancelled");
+        followUp.close(failure);
+        rejectOld(failure);
+        cleanup();
+      },
     }), "old-trace", "thread", "native-turn", "native-thread", chatGptInstructionLineage(original).current);
     let starts = 0;
-    let finishNew!: (text: string) => void;
     const replacement = () => {
       starts += 1;
       return { mode: "read-only" as const,
-        browser: new Promise<string>(resolve => { finishNew = resolve; }),
+        browser: new Promise<string>(() => {}),
         physicalSettlement: new Promise<void>(() => {}),
         trace: new ChatGptTraceFeed(), text: new ChatGptTextFeed(), cancel: () => {} };
     };
     const next = sessions.getOrCreateAfterOwnerRetirement(newKey, "thread", replacement,
       "new-trace", undefined, "native-turn", "native-thread", chatGptInstructionLineage(steered));
-    expect(cancellations).toHaveLength(1);
+    expect(cancellations).toHaveLength(0);
     expect(starts).toBe(0);
-    expect(sessions.cancelledError("old-trace")).toMatchObject({ code: "client_cancelled" });
-    cleanup();
     const current = await next;
-    expect(starts).toBe(1);
+    expect(current).toBe(originalSession);
+    expect(starts).toBe(0);
+    expect(sessions.find(newKey)).toBe(originalSession);
+    expect(sessions.find(oldKey)).toBeUndefined();
+    current.advanceInstruction(chatGptInstructionLineage(steered).current);
     expect(await sessions.getOrCreateAfterOwnerRetirement(newKey, "thread", replacement)).toBe(current);
     await expect(sessions.getOrCreateAfterOwnerRetirement(oldKey, "thread", replacement))
       .rejects.toMatchObject({ code: "client_cancelled" });
@@ -950,9 +962,8 @@ describe("ChatGPT outer-native harness v4", () => {
     await expect(sessions.getOrCreateAfterOwnerRetirement("late-unknown-round", "thread", replacement,
       "late-trace", undefined, "native-turn", "native-thread", chatGptInstructionLineage(original)))
       .rejects.toMatchObject({ code: "client_cancelled" });
-    expect(starts).toBe(1);
-    finishNew("done");
-    await current.browserOutcome;
+    expect(starts).toBe(0);
+    expect(cancellations).toHaveLength(0);
     sessions.clear();
   });
 

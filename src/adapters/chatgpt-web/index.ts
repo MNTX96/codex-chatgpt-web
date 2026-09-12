@@ -10,7 +10,7 @@ import {
   LauncherManualTurnFailedError,
   LauncherManualTurnTimedOutError,
   markLauncherManualTurnStarted,
-  readLauncherImageFactoryProjectId,
+  readLauncherImageFactoryConfig,
   releaseLauncherRetainedConversation,
   startLauncherManualTurn,
   waitForLauncherManualSent,
@@ -23,8 +23,17 @@ import { namespacedToolName, type AdapterEvent, type CodexContentPart, type Code
 import type { ProviderAdapter } from "../base";
 import { parseDataUrl } from "../image";
 import { ChatGptWebAdapterError } from "./adapter-error";
-import { ChatGptBrowserWorker, chatGptBrowserCapacityAvailable } from "./browser-worker";
-import { extractChatGptTurnEnvironment, extractChatGptTurnIdentity, priorChatGptAbortedTurnIds } from "./environment";
+import { ChatGptBrowserWorker, chatGptBrowserCapacityAvailable, type BrowserTurn } from "./browser-worker";
+import {
+  chatGptTurnUserRevisionHistory,
+  contentText,
+  extractChatGptTurnEnvironment,
+  extractChatGptTurnIdentity,
+  hasCurrentChatGptEnvironmentContext,
+  hasRawChatGptEnvironmentContext,
+  isChatGptCompactionContinuation,
+  priorChatGptAbortedTurnIds,
+} from "./environment";
 import { CHATGPT_WEB_LUNA_MODEL_ID, CHATGPT_WEB_MODEL_ID, resolveChatGptWebModelMode, type ChatGptWebCapabilities } from "./model";
 import { chatGptReadOnlyContextWarning, compileChatGptWebPrompt } from "./prompt";
 import { createChatGptStructuredOutputValidator } from "./output-validation";
@@ -39,7 +48,8 @@ import {
 } from "./rolling-checkpoint";
 import { ChatGptExternalTurnProgress } from "./turn-progress";
 import { resolveOutputArtifactTarget } from "./artifacts/artifact-target";
-import type { OutputArtifact } from "./artifacts/types";
+import { writeArtifactManifest } from "./artifacts/artifact-manifest";
+import type { OutputArtifact, OutputArtifactTarget, OutputImageCaptureResult } from "./artifacts/types";
 import {
   canonicalizeCompactionHandoff,
   existingStructuredCompactionRun,
@@ -56,17 +66,51 @@ import {
 import { ImageFactoryService } from "./image-factory/service";
 import { ImageFactoryStore, imageKey } from "./image-factory/state";
 import { IMAGE_FACTORY_INSTRUCTIONS_VERSION } from "./image-factory/instructions";
+import { IMAGE_FACTORY_TIMEOUTS, type ImageFactoryOperation, type ImageJobCandidateError, type ImageJobSubmission } from "./image-factory/contracts";
+import { resolveImageFactoryModelPolicy } from "./image-factory/model-policy";
+import { imageFactoryContinuationPrompt, imageFactoryInitialPrompt } from "./image-factory/prompt-template";
+import { verifiedImageFactoryConversationUrl } from "./image-factory/project-navigation";
+import { ChatGptFollowUpChannel, type ChatGptFollowUpRequest } from "./follow-up";
 
 function verifiedImageConversationUrl(value: string | undefined, projectId: string): string | undefined {
   if (!value) return undefined;
   try {
     const url = new URL(value);
     if (url.origin !== "https://chatgpt.com" || url.username || url.password || url.hash) return undefined;
-    if (!url.pathname.startsWith(`/g/${projectId}`) || !/\/c\/[A-Za-z0-9_-]{8,128}(?:\/|$)/.test(url.pathname)) return undefined;
+    const projectConversation = url.pathname.startsWith(`/g/${projectId}`)
+      && /\/c\/[A-Za-z0-9_-]{8,128}(?:\/|$)/.test(url.pathname);
+    const webConversation = /^\/c\/WEB:[A-Za-z0-9_-]{8,128}(?:\/|$)/.test(url.pathname);
+    if (!projectConversation && !webConversation) return undefined;
     return url.href;
   } catch {
     return undefined;
   }
+}
+
+export function imageFactoryResumePlan(
+  operation: ImageFactoryOperation,
+  hasConversation: boolean,
+  conversationUrl: string | undefined,
+  projectId: string,
+  attempt: number,
+): {
+  prepareResume: boolean;
+  requireRetainedConversation: boolean;
+  resumeConversationUrl?: string;
+} {
+  const prepareResume = hasConversation || attempt > 1;
+  const resumeConversationUrl = prepareResume
+    ? verifiedImageFactoryConversationUrl(conversationUrl, projectId)
+    : undefined;
+  return {
+    prepareResume,
+    // A first generate may safely start a fresh project conversation after a launcher restart
+    // when old state only remembers the project page. beginTurn() will still reuse an in-memory
+    // retained tab when one exists. Edits and compensation attempts must fail closed instead of
+    // silently changing conversations because they depend on exact prior-card provenance.
+    requireRetainedConversation: attempt > 1 || operation === "edit" || resumeConversationUrl !== undefined,
+    ...(resumeConversationUrl ? { resumeConversationUrl } : {}),
+  };
 }
 
 function brokerSocketPath(provider: CodexProviderConfig): string {
@@ -263,6 +307,50 @@ function brokerResult(message: CodexToolResultMessage): BrokerToolResult {
   };
 }
 
+function followUpRevisionText(content: unknown): string {
+  if (typeof content === "string") return contentText(content).trim();
+  if (!Array.isArray(content)) throw new Error("ChatGPT follow-up instruction content is invalid");
+  const normalized: CodexContentPart[] = [];
+  for (const part of content) {
+    if (!part || typeof part !== "object" || Array.isArray(part)) {
+      throw new Error("ChatGPT follow-up instruction content is invalid");
+    }
+    const value = part as Record<string, unknown>;
+    if (value.type === "input_text" && typeof value.text === "string") {
+      normalized.push({ type: "text", text: value.text });
+      continue;
+    }
+    throw new ChatGptWebAdapterError("Codex follow-up steering currently supports text instructions only", {
+      status: 409,
+      errorType: "invalid_request_error",
+      code: "follow_up_content_unsupported",
+      retryable: false,
+    });
+  }
+  const text = contentText(normalized).trim();
+  if (!text) throw new Error("ChatGPT follow-up instruction is empty");
+  return text;
+}
+
+function followUpRequest(
+  parsed: CodexParsedRequest,
+  instructionId: string,
+): ChatGptFollowUpRequest {
+  const revisions = chatGptTurnUserRevisionHistory(parsed);
+  const latest = revisions.at(-1);
+  if (!latest) throw new Error("ChatGPT follow-up requires a canonical user instruction");
+  const nativeIdentity = extractChatGptTurnIdentity(parsed);
+  const requestId = latest.itemId
+    ?? nativeIdentity.turnId
+    ?? createHash("sha256").update(instructionId).digest("hex");
+  return {
+    requestId,
+    revision: revisions.length,
+    instructionId,
+    text: followUpRevisionText(latest.content),
+  };
+}
+
 function emitToolBatch(requests: BrokerToolRequest[], usage: CodexUsage, emit: (event: AdapterEvent) => void): void {
   for (const request of requests) {
     emit({ type: "tool_call_start", id: request.callId, name: request.wireName });
@@ -372,10 +460,18 @@ function requireImageFactoryProjectId(projectId: string | null | undefined): str
 }
 
 export async function resolveImageFactoryProjectId(provider: CodexProviderConfig): Promise<string> {
-  if (provider.chatgptWeb?.browserHost !== "launcher") return configuredImageFactoryProjectId(provider);
+  return (await resolveImageFactoryProjectConfig(provider)).projectId;
+}
+
+export async function resolveImageFactoryProjectConfig(provider: CodexProviderConfig): Promise<{ projectId: string; projectName?: string }> {
+  if (provider.chatgptWeb?.browserHost !== "launcher") return {
+    projectId: configuredImageFactoryProjectId(provider),
+    projectName: provider.chatgptWeb?.imageFactoryProjectName?.trim() || undefined,
+  };
   const descriptorPath = provider.chatgptWeb.browserHostDescriptorPath?.trim();
   if (!descriptorPath) throw new Error("Launcher browser host descriptor path is missing");
-  return requireImageFactoryProjectId(await readLauncherImageFactoryProjectId(descriptorPath));
+  const config = await readLauncherImageFactoryConfig(descriptorPath);
+  return { projectId: requireImageFactoryProjectId(config.projectId), projectName: config.projectName ?? undefined };
 }
 
 export function createChatGptWebAdapter(
@@ -411,7 +507,7 @@ export function createChatGptWebAdapter(
       executionNamespace,
       async options => {
         options.signal.throwIfAborted();
-        const projectId = await resolveImageFactoryProjectId(provider);
+        const { projectId, projectName } = await resolveImageFactoryProjectConfig(provider);
         const conversationKey = imageKey(
           "conversation",
           executionNamespace,
@@ -438,7 +534,7 @@ export function createChatGptWebAdapter(
           },
         });
         options.signal.throwIfAborted();
-        const session = {
+        let session = {
           ...options.request.session,
           owner: options.request.session.owner,
           projectId,
@@ -447,14 +543,27 @@ export function createChatGptWebAdapter(
         };
         let submittedConversationUrl = session.conversationUrl;
         options.update({ session });
-        const imageModelId = configuredCapabilities.solAvailable ? CHATGPT_WEB_MODEL_ID : CHATGPT_WEB_LUNA_MODEL_ID;
+        const imageModelPolicy = resolveImageFactoryModelPolicy(
+          configuredCapabilities,
+          provider.modelDefaultReasoningEfforts?.[CHATGPT_WEB_MODEL_ID],
+        );
+        const imageModelId = imageModelPolicy.modelId;
         const imageCapabilities: ChatGptWebCapabilities = {
           ...configuredCapabilities,
           localToolsEnabled: false,
         };
         const artifacts: OutputArtifact[] = [];
-        const childTarget = {
+        const artifactBindings = new Set<string>();
+        const submissions: ImageJobSubmission[] = [];
+        const candidateErrors: ImageJobCandidateError[] = [];
+        const excessCandidateKeys: string[] = [];
+        let generatedCount = 0;
+        let attemptCount = 0;
+        let lastText = "";
+        let previousResponseCompletedAt: number | undefined;
+        const childTarget: OutputArtifactTarget = {
           ...options.target,
+          capturePolicy: "best-effort" as const,
           metadata: {
             output: "image" as const,
             surface: "persistent" as const,
@@ -467,60 +576,197 @@ export function createChatGptWebAdapter(
             sourceTurn: options.request.sourceTurnId,
           },
         };
-        const answer = await imageFactoryWorker.run({
-          traceId: `image_${options.request.jobId.slice(0, 56)}`,
-          modelId: imageModelId,
-          reasoning: "low",
-          capabilities: imageCapabilities,
-          surface: "persistent",
-          persistentProjectId: projectId,
-          executionTarget: {
-            output: "image",
-            surface: "persistent",
-            projectId,
-            imageSessionId: session.id,
-          },
-          skipConnectorIdentity: true,
-          prepare: async () => ({ text: options.prompt, images: options.images, release: () => {} }),
-          ...(session.hasConversation ? { prepareResume: async () => ({ text: options.prompt, images: options.images, release: () => {} }) } : {}),
-          ...(session.hasConversation ? { requireRetainedConversation: true } : {}),
-          retainConversation: true,
-          conversationKey,
-          abortSignal: options.signal,
-          onSubmitted: url => {
-            submittedConversationUrl = verifiedImageConversationUrl(url, projectId) ?? submittedConversationUrl;
-            childTarget.metadata.conversationUrl = submittedConversationUrl
-              ?? `https://chatgpt.com/g/${projectId}/project`;
-            options.update({
-              session: {
-                ...session,
-                hasConversation: true,
-                conversationUrl: submittedConversationUrl,
-                updatedAt: Date.now(),
-              },
-              phase: "submitted",
-            });
-          },
-          onTextDelta: () => {},
-          outputArtifactTarget: childTarget,
-          outputArtifactExecutionKey: options.request.jobKey,
-          requireOutputArtifact: true,
-          onOutputArtifact: artifact => artifacts.push(artifact),
+        const currentResult = () => ({
+          requestedCount: options.requestedCount,
+          generatedCount,
+          downloadedCount: artifacts.length,
+          attemptCount,
+          artifacts: [...artifacts],
+          submissions: submissions.map(value => ({ ...value, candidateKeys: [...value.candidateKeys], excessCandidateKeys: [...value.excessCandidateKeys], failures: value.failures.map(failure => ({ ...failure })) })),
+          ...(candidateErrors.length > 0 ? { candidateErrors: candidateErrors.map(error => ({ ...error })) } : {}),
         });
+        const initialPrompt = imageFactoryInitialPrompt(options.operation, options.prompt, options.requestedCount);
+        for (let attempt = 1; attempt <= options.maxSubmissions && generatedCount < options.requestedCount; attempt += 1) {
+          options.signal.throwIfAborted();
+          const remaining = options.requestedCount - generatedCount;
+          const submissionId = imageKey("submission", options.request.jobId, attempt);
+          const submission: ImageJobSubmission = {
+            id: submissionId,
+            attempt,
+            requestedCount: remaining,
+            generatedCount: 0,
+            downloadedCount: 0,
+            candidateKeys: [],
+            excessCandidateKeys: [],
+            failures: [],
+            queuedAt: Date.now(),
+          };
+          submissions.push(submission);
+          childTarget.metadata!.submissionId = submissionId;
+          childTarget.metadata!.conversationUrl = submittedConversationUrl
+            ?? `https://chatgpt.com/g/${projectId}/project`;
+          if (attempt > 1 && previousResponseCompletedAt !== undefined) {
+            const compensationRetryAt = previousResponseCompletedAt + 15_000;
+            const waitMs = Math.max(0, compensationRetryAt - Date.now());
+            if (waitMs > 0) {
+              await withAbort(new Promise<void>(resolveWait => setTimeout(resolveWait, waitMs)), options.signal);
+            }
+          }
+          const prompt = attempt === 1
+            ? initialPrompt
+            : imageFactoryContinuationPrompt(options.operation, initialPrompt, generatedCount, remaining);
+          const promptImages = attempt === 1 ? options.images : [];
+          const resumePlan = imageFactoryResumePlan(
+            options.operation,
+            session.hasConversation === true,
+            session.conversationUrl,
+            projectId,
+            attempt,
+          );
+          let capture: OutputImageCaptureResult | undefined;
+          try {
+            const answer = await imageFactoryWorker.run({
+              traceId: `image_${options.request.jobId.slice(0, 46)}_${attempt}`,
+              modelId: imageModelId,
+              reasoning: imageModelPolicy.reasoning,
+              capabilities: imageCapabilities,
+              surface: "persistent",
+              persistentProjectId: projectId,
+              persistentProjectName: projectName,
+              executionTarget: {
+                output: "image",
+                surface: "persistent",
+                projectId,
+                imageSessionId: session.id,
+              },
+              skipConnectorIdentity: true,
+              prepare: async () => ({ text: prompt, images: promptImages, release: () => {} }),
+              ...(resumePlan.prepareResume ? { prepareResume: async () => ({ text: prompt, images: promptImages, release: () => {} }) } : {}),
+              ...(resumePlan.requireRetainedConversation ? { requireRetainedConversation: true } : {}),
+              ...(resumePlan.resumeConversationUrl ? { resumeConversationUrl: resumePlan.resumeConversationUrl } : {}),
+              retainConversation: true,
+              conversationKey,
+              abortSignal: options.signal,
+              onSendActivated: () => {
+                attemptCount = Math.max(attemptCount, attempt);
+                submission.startedAt ??= Date.now();
+                options.update({ session, phase: "submitting", result: currentResult() });
+              },
+              onSubmitted: url => {
+                submittedConversationUrl = verifiedImageConversationUrl(url, projectId) ?? submittedConversationUrl;
+                childTarget.metadata!.conversationUrl = submittedConversationUrl
+                  ?? `https://chatgpt.com/g/${projectId}/project`;
+                session = {
+                  ...session,
+                  hasConversation: true,
+                  conversationUrl: submittedConversationUrl,
+                  updatedAt: Date.now(),
+                };
+                options.update({ session, phase: "submitted", result: currentResult() });
+              },
+              onTextDelta: () => {},
+              outputArtifactTarget: childTarget,
+              outputArtifactExecutionKey: options.request.jobKey,
+              outputArtifactLimit: remaining,
+              outputArtifactExistingTotalBytes: artifacts.reduce((total, artifact) => total + artifact.byteLength, 0),
+              outputArtifactWriteManifest: false,
+              requireOutputArtifact: true,
+              ...(options.operation === "edit" && options.sourceArtifact ? { imageEditSource: options.sourceArtifact } : {}),
+              onOutputArtifact: artifact => {
+                const binding = `${artifact.source.assistantTurnId}:${artifact.source.candidateKey}`;
+                if (!artifactBindings.has(binding)) {
+                  artifactBindings.add(binding);
+                  artifacts.push(artifact);
+                }
+                options.update({ session, phase: "downloading", result: currentResult() });
+              },
+              onOutputArtifactCapture: value => {
+                capture = value;
+                submission.generatedCount = value.detectedCandidates;
+                submission.downloadedCount = value.artifacts.length;
+                submission.candidateKeys = [...value.candidateKeys];
+                submission.excessCandidateKeys = [...value.excessCandidateKeys];
+                submission.failures = value.failures.map(failure => ({ ...failure, attempt }));
+                submission.completedAt = Date.now();
+                generatedCount += value.detectedCandidates;
+                candidateErrors.push(...submission.failures);
+                excessCandidateKeys.push(...value.excessCandidateKeys);
+                options.update({ session, phase: "downloading", result: currentResult() });
+              },
+              onOutputArtifactWarning: warning => {
+                console.warn(`[chatgpt-web] image-factory capture warning job=${options.request.jobId.slice(0, 12)} attempt=${attempt}: ${warning}`);
+              },
+            });
+            if (answer) lastText = answer;
+            previousResponseCompletedAt = Date.now();
+          } catch (error) {
+            submission.completedAt ??= Date.now();
+            if (!capture) {
+              const failure = { candidateKey: submissionId, code: "image_submission_failed", attempt };
+              submission.failures.push(failure);
+              candidateErrors.push(failure);
+              options.update({ session, result: currentResult() });
+            }
+            throw error;
+          }
+          if (!capture) {
+            submission.completedAt = Date.now();
+            options.update({ session, phase: "observing", result: currentResult() });
+          }
+        }
         const updatedSession = {
           ...session,
-          hasConversation: true,
+          hasConversation: session.hasConversation === true,
           actualMode: imageModelId,
-          conversationUrl: submittedConversationUrl ?? `https://chatgpt.com/g/${projectId}/project`,
+          conversationUrl: submittedConversationUrl ?? session.conversationUrl,
           updatedAt: Date.now(),
         };
-        options.update({ session: updatedSession, phase: "downloading" });
-        const manifestAbsolute = join(childTarget.outputDirectory, "manifest.json");
+        session = updatedSession;
+        const finalStatus = artifacts.length >= options.requestedCount
+          ? "completed" as const
+          : artifacts.length > 0
+            ? "partial" as const
+            : "failed" as const;
+        const manifestPath = artifacts.length > 0
+          ? writeArtifactManifest({
+            executionKey: options.request.jobKey,
+            traceId: `image_${options.request.jobId.slice(0, 56)}`,
+            assistantTurnId: artifacts.at(-1)!.source.assistantTurnId,
+            target: childTarget,
+            artifacts,
+            failures: candidateErrors,
+            job: {
+              operation: options.operation,
+              requestedCount: options.requestedCount,
+              generatedCount,
+              downloadedCount: artifacts.length,
+              attemptCount,
+              ...(options.sourceArtifactId ? { sourceArtifactId: options.sourceArtifactId } : {}),
+              submissions,
+              excessCandidateKeys,
+            },
+          })
+          : undefined;
+        options.update({ session: updatedSession, phase: "downloading", result: { ...currentResult(), ...(manifestPath ? { manifestPath } : {}) } });
         return {
-          status: artifacts.length > 0 ? "completed" : "failed",
+          status: finalStatus,
+          requestedCount: options.requestedCount,
+          generatedCount,
+          downloadedCount: artifacts.length,
+          attemptCount,
           artifacts,
-          ...(existsSync(manifestAbsolute) ? { manifestPath: relative(options.target.workspaceRoot, manifestAbsolute).replaceAll("\\", "/") } : {}),
-          ...(answer ? { text: answer } : {}),
+          submissions,
+          ...(candidateErrors.length > 0 ? { candidateErrors } : {}),
+          ...(manifestPath ? { manifestPath } : {}),
+          ...(lastText ? { text: lastText } : {}),
+          ...(finalStatus !== "completed" ? {
+            error: {
+              code: generatedCount < options.requestedCount ? "image_count_shortfall" : "image_download_partial",
+              message: generatedCount < options.requestedCount
+                ? `Image Factory generated ${generatedCount}/${options.requestedCount} requested image cards after ${attemptCount} submission(s).`
+                : `Image Factory generated enough image cards but saved ${artifacts.length}/${options.requestedCount} requested files.`,
+            },
+          } : {}),
         };
       },
       reservations => chatGptBrowserCapacityAvailable(reservations),
@@ -559,7 +805,10 @@ export function createChatGptWebAdapter(
     environment: ReturnType<typeof extractChatGptTurnEnvironment> | undefined,
     traceId: string,
     turnCapabilities: ChatGptWebCapabilities,
-    hooks: { onCompactionProgress?: () => void } = {},
+    hooks: {
+      onCompactionProgress?: () => void;
+      onSendActivated?: () => void | Promise<void>;
+    } = {},
   ): ChatGptTurnRuntime => {
     const manualRequest = isChatGptWebZeroRiskBackendModel(parsed.modelId);
     if (manualRequest !== manualInteraction) {
@@ -671,14 +920,13 @@ export function createChatGptWebAdapter(
       );
     };
     const submission: NonNullable<ChatGptTurnRuntime["submission"]> = { phase: "prepared" };
-    // A canonical compaction request is side-effect free and remains safe to rebuild after an
-    // ambiguous browser send. Normal task prompts must never be replayed after Send activation.
     const submissionLifecycle = {
-      ...(!parsed._compactionRequest ? {
-        onSendActivated: () => { submission.phase = "send_activated" as const; },
-      } : {}),
+      onSendActivated: async () => {
+        submission.phase = "send_activated" as const;
+        await hooks.onSendActivated?.();
+      },
       onSubmitted: () => {
-        if (!parsed._compactionRequest) submission.phase = "accepted";
+        submission.phase = "accepted";
         hooks.onCompactionProgress?.();
       },
     };
@@ -892,6 +1140,9 @@ export function createChatGptWebAdapter(
     if (!environment) throw new Error("Tool-capable ChatGPT web mode requires a trusted Codex environment");
     const token = deferred<string>();
     const externalProgress = new ChatGptExternalTurnProgress();
+    const followUp = retainConversation && !parsed._compactionRequest
+      ? new ChatGptFollowUpChannel()
+      : undefined;
     let tokenSettled = false;
     let activeToken: string | undefined;
     const prepareWith = async (input: CodexParsedRequest) => {
@@ -956,6 +1207,7 @@ export function createChatGptWebAdapter(
       onTextDelta: delta => text.push(delta),
       ...outputArtifactLifecycle,
       externalProgress,
+      ...(followUp ? { followUp } : {}),
       completionFence: {
         begin: async () => broker.beginCompletionFence(await token.promise),
         commit: async revision => broker.commitCompletionFence(await token.promise, revision),
@@ -982,11 +1234,13 @@ export function createChatGptWebAdapter(
       usageInput: checkpointInput.parsed,
       ...(conversationKey ? { conversationKey } : {}),
       ...(releaseRetainedConversation ? { releaseRetainedConversation } : {}),
+      ...(followUp ? { followUp } : {}),
       retireCapability: async () => {
         if (activeToken) await broker.revoke(activeToken);
       },
       submission,
       cancel: (reason?: Error) => {
+        followUp?.close(reason ?? Object.assign(new Error("ChatGPT browser turn cancelled"), { name: "AbortError" }));
         browserTurn.cancel(reason);
         if (activeToken) {
           void Promise.resolve(broker.revoke(activeToken, reason)).catch(error => {
@@ -1046,6 +1300,10 @@ export function createChatGptWebAdapter(
             const identity = extractChatGptTurnIdentity(parsed);
             console.warn(
               `[chatgpt-web] trusted environment unavailable (thread_id=${identity.threadId ? "present" : "missing"}, turn_id=${identity.turnId ? "present" : "missing"}, previous_response_id=${parsed.previousResponseId ?? "none"}, replay_prefix_items=${parsed._replayPrefixLen ?? 0}, context_messages=${parsed.context.messages.length})`,
+              { errorType: error instanceof Error ? error.name : typeof error,
+                rawEnvironment: hasRawChatGptEnvironmentContext(parsed),
+                currentEnvironment: hasCurrentChatGptEnvironmentContext(parsed),
+                acceptedCompactionContinuation: isChatGptCompactionContinuation(parsed) },
             );
             if (mode.localTools) throw error;
           }
@@ -1286,6 +1544,14 @@ export function createChatGptWebAdapter(
               }
               const handoffError = error instanceof Error ? error : new Error(String(error));
               console.error("[chatgpt-web] structured context handoff failed:", handoffError);
+              // Preserve actionable pre-submission failures. A generic handoff error otherwise
+              // hides an oversized record or stalled preparation and encourages identical retries.
+              if (handoffError instanceof ChatGptWebAdapterError
+                && ["context_length_exceeded", "prompt_preparation_timeout", "model_controls_unavailable", "multipart_context_unavailable"].includes(handoffError.code)) {
+                emit({ type: "error", message: handoffError.message, status: handoffError.status,
+                  errorType: handoffError.errorType, code: handoffError.code, retryable: false });
+                return;
+              }
               emit({
                 type: "error",
                 message: "ChatGPT did not complete the context handoff. Retry the task.",
@@ -1318,6 +1584,7 @@ export function createChatGptWebAdapter(
           chatGptTurnSessions.retireAbortedOwnerTurns(ownerKey, abortedTurnIds, executionKey);
         }
         const traceId = chatGptWebTraceId(provider, parsed);
+        const instructionLineage = chatGptInstructionLineage(parsed);
         const session = await chatGptTurnSessions.getOrCreateAfterOwnerRetirement(
           executionKey,
           ownerKey,
@@ -1326,7 +1593,7 @@ export function createChatGptWebAdapter(
           incoming.abortSignal,
           nativeTurnId,
           nativeIdentity.threadId,
-          chatGptInstructionLineage(parsed),
+          instructionLineage,
         );
         const roundKey = chatGptTurnRoundKey(parsed);
         const emitRoundEvents = (events: readonly AdapterEvent[]): void => {
@@ -1346,6 +1613,17 @@ export function createChatGptWebAdapter(
         const emitRoundEvent = (event: AdapterEvent): void => emitRoundEvents([event]);
         try {
           await session.runExclusive(async () => {
+            const currentInstruction = session.instructionIdentity();
+            const successorFollowUp = currentInstruction !== undefined
+              && currentInstruction !== instructionLineage.current;
+            if (successorFollowUp && !instructionLineage.predecessors.has(currentInstruction)) {
+              throw new ChatGptWebAdapterError("The retained ChatGPT conversation no longer owns this Codex instruction lineage", {
+                status: 409,
+                errorType: "invalid_request_error",
+                code: "follow_up_lineage_conflict",
+                retryable: false,
+              });
+            }
             const replay = session.roundEvents(roundKey);
             replayEvents(replay, emit);
             if (session.roundCompleted(roundKey)) {
@@ -1358,6 +1636,14 @@ export function createChatGptWebAdapter(
               return;
             }
             const settled = session.settledOutcome();
+            if (settled && successorFollowUp) {
+              throw new ChatGptWebAdapterError("ChatGPT finished before the Codex follow-up could be submitted in the retained conversation", {
+                status: 409,
+                errorType: "invalid_request_error",
+                code: "follow_up_same_chat_unavailable",
+                retryable: false,
+              });
+            }
             if (settled) {
               if (settled.type === "error") throw settled.error;
               const trace = session.runtime.trace.drain();
@@ -1431,6 +1717,34 @@ export function createChatGptWebAdapter(
               }
             } else if (session.outstanding().length > 0) {
               throw new Error("Read-only ChatGPT Web runtime cannot own local tool calls");
+            }
+
+            if (successorFollowUp) {
+              const channel = session.runtime.followUp;
+              if (!channel || !session.conversationKey()) {
+                throw new ChatGptWebAdapterError("This ChatGPT browser session cannot accept a same-conversation Codex follow-up", {
+                  status: 409,
+                  errorType: "invalid_request_error",
+                  code: "follow_up_same_chat_unavailable",
+                  retryable: false,
+                });
+              }
+              const request = followUpRequest(parsed, instructionLineage.current);
+              await withAbort(channel.enqueue(request), incoming.abortSignal);
+              const terminal = await withAbort(channel.waitForTerminal(request), incoming.abortSignal);
+              if (terminal.type === "rejected") {
+                throw new ChatGptWebAdapterError(terminal.message, {
+                  status: 409,
+                  errorType: "invalid_request_error",
+                  code: "follow_up_rejected",
+                  retryable: false,
+                });
+              }
+              session.advanceInstruction(instructionLineage.current);
+              // The retained browser now belongs to the successor response. Any text/reasoning
+              // buffered before verified follow-up submission belongs to the predecessor round.
+              session.runtime.trace.reset();
+              session.runtime.text.reset();
             }
 
             const toolWaitAbort = new AbortController();

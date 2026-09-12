@@ -10,6 +10,7 @@ import {
 } from "./environment";
 import { MAX_CHATGPT_BROWSER_TABS } from "./concurrency";
 import type { ChatGptExternalTurnProgress } from "./turn-progress";
+import type { ChatGptFollowUpChannel } from "./follow-up";
 
 function awaitWithAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
   if (!signal) return promise;
@@ -73,6 +74,10 @@ export class ChatGptTraceFeed {
     return this.queued.splice(0);
   }
 
+  reset(): void {
+    this.queued.length = 0;
+  }
+
   wait(signal?: AbortSignal): Promise<void> {
     if (this.queued.length > 0) return Promise.resolve();
     if (signal?.aborted) return Promise.reject(new DOMException("trace wait aborted", "AbortError"));
@@ -122,6 +127,11 @@ export class ChatGptTextFeed {
     return this.text;
   }
 
+  reset(): void {
+    this.queued.length = 0;
+    this.text = "";
+  }
+
   wait(signal?: AbortSignal): Promise<void> {
     if (this.queued.length > 0) return Promise.resolve();
     if (signal?.aborted) return Promise.reject(new DOMException("text wait aborted", "AbortError"));
@@ -151,6 +161,8 @@ interface ChatGptTurnRuntimeBase {
   /** Idempotently retire the turn-bound MCP capability after browser and observer settlement. */
   retireCapability?: () => void | Promise<void>;
   submission?: { phase: "prepared" | "send_activated" | "accepted" };
+  /** Automatic retained turns may accept native Codex steering on the same ChatGPT conversation. */
+  followUp?: ChatGptFollowUpChannel;
   /** Present only when the visible ChatGPT tab is driven manually through the Codex Zero Risk MCP contract. */
   manualControl?: { surfaceNonce: string };
   cancel: (reason?: Error) => void;
@@ -284,6 +296,7 @@ export class ChatGptTurnSession {
   private attachedConversationKey: string | undefined;
   private tail: Promise<void> = Promise.resolve();
   private capabilityRetirementScheduled = false;
+  private currentInstruction?: string;
   private readonly rounds = new Map<string, {
     events: AdapterEvent[];
     reasoning: string[];
@@ -297,8 +310,9 @@ export class ChatGptTurnSession {
     readonly ownerKey?: string,
     readonly nativeTurnId?: string,
     readonly nativeThreadId?: string,
-    readonly instruction?: string,
+    instruction?: string,
   ) {
+    this.currentInstruction = instruction;
     this.attachedConversationKey = runtime.conversationKey;
     this.physicalSettlement = runtime.physicalSettlement.then(
       () => { this.settledPhysical = true; },
@@ -314,6 +328,16 @@ export class ChatGptTurnSession {
       this.settledBrowserOutcome = outcome;
       return outcome;
     });
+  }
+
+  instructionIdentity(): string | undefined {
+    return this.currentInstruction;
+  }
+
+  advanceInstruction(instruction: string): void {
+    if (!instruction) throw new Error("ChatGPT follow-up instruction identity is required");
+    this.currentInstruction = instruction;
+    this.touch();
   }
 
   runExclusive<T>(task: () => Promise<T>): Promise<T> {
@@ -495,6 +519,7 @@ export class ChatGptTurnSession {
 
 export class ChatGptTurnSessions {
   private readonly entries = new Map<string, ChatGptTurnSession>();
+  private readonly supersededExecutions = new Map<string, { error: Error; at: number }>();
   private readonly conversationHeads = new Map<string, ChatGptTurnSession>();
   private readonly retirements = new Map<string, Promise<void>>();
   private readonly ownerRetirements = new Map<string, Promise<void>>();
@@ -516,6 +541,7 @@ export class ChatGptTurnSessions {
     instruction?: string,
   ): ChatGptTurnSession {
     this.prune();
+    this.assertExecutionNotSuperseded(key);
     this.assertTurnNotInterrupted(ownerKey, nativeTurnId);
     const existing = this.entries.get(key);
     if (existing) {
@@ -523,7 +549,7 @@ export class ChatGptTurnSessions {
       existing.touch();
       return existing;
     }
-    const active = [...this.entries.values()].filter(session => session.isActive()).length;
+    const active = [...new Set(this.entries.values())].filter(session => session.isActive()).length;
     if (active >= MAX_CHATGPT_BROWSER_TABS) {
       throw new Error(
         `ChatGPT Web supports at most ${MAX_CHATGPT_BROWSER_TABS} simultaneous browser turns; close or finish a browser tab before starting another`,
@@ -549,6 +575,8 @@ export class ChatGptTurnSessions {
   ): Promise<ChatGptTurnSession> {
     for (;;) {
       if (signal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
+      this.pruneSupersededExecutions();
+      this.assertExecutionNotSuperseded(key);
       this.assertTurnNotInterrupted(ownerKey, nativeTurnId);
       const existing = this.entries.get(key);
       if (existing) {
@@ -566,16 +594,31 @@ export class ChatGptTurnSessions {
       ));
       if (activeOwner) {
         const [ownedKey, ownedSession] = activeOwner;
-        if (ownedSession.isActive() && instruction && ownedSession.instruction
-          && instruction.current !== ownedSession.instruction) {
-          if (!instruction.predecessors.has(ownedSession.instruction)) throw chatGptTurnSupersededError();
-          // Native steering can return the old tool result and a new instruction in one request.
-          // Waiting for the old browser here deadlocks before that result can be consumed. Retire
-          // its capability and rebuild from the complete canonical history, including that result.
-          // Keep the old entry terminal so a delayed replay cannot restart superseded work.
+        const ownedInstruction = ownedSession.instructionIdentity();
+        if (ownedSession.isActive() && instruction && ownedInstruction
+          && instruction.current !== ownedInstruction) {
+          if (!instruction.predecessors.has(ownedInstruction)) throw chatGptTurnSupersededError();
+          if (ownedSession.runtime.followUp && ownedSession.conversationKey()) {
+            if (this.entries.size >= this.maxEntries) {
+              throw new Error(`ChatGPT web session registry is full (${this.maxEntries} entries)`);
+            }
+            // Reserve the successor execution identity on the same physical session. The caller
+            // still delivers any outstanding result from the predecessor before it enqueues the
+            // follow-up, which avoids a browser/tool-result deadlock.
+            const superseded = chatGptTurnSupersededError();
+            for (const [alias, candidate] of this.entries) {
+              if (candidate !== ownedSession || alias === key) continue;
+              this.entries.delete(alias);
+              this.supersededExecutions.set(alias, { error: superseded, at: Date.now() });
+            }
+            this.entries.set(key, ownedSession);
+            ownedSession.touch();
+            return ownedSession;
+          }
           const reason = chatGptTurnSupersededError();
           ownedSession.supersededError = reason;
           this.forgetConversationHead(ownedSession);
+          this.deleteSessionAliases(ownedSession);
           await awaitWithAbort(this.beginRetirement(ownedKey, ownedSession, reason), signal);
           continue;
         }
@@ -653,22 +696,25 @@ export class ChatGptTurnSessions {
     if (target && target !== preserved?.session) {
       throw new Error("The compacted ChatGPT response execution key is already owned by another session");
     }
+    const sessions = [...new Set(matches.map(([, session]) => session))];
     this.conversationHeads.delete(conversationKey);
     for (const [key, session] of matches) {
       if (this.entries.get(key) === session
         && (session !== preserved?.session || key !== preserved.executionKey)) {
         this.entries.delete(key);
       }
+    }
+    for (const session of sessions) {
       if (session.isActive()) session.cancel();
       if (!session.detachConversation(conversationKey)) {
         throw new Error("ChatGPT retained-conversation ownership changed during retirement");
       }
     }
     if (preserved) this.entries.set(preserved.executionKey, preserved.session);
-    const release = matches.findLast(([, session]) => (
+    const release = sessions.findLast(session => (
       session.runtime.releaseRetainedConversation !== undefined
-    ))?.[1].runtime.releaseRetainedConversation;
-    const retirement = Promise.all(matches.map(([, session]) => session.physicalSettlement))
+    ))?.runtime.releaseRetainedConversation;
+    const retirement = Promise.all(sessions.map(session => session.physicalSettlement))
       .then(async () => { await release?.(); });
     this.conversationRetirements.set(conversationKey, retirement);
     try {
@@ -678,7 +724,7 @@ export class ChatGptTurnSessions {
         this.conversationRetirements.delete(conversationKey);
       }
     }
-    return matches.length;
+    return sessions.length;
   }
 
   async waitForRetirement(key: string): Promise<void> {
@@ -694,7 +740,7 @@ export class ChatGptTurnSessions {
     const session = this.entries.get(key);
     if (!session) return false;
 
-    this.entries.delete(key);
+    this.deleteSessionAliases(session);
     this.forgetConversationHead(session);
     await awaitWithAbort(this.beginRetirement(key, session), signal);
     return true;
@@ -702,7 +748,7 @@ export class ChatGptTurnSessions {
 
   retire(key: string, session: ChatGptTurnSession): boolean {
     if (this.entries.get(key) !== session) return false;
-    this.entries.delete(key);
+    this.deleteSessionAliases(session);
     this.forgetConversationHead(session);
     this.beginRetirement(key, session);
     return true;
@@ -721,24 +767,29 @@ export class ChatGptTurnSessions {
       && session.nativeTurnId !== undefined
       && abortedTurnIds.has(session.nativeTurnId)
     ));
-    for (const [key, session] of matches) {
-      this.entries.delete(key);
+    const sessions = [...new Set(matches.map(([, session]) => session))]
+      .filter(session => this.entries.get(keepKey) !== session);
+    for (const session of sessions) {
+      const key = this.executionKeyForSession(session) ?? keepKey;
+      this.deleteSessionAliases(session);
       this.forgetConversationHead(session);
       this.beginRetirement(key, session);
     }
-    return matches.length;
+    return sessions.length;
   }
 
   clear(): number {
-    const cancelled = this.entries.size;
-    for (const [key, session] of this.entries) this.beginRetirement(key, session);
+    const sessions = [...new Set(this.entries.values())];
+    const cancelled = sessions.length;
+    for (const session of sessions) this.beginRetirement(this.executionKeyForSession(session) ?? "clear", session);
     this.entries.clear();
     this.conversationHeads.clear();
+    this.supersededExecutions.clear();
     return cancelled;
   }
 
   async cancelTrace(traceId: string, reason = chatGptBrowserTabClosedError()): Promise<number> {
-    const sessions = [...this.entries.values()]
+    const sessions = [...new Set(this.entries.values())]
       .filter(session => session.traceId === traceId && session.isActive());
     for (const session of sessions) session.cancel(reason);
     await Promise.all(sessions.map(session => session.physicalSettlement));
@@ -762,20 +813,20 @@ export class ChatGptTurnSessions {
       session.nativeThreadId === threadId
       && session.nativeTurnId === turnId
     ));
-    for (const [key, session] of matches) {
-      if (this.entries.get(key) !== session) continue;
+    const sessions = [...new Set(matches.map(([, session]) => session))];
+    for (const session of sessions) {
       if (session.ownerKey) this.rememberInterruptedTurn(session.ownerKey, turnId);
-      this.entries.delete(key);
+      this.deleteSessionAliases(session);
       this.forgetConversationHead(session);
     }
     const settlement = Promise.all(
-      matches.map(([key, session]) => this.beginRetirement(key, session, reason)),
+      sessions.map(session => this.beginRetirement(this.executionKeyForSession(session) ?? `${threadId}:${turnId}`, session, reason)),
     ).then(() => undefined);
-    return { cancelled: matches.length, settlement };
+    return { cancelled: sessions.length, settlement };
   }
 
   cancelledError(traceId: string): Error | undefined {
-    for (const session of this.entries.values()) {
+    for (const session of new Set(this.entries.values())) {
       if (session.traceId !== traceId) continue;
       if (session.supersededError) return session.supersededError;
       const outcome = session.settledOutcome();
@@ -788,17 +839,31 @@ export class ChatGptTurnSessions {
   activeCount(): number {
     this.prune();
     let active = 0;
-    for (const session of this.entries.values()) if (session.isActive()) active += 1;
+    for (const session of new Set(this.entries.values())) if (session.isActive()) active += 1;
     return active;
   }
 
   private prune(): void {
+    this.pruneSupersededExecutions();
     const cutoff = Date.now() - this.ttlMs;
-    for (const [key, session] of this.entries) {
+    for (const session of new Set(this.entries.values())) {
       if (session.isActive() || session.lastUsedAt() >= cutoff) continue;
+      const key = this.executionKeyForSession(session) ?? "prune";
       session.cancel();
-      this.entries.delete(key);
+      this.deleteSessionAliases(session);
       this.forgetConversationHead(session);
+      this.beginRetirement(key, session);
+    }
+  }
+
+  private executionKeyForSession(session: ChatGptTurnSession): string | undefined {
+    for (const [key, candidate] of this.entries) if (candidate === session) return key;
+    return undefined;
+  }
+
+  private deleteSessionAliases(session: ChatGptTurnSession): void {
+    for (const [key, candidate] of this.entries) {
+      if (candidate === session) this.entries.delete(key);
     }
   }
 
@@ -807,6 +872,18 @@ export class ChatGptTurnSessions {
     for (const [key, interruptedAt] of this.interruptedTurns) {
       if (interruptedAt < Date.now() - this.ttlMs) this.interruptedTurns.delete(key);
     }
+  }
+
+  private pruneSupersededExecutions(): void {
+    const cutoff = Date.now() - this.ttlMs;
+    for (const [key, value] of this.supersededExecutions) {
+      if (value.at < cutoff) this.supersededExecutions.delete(key);
+    }
+  }
+
+  private assertExecutionNotSuperseded(key: string): void {
+    const superseded = this.supersededExecutions.get(key);
+    if (superseded && superseded.at >= Date.now() - this.ttlMs) throw superseded.error;
   }
 
   private assertTurnNotInterrupted(ownerKey?: string, turnId?: string): void {

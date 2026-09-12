@@ -44,17 +44,67 @@ launcher-owned codex-chatgpt-web daemon
 ### Image Factory
 
 Automatic Full-harness Web turns keep their text and vision work in the task-bound Temporary Chat.
-When the model needs to create or edit an image, the bridge exposes three virtual tools through the
-existing turn-bound MCP contract: `chatgpt_image_generate`, `chatgpt_image_wait`, and
-`chatgpt_image_cancel`. The image job opens a separate regular ChatGPT conversation in the
-Project-only-memory project named `Image Factory`, then downloads the generated artifact into
-`.codex/chatgpt-web-artifacts/<job-key>/` using the existing artifact store.
+When the model needs to create or edit an image, the bridge exposes four virtual tools through the
+existing turn-bound MCP contract: `chatgpt_image_generate`, `chatgpt_image_edit`,
+`chatgpt_image_wait`, and `chatgpt_image_cancel`. Generate and edit accept a strict `count` from 1
+through 4. The image job opens or resumes a separate regular ChatGPT conversation in the
+Project-only-memory project named `Image Factory`, then downloads each verified generated-image
+card into `.codex/chatgpt-web-artifacts/<job-key>/` using the existing artifact store.
+
+Image Factory reads the configured project ID and optional Project name from the launcher for each
+job. It reuses the retained conversation/document when available, otherwise loads
+`/g/<project_id>/project` directly. If that document fails to become ready, it uses the exact
+configured name in the ChatGPT sidebar's Pinned section and verifies the resulting project ID.
+It never opens unrelated project rows to discover an ID. Missing or duplicate names stop recovery.
+The history-rate-limit modal interrupts navigation and pending clicks with a structured retryable
+429 (`rate_limit_exceeded`), which is also preserved in the image job journal.
+
+Image Factory submissions use the latest automatic ChatGPT model route and enforce Medium as the
+minimum thinking level. Instant/low is clamped to Medium, while supported High, Extra High, or Pro
+defaults are preserved. Luna-only accounts use Think (medium) for the same minimum-thinking policy.
+Retained image conversations may keep Create image selected, hiding the effort slider; the worker
+restores Latest before setting the requested effort. Image edits wait for the source thumbnail to
+hydrate after the new user message commits. The helper updates its artifact metadata with the
+submitted conversation URL before saving files, rather than keeping the pre-Send project URL.
+An empty retained image composer can reuse its verified picture_v2 tool pill, provided no connector
+is selected. Fresh tool selection searches only the hydrated mention popup; same-named sidebar
+chats and stale popups cannot supply the Create image command.
+
+For a multi-image request, the caller should make every requested output explicit in the prompt:
+
+```text
+Create N separate images in one response.
+Image 1: <complete description for image 1>
+Image 2: <complete description for image 2>
+...
+Image N: <complete description for image N>
+Shared constraints: <references, identity, style, composition, quality, and shared requirements>
+Return them as N separate image outputs. Do NOT combine multiple requested images into a collage,
+grid, triptych, contact sheet, sprite sheet, or split-screen.
+```
+
+The Image Factory reinforces that request with a one-to-one card contract: every `Image i:` slot
+must become its own generated-image card/file containing only that slot. When ChatGPT's image
+generator emits one artifact per invocation, the retained image agent is instructed to invoke it
+once per slot before finishing the response.
+
+The bridge preserves an already-canonical prompt. If `count > 1` arrives with an ordinary prompt,
+it wraps that request in the same separate-output grammar before the first browser submission. This
+is a fallback for callers that do not provide per-image descriptions; model-facing instructions ask
+Codex to provide concrete `Image 1:` through `Image N:` descriptions whenever the user requested
+distinct views or variants.
 
 The user creates the project in the authenticated browser profile; it is reused only after its
 Project-only memory and versioned instruction block are verified. Each native task owns an opaque
-image session and conversation binding; a follow-up edit reuses that binding, while a different task
-cannot address it. The child job has its own journal and deadline, but shares the five-browser-turn
-admission limit and the parent's completion fence. A parent cancellation cancels the child job.
+image session and conversation binding; an edit resolves one saved source artifact through stored
+assistant/card provenance and reuses that binding, while a different task cannot address it. Image
+detail opens through the source card's `Edit image` control and edit text is submitted through the
+dialog-local Describe edits composer. If ChatGPT returns fewer generated cards than requested, the
+job can request only the shortfall in the same conversation, up to four submissions total. Download
+failures are reported per candidate and never cause replacement generation. The child job has its
+own journal and deadline, but shares the five-browser-turn admission limit and the parent's
+completion fence. A parent cancellation cancels the child job while preserving artifacts already
+saved.
 
 This routing does not add an Images model and does not change the parent model catalog. Native Codex,
 Zero Risk, and browser-only routes keep their existing image behavior. ChatGPT Web image generation
@@ -111,6 +161,13 @@ state between tabs. Tabs share only the local login
 partition and keep independent documents and lifecycles. Closing a running tab destroys its page
 and terminates that browser turn. A sixth concurrent turn fails explicitly; the cap avoids excessive
 parallel traffic that could trigger account abuse controls.
+
+For automatic Full turns, a proven successor Codex instruction can hand off to the retained browser
+turn while ChatGPT is still Thinking. Follow-ups are queued FIFO per retained session, deduplicated
+by request identity and revision, and submitted only when no Codex tool call is in flight and the
+active composer exposes an enabled `data-testid="send-button"`. The browser verifies the new user
+message before rebinding response streaming to that revision. Explicit cancel closes the queue and
+aborts the retained turn; a follow-up timeout never creates a replacement chat.
 
 Browser submission and response binding use ChatGPT's logical `data-turn-id`, not the
 `conversation-turn-N` display index, which can change during rendering. The submission baseline

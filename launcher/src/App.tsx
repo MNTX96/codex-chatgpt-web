@@ -1169,20 +1169,23 @@ function ImageFactorySurface({
   updateSnapshot: (snapshot: LauncherSnapshot) => void;
 }) {
   const [projectId, setProjectId] = useState(snapshot.imageFactoryProjectId ?? "");
+  const [projectName, setProjectName] = useState(snapshot.imageFactoryProjectName ?? "");
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     setProjectId(snapshot.imageFactoryProjectId ?? "");
-  }, [snapshot.imageFactoryProjectId]);
+    setProjectName(snapshot.imageFactoryProjectName ?? "");
+  }, [snapshot.imageFactoryProjectId, snapshot.imageFactoryProjectName]);
 
   const save = async () => {
     if (busy) return;
     setBusy(true);
     setError(null);
     try {
-      const next = await api!.setImageFactoryProjectId(projectId.trim() || null);
+      const next = await api!.setImageFactoryProjectId(projectId.trim() || null, projectName.trim() || null);
       updateSnapshot(next);
       setProjectId(next.imageFactoryProjectId ?? "");
+      setProjectName(next.imageFactoryProjectName ?? "");
     } catch (cause) {
       setError(messageOf(cause));
     } finally {
@@ -1206,6 +1209,16 @@ function ImageFactorySurface({
             placeholder="g-p-6aa1eeecf4e88191843bc929b28c3c7a"
             spellCheck={false}
             value={projectId}
+          />
+        </FieldRow>
+        <FieldRow label={copy.imageFactoryProjectName}>
+          <input
+            autoCapitalize="none"
+            autoCorrect="off"
+            onChange={(event) => setProjectName(event.target.value)}
+            placeholder="Image Factory"
+            spellCheck={false}
+            value={projectName}
           />
         </FieldRow>
       </div>

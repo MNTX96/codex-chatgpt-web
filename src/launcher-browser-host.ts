@@ -361,11 +361,10 @@ export async function inspectLauncherBrowserHost(
 export const LAUNCHER_SESSION_INSPECTION_TIMEOUT_MS = 30_000;
 export const LAUNCHER_CAPABILITY_INSPECTION_TIMEOUT_MS = 120_000;
 export const LAUNCHER_IMAGE_FACTORY_CONFIG_TIMEOUT_MS = 5_000;
-
-export async function readLauncherImageFactoryProjectId(
+export async function readLauncherImageFactoryConfig(
   descriptorPath: string,
   timeoutMs = LAUNCHER_IMAGE_FACTORY_CONFIG_TIMEOUT_MS,
-): Promise<string | null> {
+): Promise<{ projectId: string | null; projectName: string | null }> {
   const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -383,16 +382,28 @@ export async function readLauncherImageFactoryProjectId(
     if (!response.ok) {
       throw new Error(typeof body.error === "string" ? body.error : `HTTP ${response.status}`);
     }
-    if (body.projectId === null) return null;
-    if (typeof body.projectId !== "string" || !body.projectId.trim()) {
+    if (body.projectId !== null && (typeof body.projectId !== "string" || !body.projectId.trim())) {
       throw new Error("Launcher returned invalid Image Factory configuration");
     }
-    return body.projectId.trim();
+    if (body.projectName !== undefined && body.projectName !== null && typeof body.projectName !== "string") {
+      throw new Error("Launcher returned invalid Image Factory project name");
+    }
+    return {
+      projectId: typeof body.projectId === "string" ? body.projectId.trim() : null,
+      projectName: typeof body.projectName === "string" ? body.projectName.trim() || null : null,
+    };
   } catch (error) {
     throw new Error(`Launcher Image Factory configuration could not be read: ${error instanceof Error ? error.message : String(error)}`);
   } finally {
     clearTimeout(timer);
   }
+}
+
+export async function readLauncherImageFactoryProjectId(
+  descriptorPath: string,
+  timeoutMs = LAUNCHER_IMAGE_FACTORY_CONFIG_TIMEOUT_MS,
+): Promise<string | null> {
+  return (await readLauncherImageFactoryConfig(descriptorPath, timeoutMs)).projectId;
 }
 
 export type LauncherTurnActivity =
@@ -403,6 +414,8 @@ export type LauncherTurnActivity =
       conversationKey?: string;
       connectorIdentity?: string;
       requireRetainedConversation?: boolean;
+      resumeConversationUrl?: string;
+      persistentProjectId?: string;
     }
   | {
       phase: "heartbeat";

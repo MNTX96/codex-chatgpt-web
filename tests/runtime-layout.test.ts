@@ -246,14 +246,19 @@ test("Image Factory project_id is optional, trimmed, and forwarded without patte
 
   const blank = defaultConfig("browser-only");
   blank.imageFactoryProjectId = "   ";
+  blank.imageFactoryProjectName = "   ";
   writeFileSync(join(root, "config.json"), `${JSON.stringify(blank)}\n`);
   expect(loadConfig().imageFactoryProjectId).toBeUndefined();
+  expect(loadConfig().imageFactoryProjectName).toBeUndefined();
 
   const configured = defaultConfig("browser-only");
   configured.imageFactoryProjectId = "  custom-project-id  ";
+  configured.imageFactoryProjectName = "  My studio  ";
   writeFileSync(join(root, "config.json"), `${JSON.stringify(configured)}\n`);
   const loaded = loadConfig();
   expect(loaded.imageFactoryProjectId).toBe("custom-project-id");
+  expect(loaded.imageFactoryProjectName).toBe("My studio");
+  expect(providerConfig(loaded).chatgptWeb?.imageFactoryProjectName).toBe("My studio");
   expect(providerConfig(loaded).chatgptWeb?.imageFactoryProjectId).toBe("custom-project-id");
 });
 
