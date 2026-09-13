@@ -39,6 +39,7 @@ export class LauncherManualTurnFailedError extends Error {
 export interface LauncherBrowserHostDescriptor {
   version: 3;
   features?: string[];
+  nativeBuild?: { launcher_sha256: string; started_at: string; max_vfmu_tabs: number };
   kind: typeof LAUNCHER_BROWSER_HOST_KIND;
   profile: LauncherBrowserHostProfile;
   pid: number;
@@ -91,6 +92,12 @@ function assertDescriptorShape(value: unknown): LauncherBrowserHostDescriptor {
     || descriptor.features.some(feature => typeof feature !== "string"))) {
     throw new Error("Launcher browser descriptor has invalid features");
   }
+  if (descriptor.nativeBuild !== undefined && (!descriptor.nativeBuild
+    || !/^[a-f0-9]{64}$/.test(descriptor.nativeBuild.launcher_sha256)
+    || Number.isNaN(Date.parse(descriptor.nativeBuild.started_at))
+    || descriptor.nativeBuild.max_vfmu_tabs !== 2)) {
+    throw new Error("Launcher native build identity is invalid");
+  }
   if (descriptor.profile !== "production" && descriptor.profile !== "development") {
     throw new Error("Launcher browser descriptor has an invalid profile");
   }
@@ -141,6 +148,7 @@ function assertDescriptorShape(value: unknown): LauncherBrowserHostDescriptor {
   return {
     version: 3,
     ...(descriptor.features ? { features: descriptor.features } : {}),
+    ...(descriptor.nativeBuild ? { nativeBuild: descriptor.nativeBuild } : {}),
     kind: LAUNCHER_BROWSER_HOST_KIND,
     profile: descriptor.profile,
     pid: descriptor.pid!,
@@ -409,6 +417,7 @@ export async function readLauncherImageFactoryProjectId(
 export type LauncherTurnActivity =
   | {
       phase: "start";
+      nativeScope?: string;
       traceId: string;
       helperPid: number;
       conversationKey?: string;
@@ -671,6 +680,7 @@ export async function notifyLauncherTurn(
       : LAUNCHER_TURN_START_TIMEOUT_MS,
 ): Promise<{
   surfaceId?: string;
+  tabId?: string;
   reused?: boolean;
   connectorBound?: boolean;
   cancelledByUser?: boolean;
@@ -705,6 +715,9 @@ export async function notifyLauncherTurn(
     }
     const body = await response.json().catch(() => ({})) as Record<string, unknown>;
     if (activity.phase === "start") {
+      if (activity.nativeScope && (typeof body.tabId !== "string" || !body.tabId)) {
+        throw new Error("Native Launcher did not return its bound tab id");
+      }
       if (typeof body.surfaceId !== "string" || !/^[A-Za-z0-9_-]{32}$/.test(body.surfaceId)) {
         throw new Error("Launcher browser control channel returned an invalid turn surface id");
       }
@@ -716,6 +729,7 @@ export async function notifyLauncherTurn(
       }
       return {
         surfaceId: body.surfaceId,
+        ...(typeof body.tabId === "string" ? { tabId: body.tabId } : {}),
         reused: body.reused,
         connectorBound: body.connectorBound,
       };

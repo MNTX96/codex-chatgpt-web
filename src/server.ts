@@ -813,6 +813,8 @@ export function startServer(
           pid: process.pid,
           port: config.port,
           uptime: (Date.now() - startedAt) / 1_000,
+          native_runtime: LOADED_RUNTIME_IDENTITY,
+          native_image_tool_schema_hashes: imageToolSchemaHashes(),
           accepting_turns: !draining,
           successful_model_catalog_requests: successfulModelCatalogRequests,
           last_successful_model_catalog_request_at: lastSuccessfulModelCatalogRequestAt,
@@ -1066,3 +1068,6 @@ export function startServer(
   process.once("SIGTERM", shutdown);
   return server;
 }
+import { LOADED_RUNTIME_IDENTITY } from "./runtime-build-identity";
+
+import { imageToolSchemaHashes } from "./adapters/chatgpt-web/image-factory/contracts";

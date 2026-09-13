@@ -1,6 +1,15 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { createHash, randomBytes } = require("node:crypto");
+const nativeLauncherHash = createHash("sha256");
+for (const name of fs.readdirSync(__dirname).filter(name => name.endsWith('.cjs')).sort()) {
+  nativeLauncherHash.update(name + '\0').update(fs.readFileSync(path.join(__dirname, name)));
+}
+const NATIVE_LOADED_LAUNCHER = Object.freeze({
+  launcher_sha256: nativeLauncherHash.digest('hex'),
+  started_at: new Date(Date.now() - process.uptime() * 1000).toISOString(),
+  max_vfmu_tabs: 2,
+});
 const { clipboard, WebContentsView, powerMonitor, powerSaveBlocker, shell } = require("electron");
 const { writePrivateFileAtomic } = require("./atomic-file.cjs");
 const {
@@ -524,7 +533,16 @@ class BrowserHost {
     return this.turnTabs.get(this.selectedTabId) || null;
   }
 
-  async createTurnTab(traceId, helperPid, conversationKey, connectorIdentity, initialUrl = IDLE_BROWSER_URL) {
+  async createTurnTab(traceId, helperPid, conversationKey, connectorIdentity, initialUrl = IDLE_BROWSER_URL, nativeScope) {
+    if (nativeScope !== undefined) {
+      if (typeof nativeScope !== "string" || !/^[a-f0-9]{64}$/.test(nativeScope)) {
+        throw new Error("native_scope_invalid");
+      }
+      // Count retained views too. Never evict another task to make a VFMU slot.
+      if ([...this.turnTabs.values()].filter(tab => tab.nativeScope === nativeScope).length >= 2) {
+        throw new Error("native_two_tab_capacity_exhausted");
+      }
+    }
     if (this.turnTabs.size >= MAX_BROWSER_TABS
       && !BrowserHost.prototype.evictOldestReclaimableTurnTab.call(this)) {
       throw new Error(
@@ -548,6 +566,7 @@ class BrowserHost {
     });
     const tab = {
       id,
+      ...(nativeScope ? { nativeScope } : {}),
       surfaceId,
       traceId,
       conversationKey,
@@ -2239,6 +2258,7 @@ class BrowserHost {
     requireRetainedConversation = false,
     resumeConversationUrl,
     persistentProjectId,
+    nativeScope,
   ) {
     if (this.manualOperation) {
       throw new Error(`ChatGPT browser is busy with ${this.manualOperation}`);
@@ -2260,12 +2280,13 @@ class BrowserHost {
     if (sameTrace && sameTrace.interactionMode !== "automatic") {
       throw new Error(`Browser turn ${traceId} already belongs to Zero Risk interaction`);
     }
-    if (sameTrace && (sameTrace.conversationKey !== conversationKey
+    if (sameTrace && (sameTrace.nativeScope !== nativeScope || sameTrace.conversationKey !== conversationKey
       || sameTrace.connectorIdentity !== connectorIdentity)) {
       throw new Error(`ChatGPT browser turn ${traceId} conversation metadata does not match its owned tab`);
     }
     const retainedMatches = conversationKey ? [...this.turnTabs.values()].filter((tab) => (
       tab.interactionMode === "automatic"
+      && tab.nativeScope === nativeScope
       && tab.status === "ready"
       && tab.conversationKey === conversationKey
       && tab.connectorIdentity === connectorIdentity
@@ -2329,6 +2350,7 @@ class BrowserHost {
             conversationKey,
             connectorIdentity,
             verifiedRecoveryUrl,
+            ...(nativeScope ? [nativeScope] : []),
           );
           const committedUrl = recovered.view?.webContents?.getURL?.();
           if (verifiedImageFactoryConversationUrl(committedUrl, persistentProjectId) !== verifiedRecoveryUrl) {
@@ -2361,7 +2383,9 @@ class BrowserHost {
       error.code = "retained_conversation_unavailable";
       throw error;
     }
-    const tab = await this.createTurnTab(traceId, helperPid, conversationKey, connectorIdentity);
+    const tab = nativeScope
+      ? await this.createTurnTab(traceId, helperPid, conversationKey, connectorIdentity, IDLE_BROWSER_URL, nativeScope)
+      : await this.createTurnTab(traceId, helperPid, conversationKey, connectorIdentity);
     this.selectedTabId = tab.id;
     if (reveal) this.show();
     else this.syncViewVisibility();
@@ -2935,7 +2959,8 @@ class BrowserHost {
     const descriptor = {
       version: 3,
       kind: "codex-web-gpt-launcher",
-      features: [IMAGE_DOWNLOAD_FEATURE],
+      features: [IMAGE_DOWNLOAD_FEATURE, "vfmu-native-authority-v1"],
+      nativeBuild: NATIVE_LOADED_LAUNCHER,
       profile: this.profile,
       pid: process.pid,
       endpoint: `http://127.0.0.1:${this.cdpPort}`,

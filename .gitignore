@@ -18,3 +18,4 @@ launcher/artifacts/
 .codex/chatgpt-web-artifacts/
 output/
 notes.md
+/.native-build/

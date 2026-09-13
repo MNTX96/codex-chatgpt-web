@@ -20,6 +20,7 @@ import {
   type ImageToolName,
 } from "./contracts";
 import { ImageFactoryStore, imageKey, normalizeStoredImageJob, type ImageSession, type StoredImageJob } from "./state";
+import { bindNativeImageRequest, type NativeBindingSpec } from "../native-authority";
 
 export interface ImageFactoryBrowserRequest {
   stateDirectory: string;
@@ -29,6 +30,7 @@ export interface ImageFactoryBrowserRequest {
   sourceTurnId: string;
 }
 export interface ImageJobExecution {
+  nativeBinding?: NativeBindingSpec;
   request: ImageFactoryBrowserRequest;
   operation: ImageFactoryOperation;
   requestedCount: number;
@@ -48,6 +50,7 @@ export interface ImageFactoryBrowserUpdate {
   result?: Partial<ImageJobResult>;
 }
 export interface ImageFactoryParent {
+  nativeBinding?: NativeBindingSpec;
   threadId: string;
   environment: ChatGptTurnEnvironment;
   signal: AbortSignal;
@@ -131,20 +134,47 @@ export class ImageFactoryService {
     private readonly execute: (options: ImageJobExecution) => Promise<ImageJobExecutionResult>,
     private readonly hasCapacity: (additionalReservations?: number) => boolean,
     private readonly executionPolicy: { maxSubmissions?: number } = {},
+    private readonly reconcileExecution?: (job: StoredImageJob, session: ImageSession, parent: ImageFactoryParent) => Promise<ImageJobExecutionResult>,
   ) {}
 
   async call(parent: ImageFactoryParent, name: ImageToolName, args: unknown): Promise<ImageJobResult> {
     if (parent.signal.aborted) throw new ImageFactoryError("image_parent_retired");
     if (!parent.threadId) throw new ImageFactoryError("image_task_identity_missing");
     const owner = imageKey(this.namespace, parent.threadId);
-    if (name === "chatgpt_image_generate") return this.start(parent, owner, "generate", imageGenerateSchema.parse(args));
-    if (name === "chatgpt_image_edit") return this.start(parent, owner, "edit", imageEditSchema.parse(args));
+    if (name === "chatgpt_image_generate" || name === "chatgpt_image_edit") {
+      const operation = name === "chatgpt_image_generate" ? "generate" : "edit";
+      const input = operation === "generate" ? imageGenerateSchema.parse(args) : imageEditSchema.parse(args);
+      const nativeBinding = parent.nativeBinding
+        ? await bindNativeImageRequest(parent.nativeBinding, input.request_binding_sha256 ?? "",
+          input.prompt, input.count, "reference_image_paths" in input ? input.reference_image_paths ?? [] : [],
+          "source_artifact_id" in input ? input.source_artifact_id : undefined, input.image_session_id)
+        : undefined;
+      if (!parent.nativeBinding && input.request_binding_sha256) throw new ImageFactoryError("native_parent_binding_required");
+      return this.start(parent, owner, operation, input, nativeBinding);
+    }
     const { job_id: jobId } = imageJobSchema.parse(args);
     const key = imageKey("job-id", owner, jobId);
     const rawStored = this.live.get(key)?.job ?? this.store.read<StoredImageJob>("job", key);
     const stored = rawStored ? normalizeStoredImageJob(rawStored) : undefined;
     if (!stored || stored.owner !== owner) throw new ImageFactoryError("image_job_unavailable");
     const live = this.live.get(key);
+    if (name === "chatgpt_image_reconcile") {
+      if (live) return structuredClone(stored.result);
+      if (stored.result.status === "completed") return structuredClone(stored.result);
+      const session = this.store.read<ImageSession>("session", imageKey(owner, stored.result.imageSessionId));
+      if (!session || session.owner !== owner || !this.reconcileExecution) {
+        throw new ImageFactoryError("image_submission_unknown", "Reconciliation requires the original task/session and observed response identity; no prompt was sent.");
+      }
+      const result = await this.reconcileExecution(stored, session, parent);
+      Object.assign(stored.result, result);
+      normalizeTerminalResult(stored.result);
+      stored.phase = "terminal";
+      session.artifacts ??= {};
+      for (const artifact of stored.result.artifacts) session.artifacts[artifact.id] = artifact.source;
+      this.store.write("session", imageKey(owner, session.id), session);
+      this.store.write("job", key, stored);
+      return structuredClone(stored.result);
+    }
     imageFactoryJobLog("wait_or_cancel_requested", {
       tool: name,
       jobId: shortImageJobId(jobId),
@@ -164,7 +194,7 @@ export class ImageFactoryService {
     return structuredClone(stored.result);
   }
 
-  private start(parent: ImageFactoryParent, owner: string, operation: ImageFactoryOperation, input: ImageFactoryInput): ImageJobResult {
+  private start(parent: ImageFactoryParent, owner: string, operation: ImageFactoryOperation, input: ImageFactoryInput, nativeBinding?: NativeBindingSpec): ImageJobResult {
     const jobId = imageKey(owner, input.request_id);
     const key = imageKey("job-id", owner, jobId);
     const payloadHash = normalizedPayloadHash(operation, input);
@@ -227,6 +257,7 @@ export class ImageFactoryService {
       ...(sourceArtifactId ? { sourceArtifactId } : {}),
     };
     const job: StoredImageJob = {
+      ...(nativeBinding ? { nativeBinding } : {}),
       key,
       owner,
       payloadHash,
@@ -261,7 +292,7 @@ export class ImageFactoryService {
     const abort = new AbortController();
     const onParentAbort = () => abort.abort(parent.signal.reason);
     parent.signal.addEventListener("abort", onParentAbort, { once: true });
-    const maxSubmissions = Math.max(
+    const maxSubmissions = nativeBinding ? 1 : Math.max(
       1,
       Math.min(
         IMAGE_FACTORY_TIMEOUTS.maxSubmissions,
@@ -296,6 +327,7 @@ export class ImageFactoryService {
     const done = Promise.resolve().then(async () => {
       abort.signal.throwIfAborted();
       const executionResult = await this.execute({
+        ...(nativeBinding ? { nativeBinding } : {}),
         request: { stateDirectory: this.store.directory, session: session!, jobId, jobKey: key, sourceTurnId: parent.threadId },
         operation,
         requestedCount: input.count,

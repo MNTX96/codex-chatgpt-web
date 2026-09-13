@@ -66,6 +66,7 @@ export class OutputImageAdapter {
     maxArtifacts?: number;
     existingTotalBytes?: number;
     writeManifest?: boolean;
+    excludeCandidateKeys?: string[];
   }): Promise<OutputImageCaptureResult> {
     const jobDeadlineAt = Date.now() + 240_000;
     const log = imageTransferLog(options.traceId, options.target.metadata?.jobId);
@@ -77,7 +78,8 @@ export class OutputImageAdapter {
       Math.min(jobDeadlineAt, Date.now() + 10_000),
     );
     const artifactLimit = Math.min(options.maxArtifacts ?? options.target.maxArtifacts, options.target.maxArtifacts);
-    const selected = candidates.slice(0, artifactLimit);
+    const excluded = new Set(options.excludeCandidateKeys ?? []);
+    const selected = candidates.filter(candidate => !excluded.has(candidate.key)).slice(0, artifactLimit);
     const artifacts = []; const failures: Array<{ candidateKey: string; code: string }> = [];
     let totalBytes = options.existingTotalBytes ?? 0;
     for (const candidate of selected) {

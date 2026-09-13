@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { createHash } from "node:crypto";
 import type { OutputImageArtifact } from "../artifacts/types";
 import { IMAGE_FACTORY_MULTI_IMAGE_PROMPT_TEMPLATE } from "./prompt-template";
 
@@ -6,7 +7,7 @@ export type ChatExecutionTarget =
   | { output: "text"; surface: "temporary" }
   | { output: "image"; surface: "persistent"; projectId: string; imageSessionId: string };
 
-export const IMAGE_TOOL_NAMES = ["chatgpt_image_generate", "chatgpt_image_edit", "chatgpt_image_wait", "chatgpt_image_cancel"] as const;
+export const IMAGE_TOOL_NAMES = ["chatgpt_image_generate", "chatgpt_image_edit", "chatgpt_image_wait", "chatgpt_image_cancel", "chatgpt_image_reconcile"] as const;
 export type ImageToolName = typeof IMAGE_TOOL_NAMES[number];
 export const isImageTool = (name: string): name is ImageToolName => (IMAGE_TOOL_NAMES as readonly string[]).includes(name);
 
@@ -14,6 +15,7 @@ const id = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/);
 const imageCount = z.number().int().min(1).max(4).default(1);
 export const imageGenerateSchema = z.object({
   request_id: id,
+  request_binding_sha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
   prompt: z.string().trim().min(1).max(100_000),
   reference_image_paths: z.array(z.string().min(1).max(4096)).max(10).optional(),
   image_session_id: id.optional(),
@@ -21,6 +23,7 @@ export const imageGenerateSchema = z.object({
 }).strict();
 export const imageEditSchema = z.object({
   request_id: id,
+  request_binding_sha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
   image_session_id: id,
   source_artifact_id: id,
   prompt: z.string().trim().min(1).max(100_000),
@@ -106,9 +109,17 @@ export function imageToolInventory() {
         ? "Edit one previously saved Image Factory artifact into 1-4 variants in its existing ChatGPT conversation. source_artifact_id must be an artifact owned by image_session_id with stored provenance. Returns a job_id quickly; poll chatgpt_image_wait until terminal."
       : name === "chatgpt_image_wait"
         ? "Wait up to 20 seconds for an Image Factory job. A running result is not completion; poll again. Completed results contain local image paths and imageSessionId for later edits."
-        : "Cancel an Image Factory job owned by this task. Does not delete ChatGPT history or completed artifacts.",
+        : name === "chatgpt_image_reconcile"
+          ? "Observe and re-download only already-created cards of this task's saved Image Factory job. Never sends a generation/edit prompt. Unknown submission identity remains an explicit blocker."
+          : "Cancel an Image Factory job owned by this task. Does not delete ChatGPT history or completed artifacts.",
     parameters: schemaFor(name),
   }));
+}
+
+/** Hash the loaded public schemas, including native binding and reconciliation arguments. */
+export function imageToolSchemaHashes(): Record<string, string> {
+  return Object.fromEntries(imageToolInventory().map(tool => [tool.name,
+    createHash("sha256").update(JSON.stringify(tool.parameters)).digest("hex")]));
 }
 
 export const IMAGE_FACTORY_PROMPT_RULE = `For image generation, use codex_tool_call with wire_name chatgpt_image_generate and pass count exactly as requested (1-4; do not silently clamp larger requests). When count > 1, build prompt with exactly one concrete Image 1: through Image N: description and explicitly require N separate image outputs in one response; never ask for a collage, grid, triptych, contact sheet, sprite sheet, or split-screen unless the user requested that layout. Shared identity/reference/style constraints may be stated once after the per-image descriptions. For edits of a saved Image Factory artifact, use chatgpt_image_edit with image_session_id and source_artifact_id. Keep request_id stable on retries. Poll chatgpt_image_wait while status is running. Use reference_image_paths for local generation references. Do not call native Codex ImageGen. Your text/vision conversation remains Temporary Chat; the tools run a separate Regular Chat in Image Factory. Never claim success before the tool returns saved artifact paths.`;

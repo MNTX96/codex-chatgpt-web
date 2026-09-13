@@ -2404,6 +2404,20 @@ test("five browser tabs are a hard account-safety limit", async () => {
   );
 });
 
+test("VFMU admission counts its parent, child and retained views within two slots", async () => {
+  const scope = "a".repeat(64);
+  const tabs = new Map([
+    ["parent", { nativeScope: scope, status: "running" }],
+    ["retained-child", { nativeScope: scope, status: "ready" }],
+    ["unrelated", { status: "running" }],
+  ]);
+  await assert.rejects(() => BrowserHost.prototype.createTurnTab.call(
+    { turnTabs: tabs }, "new-native-turn", 1, "conversation", undefined, IDLE_BROWSER_URL, scope),
+    /native_two_tab_capacity_exhausted/);
+  assert.equal(tabs.size, 3);
+  assert.ok(tabs.has("unrelated"));
+});
+
 test("a full browser host evicts only its oldest ready tab", () => {
   const oldest = { id: "oldest", ordinal: 1, status: "ready", lastHeartbeatAt: 10 };
   const newer = { id: "newer", ordinal: 2, status: "ready", lastHeartbeatAt: 20 };

@@ -15,7 +15,7 @@ function hasCanonicalSeparateImageShape(prompt: string, count: number): boolean 
   for (let index = 1; index <= count; index += 1) {
     if (!new RegExp(`(?:^|\\n)\\s*Image\\s+${index}\\s*:`, "i").test(prompt)) return false;
   }
-  return new RegExp(`Return\\s+(?:them|the\\s+results?)\\s+as\\s+${escapedCount}\\s+separate\\s+image\\s+outputs?`, "i").test(prompt);
+  return new RegExp(`Return\\s+(?:(?:them|the\\s+results?)\\s+as\\s+)?${escapedCount}\\s+separate\\s+image\\s+outputs?`, "i").test(prompt);
 }
 
 function separateCardContract(count: number): string {
