@@ -548,7 +548,8 @@ export function createChatGptWebAdapter(
         options.update({ session });
         const imageModelPolicy = resolveImageFactoryModelPolicy(
           configuredCapabilities,
-          provider.modelDefaultReasoningEfforts?.[CHATGPT_WEB_MODEL_ID],
+          options.modelId,
+          options.reasoning,
         );
         const imageModelId = imageModelPolicy.modelId;
         const imageCapabilities: ChatGptWebCapabilities = {
@@ -1176,6 +1177,8 @@ export function createChatGptWebAdapter(
             const result = await imageFactory.call({
               ...(nativeBinding ? { nativeBinding } : {}),
               threadId: identity.threadId ?? identity.turnId ?? traceId,
+              modelId: parsed.modelId,
+              reasoning: parsed.options.reasoning,
               environment,
               signal: browserAbort.signal,
               activity: () => structuredBroker.holdImageActivity!(turnToken),

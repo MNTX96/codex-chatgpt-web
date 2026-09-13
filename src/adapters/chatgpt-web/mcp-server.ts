@@ -785,7 +785,7 @@ export async function runChatGptMcpServer(options: {
         const needle = query?.trim().toLowerCase();
         if (bound.nativePolicy && bound.nativePolicy.tool_policy !== "local_orchestrator") {
           const tools = [
-            { wire_name: "vfmu_read_bound_file", name: "vfmu_read_bound_file", kind: "function",
+            { wire_name: "native_read_bound_file", name: "native_read_bound_file", kind: "function",
               description: "Read only text files in this native request's verified evidence closure.",
               parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"], additionalProperties: false } },
             { wire_name: "view_image", name: "view_image", kind: "function",
@@ -899,7 +899,7 @@ export async function runChatGptMcpServer(options: {
       }
       return withClaimedTurn("codex_tool_call", requestId, extra, async claimed => {
         const bound = claimed.environment;
-        if (bound.nativePolicy && wire_name === "vfmu_read_bound_file") {
+        if (bound.nativePolicy && wire_name === "native_read_bound_file") {
           if (input !== undefined || typeof args?.path !== "string") throw new Error("native_bound_path_required");
           return result(await callNativeAuthority(bound.nativePolicy.workspace,
             { ...bound.nativePolicy, operation: "read", path: args.path }));

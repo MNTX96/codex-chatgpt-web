@@ -27,29 +27,35 @@ afterEach(() => {
 });
 
 describe("Image Factory contract", () => {
-  test("Image Factory uses Latest with at least Medium thinking", () => {
+  test("Image Factory inherits the parent Sol effort including Instant", () => {
     const plus = { localToolsEnabled: false, solAvailable: true, proAvailable: false };
-    expect(resolveImageFactoryModelPolicy(plus, undefined)).toEqual({
+    expect(resolveImageFactoryModelPolicy(plus, "gpt-5.6-sol", "low")).toEqual({
+      modelId: "gpt-5.6-sol",
+      reasoning: "low",
+    });
+    expect(resolveImageFactoryModelPolicy(plus, "gpt-5.6-sol", "medium")).toEqual({
       modelId: "gpt-5.6-sol",
       reasoning: "medium",
     });
-    expect(resolveImageFactoryModelPolicy(plus, "low")).toEqual({
-      modelId: "gpt-5.6-sol",
-      reasoning: "medium",
-    });
-    expect(resolveImageFactoryModelPolicy(plus, "high")).toEqual({
+    expect(resolveImageFactoryModelPolicy(plus, "gpt-5.6-sol", "high")).toEqual({
       modelId: "gpt-5.6-sol",
       reasoning: "high",
     });
   });
 
-  test("Image Factory preserves supported higher thinking and clamps Luna to Think", () => {
+  test("Image Factory inherits supported higher thinking and Luna/Think exactly", () => {
     const pro = { localToolsEnabled: false, solAvailable: true, proAvailable: true };
-    expect(resolveImageFactoryModelPolicy(pro, "xhigh").reasoning).toBe("xhigh");
-    expect(resolveImageFactoryModelPolicy(pro, "max").reasoning).toBe("max");
+    expect(resolveImageFactoryModelPolicy(pro, "gpt-5.6-sol", "xhigh").reasoning).toBe("xhigh");
+    expect(resolveImageFactoryModelPolicy(pro, "gpt-5.6-sol", "max").reasoning).toBe("max");
     expect(resolveImageFactoryModelPolicy(
       { localToolsEnabled: false, solAvailable: false, proAvailable: false },
+      "gpt-5.6-luna",
       "low",
+    )).toEqual({ modelId: "gpt-5.6-luna", reasoning: "low" });
+    expect(resolveImageFactoryModelPolicy(
+      { localToolsEnabled: false, solAvailable: false, proAvailable: false },
+      "gpt-5.6-luna",
+      "medium",
     )).toEqual({ modelId: "gpt-5.6-luna", reasoning: "medium" });
   });
 
@@ -199,7 +205,7 @@ describe("Image Factory contract", () => {
         status: 429, code: "rate_limit_exceeded", errorType: "rate_limit_error", retryable: true,
       });
     }, () => true);
-    const parent = { threadId: "thread", signal: new AbortController().signal, activity: () => () => {},
+    const parent = { threadId: "thread", modelId: "gpt-5.6-sol", reasoning: "high", signal: new AbortController().signal, activity: () => () => {},
       environment: { cwd: directory, roots: [directory], writableRoots: [directory], tools: [], sandboxPolicy: { type: "dangerFullAccess" as const } } };
     const job = await service.call(parent, "chatgpt_image_generate", { request_id: "rate", prompt: "draw" });
     const result = await service.call(parent, "chatgpt_image_wait", { job_id: job.jobId });
@@ -220,7 +226,7 @@ describe("Image Factory contract", () => {
       }), () => true);
     };
     const first = ImageFactoryService.shared(directory, "shared", create);
-    const parent = { threadId: "thread", signal: new AbortController().signal, activity: () => () => {},
+    const parent = { threadId: "thread", modelId: "gpt-5.6-sol", reasoning: "high", signal: new AbortController().signal, activity: () => () => {},
       environment: { cwd: directory, roots: [directory], writableRoots: [directory], tools: [], sandboxPolicy: { type: "dangerFullAccess" as const } } };
     const job = await first.call(parent, "chatgpt_image_generate", { request_id: "request", prompt: "draw" });
     const nextRound = ImageFactoryService.shared(directory, "shared", create);
@@ -434,8 +440,12 @@ describe("Image Factory contract", () => {
     };
     let releases = 0;
     let receivedReference = false;
+    let receivedModel: string | undefined;
+    let receivedReasoning: string | undefined;
     const service = new ImageFactoryService(store, "namespace", async options => {
       receivedReference = options.images[0]?.imageUrl.startsWith("data:image/png;base64,") === true;
+      receivedModel = options.modelId;
+      receivedReasoning = options.reasoning;
       options.update({ session: { ...options.request.session, accountKey: "b".repeat(64), updatedAt: Date.now() }, phase: "submitted" });
       const artifact = {
         kind: "generated_image" as const,
@@ -449,13 +459,15 @@ describe("Image Factory contract", () => {
       };
       return { status: "completed" as const, artifacts: [artifact] };
     }, () => true);
-    const parent = { threadId: "thread-1", environment, signal: new AbortController().signal, activity: () => { releases += 1; return () => { releases += 1; }; } };
+    const parent = { threadId: "thread-1", modelId: "gpt-5.6-sol", reasoning: "high", environment, signal: new AbortController().signal, activity: () => { releases += 1; return () => { releases += 1; }; } };
     const first = await service.call(parent, "chatgpt_image_generate", { request_id: "request-1", prompt: "draw a dog", reference_image_paths: [reference] });
     expect(first.status).toBe("running");
     const result = await service.call(parent, "chatgpt_image_wait", { job_id: first.jobId });
     expect(result.status).toBe("completed");
     expect(result.artifacts).toHaveLength(1);
     expect(receivedReference).toBe(true);
+    expect(receivedModel).toBe("gpt-5.6-sol");
+    expect(receivedReasoning).toBe("high");
     expect(releases).toBe(2);
     expect((await service.call(parent, "chatgpt_image_generate", { request_id: "request-1", prompt: "draw a dog", reference_image_paths: [reference] })).jobId).toBe(first.jobId);
     await expect(service.call(parent, "chatgpt_image_generate", { request_id: "request-1", prompt: "different payload" })).rejects.toThrow("idempotency_conflict");
@@ -477,6 +489,8 @@ describe("Image Factory contract", () => {
     }, () => true);
     const parent = {
       threadId: "thread-pre-send-failure",
+      modelId: "gpt-5.6-sol",
+      reasoning: "high",
       environment,
       signal: new AbortController().signal,
       activity: () => () => {},
@@ -561,6 +575,8 @@ describe("Image Factory contract", () => {
     }, () => true);
     const parent = {
       threadId,
+      modelId: "gpt-5.6-sol",
+      reasoning: "high",
       environment,
       signal: new AbortController().signal,
       activity: () => () => {},
@@ -610,7 +626,7 @@ describe("Image Factory contract", () => {
       executions += 1;
       return { status: "failed", artifacts: [] };
     }, () => true);
-    const parent = { threadId, environment, signal: new AbortController().signal, activity: () => () => {} };
+    const parent = { threadId, modelId: "gpt-5.6-sol", reasoning: "high", environment, signal: new AbortController().signal, activity: () => () => {} };
     await expect(service.call(parent, "chatgpt_image_edit", {
       request_id: "edit-request",
       image_session_id: imageSessionId,
@@ -634,7 +650,7 @@ describe("Image Factory contract", () => {
     const service = new ImageFactoryService(store, "namespace", async ({ signal }) => await new Promise<never>((_resolve, reject) => {
       signal.addEventListener("abort", () => reject(signal.reason), { once: true });
     }), () => true);
-    const parent = { threadId: "thread-2", environment, signal: new AbortController().signal, activity: () => () => {} };
+    const parent = { threadId: "thread-2", modelId: "gpt-5.6-sol", reasoning: "high", environment, signal: new AbortController().signal, activity: () => () => {} };
     const first = await service.call(parent, "chatgpt_image_generate", { request_id: "request-2", prompt: "draw a cat" });
     const cancelled = await service.call(parent, "chatgpt_image_cancel", { job_id: first.jobId });
     expect(cancelled.status).toBe("cancelled");
@@ -648,7 +664,7 @@ describe("Image Factory contract", () => {
     const service = new ImageFactoryService(store, "namespace", async () => ({ status: "failed", artifacts: [] }), () => true);
     const environment = { cwd: directory, roots: [directory], writableRoots: [directory],
       sandboxPolicy: { type: "dangerFullAccess" as const }, tools: [] };
-    const parent = { threadId: "thread", environment, signal: new AbortController().signal,
+    const parent = { threadId: "thread", modelId: "gpt-5.6-sol", reasoning: "high", environment, signal: new AbortController().signal,
       activity: (): (() => void) => { throw new Error("parent retired"); } };
     await expect(service.call(parent, "chatgpt_image_generate", { request_id: "request", prompt: "draw" })).rejects.toThrow("parent retired");
     expect(readdirSync(store.directory)).toHaveLength(0);

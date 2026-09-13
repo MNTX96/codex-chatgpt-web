@@ -308,7 +308,7 @@ export const CHATGPT_WEB_MODEL_ROUTES: readonly ChatGptWebAutomaticModelRoute[] 
   {
     slug: "chatgpt-web/light",
     displayName: "ChatGPT Web — Instant",
-    description: "ChatGPT Web Instant through the native Codex harness.",
+    description: "ChatGPT Web Instant through the native Codex harness. Image Factory inherits Instant; low reasoning can miss the requested multi-image count, so choose Medium or higher when exact image count matters.",
     interactionMode: "automatic",
     backendModel: CHATGPT_WEB_BACKEND_MODEL,
     codexEffort: "low",

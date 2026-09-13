@@ -1,8 +1,8 @@
 import { test, expect, afterEach } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { NativeBrowserAuthority, installNativeAuthority, resolveNativeBinding,
+import { NativeBrowserAuthority, callNativeAuthority, installNativeAuthority, resolveNativeBinding,
   nativeHelperInspectionEnvironment, validateNativeBinding, type NativeBindingSpec } from "../src/adapters/chatgpt-web/native-authority";
 import { ImageFactoryService } from "../src/adapters/chatgpt-web/image-factory/service";
 import { ImageFactoryStore } from "../src/adapters/chatgpt-web/image-factory/state";
@@ -12,7 +12,7 @@ const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 const hash = (text: string) => createHash("sha256").update(text).digest("hex");
 function fixture() {
-  const root = mkdtempSync("/private/tmp/vfmu-native-bridge-"); roots.push(root);
+  const root = mkdtempSync("/private/tmp/native-authority-bridge-"); roots.push(root);
   const spec: NativeBindingSpec = { workspace: root, requestSha256: "a".repeat(64),
     threadId: "thread-1", eventId: "event-1", ordinal: 1, scope: hash(root) };
   const binding = { request_sha256: spec.requestSha256, thread_id: spec.threadId, kind: "SEMANTIC", status: "BOUND",
@@ -88,22 +88,45 @@ test("a prepared multi-image prompt does not duplicate all slots inside every Im
   expect([...compiled.matchAll(/^Image \d+:/gm)].map(match => match[0])).toEqual(["Image 1:", "Image 2:", "Image 3:"]);
 });
 
-test("same-workspace ordinary tasks do not invoke VFMU authority or join its pool", async () => {
+test("same-workspace ordinary tasks do not invoke native authority or join its pool", async () => {
   const { root } = fixture();
   const home = join(root, "home"); mkdirSync(home);
-  mkdirSync(join(root, ".venv/bin"), { recursive: true });
-  mkdirSync(join(root, "src/vfmu_pipeline"), { recursive: true });
-  const sentinel = join(root, "invoked");
-  writeFileSync(join(root, ".venv/bin/python"), `#!/bin/sh\ntouch '${sentinel}'\nexit 1\n`, { mode: 0o700 });
-  writeFileSync(join(root, "src/vfmu_pipeline/native_runtime.py"), "# isolated fixture\n");
-  writeFileSync(join(root, "src/vfmu_pipeline/cli.py"), "# isolated fixture\n");
+  mkdirSync(join(root, ".codex"), { recursive: true });
+  mkdirSync(join(root, "authority"), { recursive: true });
+  writeFileSync(join(root, "authority/runtime.txt"), "isolated fixture\n");
+  writeFileSync(join(root, ".codex/native-authority.json"), JSON.stringify({
+    executable: process.execPath,
+    args: ["-e", "process.exit(1)"],
+    integrityFiles: ["authority/runtime.txt"],
+  }));
   installNativeAuthority(root, home);
   expect(await resolveNativeBinding(root, "ordinary-task", "Review this source", home)).toBeUndefined();
-  expect(existsSync(sentinel)).toBe(false);
-  await expect(resolveNativeBinding(root, "native-task", "VFMU_NATIVE_REQUEST_V1 " + "a".repeat(64) + "\noriginal", home)).rejects.toThrow();
-  expect(existsSync(sentinel)).toBe(true);
+  await expect(resolveNativeBinding(root, "native-task", "NATIVE_REQUEST " + "a".repeat(64) + "\noriginal", home)).rejects.toThrow();
 });
 
+test("workspace manifest can register an arbitrary native authority executable", async () => {
+  const { root } = fixture();
+  const home = join(root, "home"); mkdirSync(home);
+  mkdirSync(join(root, ".codex"), { recursive: true });
+  mkdirSync(join(root, "authority"), { recursive: true });
+  writeFileSync(join(root, "authority/runtime.js"), [
+    "let input = '';",
+    "process.stdin.setEncoding('utf8');",
+    "process.stdin.on('data', chunk => { input += chunk; });",
+    "process.stdin.on('end', () => process.stdout.write(JSON.stringify({ cwd: process.cwd(), request: JSON.parse(input) })));",
+    "",
+  ].join("\n"));
+  writeFileSync(join(root, ".codex/native-authority.json"), JSON.stringify({
+    executable: process.execPath,
+    args: ["{workspace}/authority/runtime.js"],
+    integrityFiles: ["authority/runtime.js"],
+  }));
+
+  const installed = installNativeAuthority(root, home);
+  expect(installed.args).toEqual([join(root, "authority/runtime.js")]);
+  const result = await callNativeAuthority(root, { operation: "probe", value: 7 }, home);
+  expect(result).toEqual({ cwd: root, request: { operation: "probe", value: 7 } });
+});
 test("reconciliation preserves existing job identity and never executes generation", async () => {
   const { root } = fixture();
   const store = new ImageFactoryStore(join(root, "state"));
@@ -112,7 +135,7 @@ test("reconciliation preserves existing job identity and never executes generati
     generateCalls++;
     return { status: "failed", artifacts: [] };
   }, () => true, {}, async () => { reconcileCalls++; return { status: "partial", artifacts: [] }; });
-  const parent = { threadId: "owner", environment: { cwd: root, roots: [root], writableRoots: [root],
+  const parent = { threadId: "owner", modelId: "gpt-5.6-sol", reasoning: "high", environment: { cwd: root, roots: [root], writableRoots: [root],
     sandboxPolicy: { type: "workspaceWrite" as const, writableRoots: [root], networkAccess: true }, tools: [] },
     signal: new AbortController().signal, activity: () => () => {} };
   const started = await service.call(parent, "chatgpt_image_generate", { request_id: "request-1", prompt: "Bowl", count: 1 });

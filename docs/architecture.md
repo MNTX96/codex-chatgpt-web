@@ -59,9 +59,10 @@ It never opens unrelated project rows to discover an ID. Missing or duplicate na
 The history-rate-limit modal interrupts navigation and pending clicks with a structured retryable
 429 (`rate_limit_exceeded`), which is also preserved in the image job journal.
 
-Image Factory submissions use the latest automatic ChatGPT model route and enforce Medium as the
-minimum thinking level. Instant/low is clamped to Medium, while supported High, Extra High, or Pro
-defaults are preserved. Luna-only accounts use Think (medium) for the same minimum-thinking policy.
+Image Factory submissions inherit the exact automatic ChatGPT model and reasoning effort selected
+by the parent Codex turn, including Luna/Think and Instant through Pro. Instant therefore submits
+with low reasoning as well; for multi-image requests this can make the returned image count less
+reliable, so users who need an exact count should select Medium or higher.
 Retained image conversations may keep Create image selected, hiding the effort slider; the worker
 restores Latest before setting the requested effort. Image edits wait for the source thumbnail to
 hydrate after the new user message commits. The helper updates its artifact metadata with the

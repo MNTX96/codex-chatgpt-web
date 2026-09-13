@@ -2404,7 +2404,7 @@ test("five browser tabs are a hard account-safety limit", async () => {
   );
 });
 
-test("VFMU admission counts its parent, child and retained views within two slots", async () => {
+test("native-authority admission counts its parent, child and retained views within two slots", async () => {
   const scope = "a".repeat(64);
   const tabs = new Map([
     ["parent", { nativeScope: scope, status: "running" }],

@@ -211,7 +211,7 @@ test("a transient effort control does not turn a Luna-only account into Sol", as
   expect(visibilityReads).toBe(2);
 });
 
-function reasoningPicker(options: { max?: string; delay?: number; missing?: boolean } = {}) {
+function reasoningPicker(options: { max?: string; delay?: number; missing?: boolean; fallbackMini?: boolean } = {}) {
   let value = 0;
   const keys: string[] = [];
   const hidden = {
@@ -242,10 +242,15 @@ function reasoningPicker(options: { max?: string; delay?: number; missing?: bool
   const control = {
     last() { return this; }, waitFor: async () => {}, isVisible: async () => true,
     getAttribute: async (name: string) => name === "aria-expanded" ? "true" : null,
+    innerText: async () => options.fallbackMini ? "GPT-5.5-mini" : "Latest",
   };
   const composer = { filter() { return this; }, last() { return this; }, locator: () => ({ locator: () => control }) };
   const modelRows = { count: async () => 3, first() { return this; }, waitFor: async () => {}, nth: () => { throw new Error("Model rows are not effort choices"); } };
-  const menu = { filter() { return this; }, last() { return this; }, isVisible: async () => true, locator: () => modelRows, getByRole: () => hidden };
+  const menu = {
+    filter() { return this; }, last() { return this; }, isVisible: async () => true,
+    locator: () => modelRows, getByRole: () => hidden,
+    innerText: async () => options.fallbackMini ? "GPT-5.5-mini" : "Latest",
+  };
   const page = {
     locator: (selector: string) => {
       if (selector === CHATGPT_COMPOSER_SELECTOR) return composer;
@@ -281,4 +286,20 @@ test("Pro selection changes the hidden slider through its visible owner, never t
   await select.call({ activeComposer: async () => fixture.composer }, fixture.page, "gpt-5.6-sol", "max", { localToolsEnabled: false, solAvailable: true, proAvailable: true });
   expect(fixture.keys).toEqual(["ArrowRight", "ArrowRight", "ArrowRight", "ArrowRight"]);
   expect(fixture.value()).toBe(4);
+});
+
+test("account-limit GPT-5.5-mini fallback continues when the requested effort is no longer exposed", async () => {
+  const fixture = reasoningPicker({ max: "2", fallbackMini: true });
+  const select = (ChatGptBrowserWorker.prototype as unknown as {
+    selectModelAndEffort(...args: unknown[]): Promise<{ displayLabel: string; effort: string }>;
+  }).selectModelAndEffort;
+
+  await expect(select.call(
+    { activeComposer: async () => fixture.composer },
+    fixture.page,
+    "gpt-5.6-sol",
+    "max",
+    { localToolsEnabled: false, solAvailable: true, proAvailable: true },
+  )).resolves.toMatchObject({ displayLabel: "Pro", effort: "max" });
+  expect(fixture.keys).toEqual([]);
 });

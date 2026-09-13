@@ -39,7 +39,7 @@ export class LauncherManualTurnFailedError extends Error {
 export interface LauncherBrowserHostDescriptor {
   version: 3;
   features?: string[];
-  nativeBuild?: { launcher_sha256: string; started_at: string; max_vfmu_tabs: number };
+  nativeBuild?: { launcher_sha256: string; started_at: string; max_native_tabs: number };
   kind: typeof LAUNCHER_BROWSER_HOST_KIND;
   profile: LauncherBrowserHostProfile;
   pid: number;
@@ -95,7 +95,7 @@ function assertDescriptorShape(value: unknown): LauncherBrowserHostDescriptor {
   if (descriptor.nativeBuild !== undefined && (!descriptor.nativeBuild
     || !/^[a-f0-9]{64}$/.test(descriptor.nativeBuild.launcher_sha256)
     || Number.isNaN(Date.parse(descriptor.nativeBuild.started_at))
-    || descriptor.nativeBuild.max_vfmu_tabs !== 2)) {
+    || descriptor.nativeBuild.max_native_tabs !== 2)) {
     throw new Error("Launcher native build identity is invalid");
   }
   if (descriptor.profile !== "production" && descriptor.profile !== "development") {

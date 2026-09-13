@@ -1,4 +1,4 @@
-import { NativeBrowserAuthority, type NativeBindingSpec, type NativeImageReconcile } from "./native-authority";
+import { NATIVE_AUTHORITY_PROTOCOL, NativeBrowserAuthority, type NativeBindingSpec, type NativeImageReconcile } from "./native-authority";
 import { readLauncherBrowserHostDescriptor } from "../../launcher-browser-host";
 import { chatGptRateLimitDialog, throwIfChatGptRateLimitDialog, withChatGptNavigationGuard } from "./rate-limit";
 import { observeChatGptConversationResponses } from "./browser-network-diagnostics";
@@ -261,6 +261,7 @@ function chatGptConnectorUnavailableError(message: string): ChatGptWebAdapterErr
 }
 
 const CHATGPT_MODEL_CONTROL_UNAVAILABLE_MESSAGE = "ChatGPT model controls are unavailable. The next prompt was not sent. Verify the model and thinking setting in ChatGPT, then retry.";
+const CHATGPT_ACCOUNT_LIMIT_MINI_FALLBACK = /\bGPT[\s-]*5(?:\.5)?[\s-]*mini\b/i;
 
 function chatGptModelControlUnavailableError(diagnostic: string): Error {
   return chatGptModelControlUnavailableAdapterError(diagnostic);
@@ -2706,6 +2707,25 @@ export class ChatGptBrowserWorker {
     }
     const effortSlider = activation.slider;
     const sliderContainer = activation.sliderContainer;
+    const accountLimitMiniFallbackActive = async (): Promise<boolean> => {
+      const readText = async (scope: Locator): Promise<string> => {
+        const innerText = scope.innerText;
+        return typeof innerText === "function" ? innerText.call(scope) : "";
+      };
+      const [controlResult, menuResult] = await Promise.allSettled([
+        readText(currentEffort),
+        readText(activation.menu),
+      ]);
+      const controlText = controlResult.status === "fulfilled" ? controlResult.value : "";
+      const menuText = menuResult.status === "fulfilled" ? menuResult.value : "";
+      return CHATGPT_ACCOUNT_LIMIT_MINI_FALLBACK.test(`${controlText}\n${menuText}`);
+    };
+    const acceptAccountLimitMiniFallback = async (): Promise<boolean> => {
+      if (!await accountLimitMiniFallbackActive()) return false;
+      await captureDiagnostic?.("account-limit-mini-fallback-accepted");
+      await page.keyboard.press("Escape");
+      return true;
+    };
     const waitAbort = new AbortController();
     try {
       const waitForSlider = async () => {
@@ -2717,6 +2737,7 @@ export class ChatGptBrowserWorker {
           await throwIfChatGptRateLimitDialog(page);
           await throwIfChatGptSessionFailureAlert(page);
           if (await activation.menu.locator('[data-model-selection-view][data-has-slider="false"]').count() > 0) {
+            if (await accountLimitMiniFallbackActive()) return "account-limit-mini-fallback" as const;
             throw chatGptModelControlUnavailableAdapterError("The active model picker explicitly reports that no thinking slider is available");
           }
           // A post-ACK re-render can dismiss the picker after activation was observed. Reopen only
@@ -2738,6 +2759,11 @@ export class ChatGptBrowserWorker {
       ]);
       if (ready === "rate-limit") await throwIfChatGptRateLimitDialog(page);
       if (ready === "session-expired") await throwIfChatGptSessionFailureAlert(page);
+      if (ready === "account-limit-mini-fallback") {
+        await captureDiagnostic?.("account-limit-mini-fallback-accepted");
+        await page.keyboard.press("Escape");
+        return mode;
+      }
       await captureDiagnostic?.("effort-slider-visible");
     } catch (error) {
       if (error instanceof ChatGptWebAdapterError) throw error;
@@ -2755,12 +2781,14 @@ export class ChatGptBrowserWorker {
       await effortSlider.getAttribute("aria-valuenow"),
     );
     if (!sliderState) {
+      if (await acceptAccountLimitMiniFallback()) return mode;
       throw chatGptModelControlUnavailableAdapterError(
         "ChatGPT effort slider exposed an invalid ARIA range",
       );
     }
     const targetValue = sliderState.min + uiEffortIndex;
     if (targetValue > sliderState.max) {
+      if (await acceptAccountLimitMiniFallback()) return mode;
       const proUsageLimitHint = uiEffortIndex === 4 && sliderState.min === 0 && sliderState.max === 3
         ? " If you have made many Pro requests recently, ChatGPT may have temporarily hidden Pro because you reached its usage limit."
         : "";
@@ -4965,7 +4993,7 @@ export class ChatGptBrowserWorker {
     const nativeAbort = new AbortController();
     if (turn.nativeBinding) {
       turn = { ...turn, abortSignal: turn.abortSignal ? AbortSignal.any([turn.abortSignal, nativeAbort.signal]) : nativeAbort.signal };
-      if (this.config.browserHost !== "launcher" || !readLauncherBrowserHostDescriptor(this.config.browserHostDescriptorPath!).features?.includes("vfmu-native-authority-v1")) {
+      if (this.config.browserHost !== "launcher" || !readLauncherBrowserHostDescriptor(this.config.browserHostDescriptorPath!).features?.includes(NATIVE_AUTHORITY_PROTOCOL)) {
         throw new Error("native_launcher_restart_required");
       }
       turn.nativeAuthority = new NativeBrowserAuthority(turn.nativeBinding!);

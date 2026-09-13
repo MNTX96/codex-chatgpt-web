@@ -47,7 +47,9 @@ turn remains in Temporary Chat; the image child runs in a regular ChatGPT conver
 Project-only-memory `Image Factory` project and saves verified artifacts in the workspace. A single
 job can request 1–4 separate images, download each verified card, and edit a saved Image Factory
 artifact into 1–4 variants in that same retained image conversation. This uses the signed-in ChatGPT
-account's image availability and limits and does not add an Images model.
+account's image availability and limits and does not add an Images model. The child inherits the
+parent Codex model and reasoning effort. With Instant, that means low reasoning, which can make the
+requested count less reliable for multi-image jobs; choose Medium or higher when exact count matters.
 
 > [!TIP]
 > I also built **[ChatGPT Persona Voice](https://github.com/miuuyy/ChatGPT-Persona-Voice)**, a local

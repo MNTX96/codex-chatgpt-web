@@ -1,12 +1,12 @@
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
-import { isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { atomicWriteFile, getConfigDir, loadConfig } from "../../config";
 import { readLauncherBrowserHostDescriptor } from "../../launcher-browser-host";
 import type { OutputImageArtifact, OutputImageCaptureResult } from "./artifacts/types";
 
-export const NATIVE_AUTHORITY_PROTOCOL = "vfmu-native-authority-v1";
+export const NATIVE_AUTHORITY_PROTOCOL = "native-authority";
 const hash = (value: string | Uint8Array) => createHash("sha256").update(value).digest("hex");
 const digest = /^[a-f0-9]{64}$/;
 const identity = /^[A-Za-z0-9_:-]{1,160}$/;
@@ -36,12 +36,43 @@ export interface NativeImageReconcile {
   userTurnId: string;
   excludeCandidateKeys: string[];
 }
+interface NativeAuthorityManifest {
+  executable: string;
+  args: string[];
+  integrityFiles: string[];
+}
 interface Registration {
   workspace: string;
-  python: string;
-  pythonSha256: string;
-  authoritySha256: string;
-  cliSha256: string;
+  executable: string;
+  executableSha256: string;
+  args: string[];
+  integrityFiles: Array<{ path: string; sha256: string }>;
+}
+
+export const NATIVE_REQUEST_MARKER = "NATIVE_REQUEST ";
+const NATIVE_AUTHORITY_MANIFEST = join(".codex", "native-authority.json");
+const NATIVE_AUTHORITY_REGISTRY = "native-authorities.json";
+
+function pathInside(root: string, candidate: string): boolean {
+  const rel = relative(root, candidate);
+  return rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel));
+}
+
+function readNativeAuthorityManifest(root: string): NativeAuthorityManifest {
+  const path = join(root, NATIVE_AUTHORITY_MANIFEST);
+  if (!existsSync(path)) throw new Error("native_authority_manifest_missing");
+  const stat = lstatSync(path);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 1_000_000) {
+    throw new Error("native_authority_manifest_invalid");
+  }
+  const value = JSON.parse(readFileSync(path, "utf8")) as Partial<NativeAuthorityManifest>;
+  if (typeof value.executable !== "string" || !value.executable.trim()
+    || !Array.isArray(value.args) || value.args.some(arg => typeof arg !== "string" || arg.includes("\0"))
+    || !Array.isArray(value.integrityFiles) || value.integrityFiles.length === 0
+    || value.integrityFiles.some(file => typeof file !== "string" || !file.trim())) {
+    throw new Error("native_authority_manifest_invalid");
+  }
+  return { executable: value.executable, args: value.args, integrityFiles: value.integrityFiles };
 }
 interface Binding {
   request_sha256: string;
@@ -60,16 +91,22 @@ interface Binding {
   };
 }
 
-/** Explicit installation writes only nonsecret workspace authority, never credentials. */
+/** Explicit installation snapshots a workspace-owned authority manifest and never stores credentials. */
 export function installNativeAuthority(workspace: string, directory = getConfigDir()): Registration {
   const root = realpathSync(workspace);
-  const python = join(root, ".venv/bin/python");
-  const authority = join(root, "src/vfmu_pipeline/native_runtime.py");
-  const cli = join(root, "src/vfmu_pipeline/cli.py");
-  const value: Registration = { workspace: root, python,
-    pythonSha256: hash(readFileSync(realpathSync(python))),
-    authoritySha256: hash(readFileSync(authority)), cliSha256: hash(readFileSync(cli)) };
-  const path = join(directory, "vfmu-authorities.json");
+  const manifest = readNativeAuthorityManifest(root);
+  const executable = realpathSync(isAbsolute(manifest.executable)
+    ? manifest.executable
+    : resolve(root, manifest.executable));
+  const args = manifest.args.map(arg => arg.replaceAll("{workspace}", root));
+  const integrityFiles = manifest.integrityFiles.map(file => {
+    const path = realpathSync(isAbsolute(file) ? file : resolve(root, file));
+    if (!pathInside(root, path)) throw new Error("native_authority_manifest_invalid");
+    return { path, sha256: hash(readFileSync(path)) };
+  });
+  const value: Registration = { workspace: root, executable, executableSha256: hash(readFileSync(executable)),
+    args, integrityFiles };
+  const path = join(directory, NATIVE_AUTHORITY_REGISTRY);
   const previous = existsSync(path) ? readRegistrations(path) : {};
   previous[root] = value;
   atomicWriteFile(path, JSON.stringify({ version: 1, workspaces: previous }, null, 2) + "\n", { mode: 0o600 });
@@ -128,7 +165,7 @@ export async function inspectLoadedNativeRuntime(workspace: string, canaryId: st
     runtime_started_at: health.native_runtime.started_at, helper_started_at: helper.started_at,
     launcher_sha256: descriptor.nativeBuild.launcher_sha256,
     helper_sha256: helper.helper_sha256, runtime_sha256: health.native_runtime.sha256,
-    mode: health.mode, max_browser_tabs: descriptor.nativeBuild.max_vfmu_tabs,
+    mode: health.mode, max_browser_tabs: descriptor.nativeBuild.max_native_tabs,
     protocols: [...new Set([...(descriptor.features ?? []), ...(helper.features ?? [])])],
     observed_limits: helper.observed_limits, tool_schema_hashes: helper.tool_schema_hashes,
     limits_source: "BRIDGE_PROTOCOL_NOT_PROVIDER_QUALIFICATION" };
@@ -146,15 +183,30 @@ function readRegistrations(path: string): Record<string, Registration> {
 }
 
 function registration(workspace: string, directory = getConfigDir()): Registration | undefined {
-  const path = join(directory, "vfmu-authorities.json");
+  const path = join(directory, NATIVE_AUTHORITY_REGISTRY);
   if (!existsSync(path)) return undefined;
   const root = realpathSync(workspace);
   const value = readRegistrations(path)[root];
   if (!value) return undefined;
-  if (value.workspace !== root || value.python !== join(root, ".venv/bin/python")
-    || hash(readFileSync(realpathSync(value.python))) !== value.pythonSha256
-    || hash(readFileSync(join(root, "src/vfmu_pipeline/native_runtime.py"))) !== value.authoritySha256
-    || hash(readFileSync(join(root, "src/vfmu_pipeline/cli.py"))) !== value.cliSha256) {
+  const validShape = value.workspace === root
+    && typeof value.executable === "string"
+    && digest.test(value.executableSha256)
+    && Array.isArray(value.args)
+    && value.args.every(arg => typeof arg === "string" && !arg.includes("\0"))
+    && Array.isArray(value.integrityFiles)
+    && value.integrityFiles.length > 0
+    && value.integrityFiles.every(file => typeof file?.path === "string" && digest.test(file.sha256));
+  if (!validShape) throw new Error("native_authority_registry_invalid");
+  let executable: string;
+  try { executable = realpathSync(value.executable); }
+  catch { throw new Error("native_authority_installation_drift"); }
+  if (executable !== value.executable || hash(readFileSync(executable)) !== value.executableSha256
+    || value.integrityFiles.some(file => {
+      try {
+        const path = realpathSync(file.path);
+        return path !== file.path || !pathInside(root, path) || hash(readFileSync(path)) !== file.sha256;
+      } catch { return true; }
+    })) {
     throw new Error("native_authority_installation_drift");
   }
   return value;
@@ -173,8 +225,7 @@ export async function callNativeAuthority(
   if (!trusted) throw new Error("native_authority_not_installed");
   // No shell, no model-provided executable/argv/environment, and no credential reads.
   return new Promise((resolveResult, reject) => {
-    const child = spawn(trusted.python, ["-m", "vfmu_pipeline.cli", "--workspace", trusted.workspace,
-      "runtime", "native-authority"], { cwd: trusted.workspace, stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn(trusted.executable, trusted.args, { cwd: trusted.workspace, stdio: ["pipe", "pipe", "pipe"] });
     let stdout = "";
     let overflow = false;
     const timer = setTimeout(() => { child.kill("SIGTERM"); reject(new Error("native_authority_timeout")); }, 20_000);
@@ -202,14 +253,14 @@ export async function callNativeAuthority(
 export async function resolveNativeBinding(
   workspace: string, threadId: string, currentInstruction: string, directory = getConfigDir(),
 ): Promise<NativeBindingSpec | undefined> {
-  const marker = /^VFMU_NATIVE_REQUEST_V1 ([a-f0-9]{64})(?:\n|$)/.exec(currentInstruction);
+  const marker = new RegExp(`^${NATIVE_REQUEST_MARKER}([a-f0-9]{64})(?:\\n|$)`).exec(currentInstruction);
   const installed = registration(workspace, directory);
   if (!installed) {
     if (marker) throw new Error("native_authority_not_installed");
     return undefined;
   }
   const ownerPath = join(directory, "runtime/native-thread-bindings", hash(realpathSync(workspace) + "\0" + threadId) + ".json");
-  // Ordinary tasks in the same workspace are not VFMU transactions. Do not invoke
+  // Ordinary tasks in the same workspace are not native-authority transactions. Do not invoke
   // its CLI, inspect its database, or enroll a task just because its cwd matches.
   if (!marker && !existsSync(ownerPath)) return undefined;
   const loaded = marker

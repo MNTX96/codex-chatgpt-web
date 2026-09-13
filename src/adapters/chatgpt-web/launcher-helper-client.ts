@@ -332,8 +332,8 @@ export class LauncherBrowserHelperClient {
     if (turn.outputArtifactTarget && !this.helperFeatures.has("output-artifact-v1")) {
       throw new Error("Launcher browser helper does not support output artifacts; update or restart the launcher");
     }
-    if (turn.nativeBinding && !this.helperFeatures.has("vfmu-native-authority-v1")) {
-      throw new Error("Launcher helper lacks vfmu-native-authority-v1; wait for the user's Launcher restart");
+    if (turn.nativeBinding && !this.helperFeatures.has("native-authority")) {
+      throw new Error("Launcher helper lacks native-authority; wait for the user's Launcher restart");
     }
     if (turn.executionTarget?.output === "image" && !this.helperFeatures.has("image-factory-v1")) {
       throw new Error(

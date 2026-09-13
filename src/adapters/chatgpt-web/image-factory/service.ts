@@ -32,6 +32,8 @@ export interface ImageFactoryBrowserRequest {
 export interface ImageJobExecution {
   nativeBinding?: NativeBindingSpec;
   request: ImageFactoryBrowserRequest;
+  modelId: string;
+  reasoning?: string;
   operation: ImageFactoryOperation;
   requestedCount: number;
   sourceArtifactId?: string;
@@ -52,6 +54,8 @@ export interface ImageFactoryBrowserUpdate {
 export interface ImageFactoryParent {
   nativeBinding?: NativeBindingSpec;
   threadId: string;
+  modelId: string;
+  reasoning?: string;
   environment: ChatGptTurnEnvironment;
   signal: AbortSignal;
   activity: () => () => void;
@@ -329,6 +333,8 @@ export class ImageFactoryService {
       const executionResult = await this.execute({
         ...(nativeBinding ? { nativeBinding } : {}),
         request: { stateDirectory: this.store.directory, session: session!, jobId, jobKey: key, sourceTurnId: parent.threadId },
+        modelId: parent.modelId,
+        reasoning: parent.reasoning,
         operation,
         requestedCount: input.count,
         ...(sourceArtifactId ? { sourceArtifactId } : {}),

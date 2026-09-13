@@ -565,10 +565,11 @@ async function main(): Promise<void> {
       return;
     }
     if (action !== "install" || canaryId) throw new Error("Use native-authority install --workspace PATH or inspect --workspace PATH --canary-id ID");
-    const { installNativeAuthority } = await import("./adapters/chatgpt-web/native-authority");
+    const { installNativeAuthority, NATIVE_AUTHORITY_PROTOCOL } = await import("./adapters/chatgpt-web/native-authority");
     const installed = installNativeAuthority(workspace);
-    stdout.write(JSON.stringify({ protocol: "vfmu-native-authority-v1", workspace: installed.workspace,
-      authoritySha256: installed.authoritySha256, restartRequired: true }) + "\n");
+    stdout.write(JSON.stringify({ protocol: NATIVE_AUTHORITY_PROTOCOL, workspace: installed.workspace,
+      executableSha256: installed.executableSha256, integrityFiles: installed.integrityFiles,
+      restartRequired: true }) + "\n");
   }
   else if (command === "setup") await setupCommand(args);
   else if (command === "login") await loginCommand(args);

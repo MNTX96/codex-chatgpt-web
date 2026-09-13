@@ -709,9 +709,9 @@ process.once("SIGTERM", () => {
 
 // Advertise the optional frames this helper understands so the daemon can negotiate them explicitly.
 if (process.argv.includes("--native-runtime-info")) {
-  writeProtocol({ protocol: "vfmu-native-authority-v1", helper_sha256: LOADED_RUNTIME_IDENTITY.sha256,
+  writeProtocol({ protocol: "native-authority", helper_sha256: LOADED_RUNTIME_IDENTITY.sha256,
     started_at: LOADED_RUNTIME_IDENTITY.started_at, tool_schema_hashes: imageToolSchemaHashes(),
-    features: ["image-transfer-v1", "image-factory-v2", "vfmu-native-authority-v1"],
+    features: ["image-transfer-v1", "image-factory-v2", "native-authority"],
     observed_limits: { max_stable_parallel_dispatches: 2, image_job_deadline_seconds: IMAGE_FACTORY_TIMEOUTS.job / 1000,
       image_reference_limit: 10, image_upload_max_bytes: 20_000_000 } });
   process.exit(0);
@@ -727,7 +727,7 @@ writeProtocol({
     "image-factory-v1",
     "image-factory-v2",
     "image-transfer-v1",
-    "vfmu-native-authority-v1",
+    "native-authority",
     "follow-up-v1",
   ],
 });

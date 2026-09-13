@@ -8,7 +8,7 @@ for (const name of fs.readdirSync(__dirname).filter(name => name.endsWith('.cjs'
 const NATIVE_LOADED_LAUNCHER = Object.freeze({
   launcher_sha256: nativeLauncherHash.digest('hex'),
   started_at: new Date(Date.now() - process.uptime() * 1000).toISOString(),
-  max_vfmu_tabs: 2,
+  max_native_tabs: 2,
 });
 const { clipboard, WebContentsView, powerMonitor, powerSaveBlocker, shell } = require("electron");
 const { writePrivateFileAtomic } = require("./atomic-file.cjs");
@@ -538,7 +538,7 @@ class BrowserHost {
       if (typeof nativeScope !== "string" || !/^[a-f0-9]{64}$/.test(nativeScope)) {
         throw new Error("native_scope_invalid");
       }
-      // Count retained views too. Never evict another task to make a VFMU slot.
+      // Count retained views too. Never evict another task to make a native-authority slot.
       if ([...this.turnTabs.values()].filter(tab => tab.nativeScope === nativeScope).length >= 2) {
         throw new Error("native_two_tab_capacity_exhausted");
       }
@@ -2959,7 +2959,7 @@ class BrowserHost {
     const descriptor = {
       version: 3,
       kind: "codex-web-gpt-launcher",
-      features: [IMAGE_DOWNLOAD_FEATURE, "vfmu-native-authority-v1"],
+      features: [IMAGE_DOWNLOAD_FEATURE, "native-authority"],
       nativeBuild: NATIVE_LOADED_LAUNCHER,
       profile: this.profile,
       pid: process.pid,
