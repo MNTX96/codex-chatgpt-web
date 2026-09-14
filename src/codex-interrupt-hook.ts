@@ -144,68 +144,210 @@ function locateCodexInterruptHook(text: string, installed: InstalledCodexInterru
   const ownedPrefix = installed.fragment.slice(0, marker);
   // Native config writes normalize CRLF to LF; commands and owned fields must still match exactly.
   const pattern = new RegExp(hookTextPattern(ownedPrefix), "g");
-  const match = pattern.exec(text);
-  if (!match || pattern.exec(text)) {
-    throw new Error("Codex interrupt lifecycle hook changed after setup; refusing to overwrite it");
-  }
-  const first = match.index;
-  const ownedEnd = first + match[0].length;
-  if (interruptGroupCount(text.slice(0, first)) !== installed.groupIndex) {
-    throw new Error("Codex interrupt lifecycle hook order changed after setup; refusing to overwrite it");
-  }
-  const endMarker = text.indexOf(MANAGED_INTERRUPT_HOOK_END);
-  if (managedMarkerCount(text) !== 1 || endMarker < 0
-    || (endMarker >= first && endMarker < ownedEnd)
-    || text.split(MANAGED_INTERRUPT_HOOK_END).length !== 2) {
-    throw new Error("Codex interrupt lifecycle hook markers changed after setup; refusing to overwrite them");
-  }
-  if (endMarker < first) {
-    // A moved comment is independent of the owned definitions. Prove it is still a comment,
-    // rather than matching text inside an unrelated TOML value, before removing it separately.
-    const precedingConfig = text.slice(0, first);
-    const withoutMarker = precedingConfig.slice(0, endMarker)
-      + precedingConfig.slice(endMarker + MANAGED_INTERRUPT_HOOK_END.length);
-    try {
-      if (JSON.stringify(canonicalJson(Bun.TOML.parse(precedingConfig)))
-        !== JSON.stringify(canonicalJson(Bun.TOML.parse(withoutMarker)))) {
-        throw new Error("Marker removal changes TOML values");
-      }
-    } catch {
+  let match = pattern.exec(text);
+  let duplicate = match ? pattern.exec(text) : null;
+
+  if (match && !duplicate) {
+    const first = match.index;
+    const ownedEnd = first + match[0].length;
+    if (interruptGroupCount(text.slice(0, first)) !== installed.groupIndex) {
+      throw new Error("Codex interrupt lifecycle hook order changed after setup; refusing to overwrite it");
+    }
+    const endMarker = text.indexOf(MANAGED_INTERRUPT_HOOK_END);
+    if (managedMarkerCount(text) !== 1 || endMarker < 0
+      || (endMarker >= first && endMarker < ownedEnd)
+      || text.split(MANAGED_INTERRUPT_HOOK_END).length !== 2) {
       throw new Error("Codex interrupt lifecycle hook markers changed after setup; refusing to overwrite them");
     }
+    if (endMarker < first) {
+      // A moved comment is independent of the owned definitions. Prove it is still a comment,
+      // rather than matching text inside an unrelated TOML value, before removing it separately.
+      const precedingConfig = text.slice(0, first);
+      const withoutMarker = precedingConfig.slice(0, endMarker)
+        + precedingConfig.slice(endMarker + MANAGED_INTERRUPT_HOOK_END.length);
+      try {
+        if (JSON.stringify(canonicalJson(Bun.TOML.parse(precedingConfig)))
+          !== JSON.stringify(canonicalJson(Bun.TOML.parse(withoutMarker)))) {
+          throw new Error("Marker removal changes TOML values");
+        }
+      } catch {
+        throw new Error("Codex interrupt lifecycle hook markers changed after setup; refusing to overwrite them");
+      }
+    }
+    if (codexInterruptHookHash(installed.command) !== installed.trustedHash) {
+      throw new Error("Codex interrupt lifecycle hook journal hash is invalid");
+    }
+    // Codex's TOML editor inserts new tables before trailing comments. The end marker can therefore
+    // move past unrelated config even though the owned hook fields remain unchanged.
+    const appendedConfig = text.slice(ownedEnd, endMarker < first ? undefined : endMarker);
+    const firstAssignment = appendedConfig.split(/\r\n|\n|\r/)
+      .map(line => line.trim()).find(line => line && !line.startsWith("#"));
+    if (firstAssignment && !/^\[\[?.+\]\]?(?:\s*#.*)?$/.test(firstAssignment)) {
+      throw new Error("Codex interrupt lifecycle hook changed after setup; refusing to overwrite it");
+    }
+    if (firstAssignment) {
+      // A later table can also extend the owned hook or trust state. Compare those exact
+      // definitions with Bun's TOML parser before treating the inserted tables as unrelated.
+      const ownedDefinitions = (fragment: string): string => {
+        const { hooks } = Bun.TOML.parse(fragment) as {
+          hooks: { Interrupt: unknown[]; state: Record<string, unknown> };
+        };
+        return JSON.stringify(canonicalJson([hooks.Interrupt[0], hooks.state[installed.stateKey]]));
+      };
+      try {
+        if (ownedDefinitions(ownedPrefix) !== ownedDefinitions(ownedPrefix + appendedConfig)) {
+          throw new Error("Modified owned definitions");
+        }
+      } catch {
+        throw new Error("Codex interrupt lifecycle hook changed after setup; refusing to overwrite it");
+      }
+    }
+    const end = endMarker + MANAGED_INTERRUPT_HOOK_END.length;
+    const trailing = installed.fragment.slice(marker + MANAGED_INTERRUPT_HOOK_END.length);
+    const trailingLength = new RegExp("^" + hookTextPattern(trailing)).exec(text.slice(end))?.[0].length ?? 0;
+    return [{ start: first, end: ownedEnd }, { start: endMarker, end: end + trailingLength }];
   }
-  if (codexInterruptHookHash(installed.command) !== installed.trustedHash) {
-    throw new Error("Codex interrupt lifecycle hook journal hash is invalid");
-  }
-  // Codex's TOML editor inserts new tables before trailing comments. The end marker can therefore
-  // move past unrelated config even though the owned hook fields remain unchanged.
-  const appendedConfig = text.slice(ownedEnd, endMarker < first ? undefined : endMarker);
-  const firstAssignment = appendedConfig.split(/\r\n|\n|\r/)
-    .map(line => line.trim()).find(line => line && !line.startsWith("#"));
-  if (firstAssignment && !/^\[\[?.+\]\]?(?:\s*#.*)?$/.test(firstAssignment)) {
+
+  // Fallback for Codex TOML normalization
+  let parsed: any;
+  try {
+    parsed = Bun.TOML.parse(text);
+  } catch {
     throw new Error("Codex interrupt lifecycle hook changed after setup; refusing to overwrite it");
   }
-  if (firstAssignment) {
-    // A later table can also extend the owned hook or trust state. Compare those exact
-    // definitions with Bun's TOML parser before treating the inserted tables as unrelated.
-    const ownedDefinitions = (fragment: string): string => {
-      const { hooks } = Bun.TOML.parse(fragment) as {
-        hooks: { Interrupt: unknown[]; state: Record<string, unknown> };
-      };
-      return JSON.stringify(canonicalJson([hooks.Interrupt[0], hooks.state[installed.stateKey]]));
-    };
-    try {
-      if (ownedDefinitions(ownedPrefix) !== ownedDefinitions(ownedPrefix + appendedConfig)) {
-        throw new Error("Modified owned definitions");
-      }
-    } catch {
+
+  const interrupts = parsed.hooks?.Interrupt;
+  if (!Array.isArray(interrupts) || interrupts.length <= installed.groupIndex) {
+    throw new Error("Codex interrupt lifecycle hook changed after setup; refusing to overwrite it");
+  }
+  const hookDef = interrupts[installed.groupIndex];
+  if (!hookDef || !Array.isArray(hookDef.hooks) || hookDef.hooks.length !== 1) {
+    throw new Error("Codex interrupt lifecycle hook changed after setup; refusing to overwrite it");
+  }
+  const cmdHook = hookDef.hooks[0];
+  if (cmdHook.type !== "command" || cmdHook.command !== installed.command || cmdHook.timeout !== 3) {
+    throw new Error("Codex interrupt lifecycle hook changed after setup; refusing to overwrite it");
+  }
+  if (Object.hasOwn(cmdHook, "async") && cmdHook.async !== false) {
+    throw new Error("Codex interrupt lifecycle hook changed after setup; refusing to overwrite it");
+  }
+  const allowedKeys = new Set(["type", "command", "timeout", "async"]);
+  for (const key of Object.keys(cmdHook)) {
+    if (!allowedKeys.has(key)) {
       throw new Error("Codex interrupt lifecycle hook changed after setup; refusing to overwrite it");
     }
   }
-  const end = endMarker + MANAGED_INTERRUPT_HOOK_END.length;
+  if (Object.keys(hookDef).length !== 1) {
+    throw new Error("Codex interrupt lifecycle hook changed after setup; refusing to overwrite it");
+  }
+
+  let managedInterruptCount = 0;
+  for (const interrupt of interrupts) {
+    if (Array.isArray(interrupt.hooks)) {
+      for (const h of interrupt.hooks) {
+        if (h.type === "command" && h.command === installed.command) {
+          managedInterruptCount++;
+        }
+      }
+    }
+  }
+  if (managedInterruptCount !== 1) {
+    throw new Error("Codex interrupt lifecycle hook changed after setup; refusing to overwrite it");
+  }
+
+  const stateTable = parsed.hooks?.state;
+  if (!stateTable || typeof stateTable !== "object" || !Object.hasOwn(stateTable, installed.stateKey)) {
+    throw new Error("Codex interrupt lifecycle hook changed after setup; refusing to overwrite it");
+  }
+  const myState = stateTable[installed.stateKey];
+  if (myState.trusted_hash !== installed.trustedHash) {
+    throw new Error("Codex interrupt lifecycle hook changed after setup; refusing to overwrite it");
+  }
+  if (Object.keys(myState).length !== 1) {
+    throw new Error("Codex interrupt lifecycle hook changed after setup; refusing to overwrite it");
+  }
+
+  if (codexInterruptHookHash(installed.command) !== installed.trustedHash) {
+    throw new Error("Codex interrupt lifecycle hook journal hash is invalid");
+  }
+
+  if (managedMarkerCount(text) !== 1 || text.split(MANAGED_INTERRUPT_HOOK_END).length - 1 !== 1) {
+    throw new Error("Codex interrupt lifecycle hook markers changed after setup; refusing to overwrite them");
+  }
+  const startMarkerIndex = text.indexOf(MANAGED_INTERRUPT_HOOK_START);
+  const endMarkerIndex = text.indexOf(MANAGED_INTERRUPT_HOOK_END);
+  if (startMarkerIndex > endMarkerIndex) {
+    throw new Error("Codex interrupt lifecycle hook changed after setup; refusing to overwrite it");
+  }
+
+  const textWithoutMarkers = text
+    .replace(MANAGED_INTERRUPT_HOOK_START, "")
+    .replace(MANAGED_INTERRUPT_HOOK_END, "");
+  let parsedWithoutMarkers: any;
+  try {
+    parsedWithoutMarkers = Bun.TOML.parse(textWithoutMarkers);
+  } catch {
+    throw new Error("Codex interrupt lifecycle hook markers changed after setup; refusing to overwrite them");
+  }
+  if (JSON.stringify(canonicalJson(parsedWithoutMarkers)) !== JSON.stringify(canonicalJson(parsed))) {
+    throw new Error("Codex interrupt lifecycle hook markers changed after setup; refusing to overwrite them");
+  }
+
+  const escapedKey = installed.stateKey.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const stateHeaderRegex = new RegExp(`\\[\\s*hooks\\.state\\.["']${escapedKey}["']\\s*\\]`);
+  const stateHeaderMatch = stateHeaderRegex.exec(text);
+  if (!stateHeaderMatch) {
+    throw new Error("Codex interrupt lifecycle hook changed after setup; refusing to overwrite it");
+  }
+  const sH_idx = stateHeaderMatch.index;
+  
+  const nextBracket = text.indexOf('[', sH_idx + 1);
+  const searchArea = text.slice(sH_idx, nextBracket > -1 ? nextBracket : text.length);
+  const hashRegex = /trusted_hash\s*=\s*["']([^"']+)["']/;
+  const hashMatch = hashRegex.exec(searchArea);
+  if (!hashMatch || hashMatch[1] !== installed.trustedHash) {
+    throw new Error("Codex interrupt lifecycle hook changed after setup; refusing to overwrite it");
+  }
+  const sHash_idx = sH_idx + hashMatch.index;
+  let sHash_end = text.indexOf('\n', sHash_idx);
+  if (sHash_end < 0) sHash_end = text.length;
+
+  let stateStart = sH_idx;
+  while (stateStart > 0 && (text[stateStart - 1] === ' ' || text[stateStart - 1] === '\t')) stateStart--;
+  if (stateStart > 0 && text[stateStart - 1] === '\n') {
+      stateStart--;
+      if (stateStart > 0 && text[stateStart - 1] === '\r') stateStart--;
+  }
+  let stateEnd = sHash_end;
+  while (stateEnd < text.length && (text[stateEnd] === ' ' || text[stateEnd] === '\t')) stateEnd++;
+  if (stateEnd < text.length && text[stateEnd] === '\r') stateEnd++;
+  if (stateEnd < text.length && text[stateEnd] === '\n') stateEnd++;
+
+  const endMarkerEnd = endMarkerIndex + MANAGED_INTERRUPT_HOOK_END.length;
   const trailing = installed.fragment.slice(marker + MANAGED_INTERRUPT_HOOK_END.length);
-  const trailingLength = new RegExp("^" + hookTextPattern(trailing)).exec(text.slice(end))?.[0].length ?? 0;
-  return [{ start: first, end: ownedEnd }, { start: endMarker, end: end + trailingLength }];
+  const trailingLength = new RegExp("^" + hookTextPattern(trailing)).exec(text.slice(endMarkerEnd))?.[0].length ?? 0;
+  
+  const managedBlock = text.slice(startMarkerIndex, endMarkerEnd);
+  let parsedManaged: any;
+  try {
+    parsedManaged = Bun.TOML.parse(managedBlock);
+  } catch {
+    throw new Error("Codex interrupt lifecycle hook changed after setup; refusing to overwrite it");
+  }
+  if (!parsedManaged.hooks || !parsedManaged.hooks.Interrupt || parsedManaged.hooks.Interrupt.length !== 1) {
+    throw new Error("Codex interrupt lifecycle hook changed after setup; refusing to overwrite it");
+  }
+  if (Object.keys(parsedManaged).length !== 1 || Object.keys(parsedManaged.hooks).length !== 1) {
+    throw new Error("Codex interrupt lifecycle hook changed after setup; refusing to overwrite it");
+  }
+
+  const range1 = { start: startMarkerIndex, end: endMarkerEnd + trailingLength };
+  const range2 = { start: stateStart, end: stateEnd };
+  if (range1.start < range2.end && range2.start < range1.end) {
+     throw new Error("Codex interrupt lifecycle hook changed after setup; refusing to overwrite it");
+  }
+
+  return [range1, range2];
 }
 
 export function verifyCodexInterruptHook(text: string, installed: InstalledCodexInterruptHook): void {

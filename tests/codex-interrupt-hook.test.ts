@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
   MANAGED_INTERRUPT_HOOK_END,
+  MANAGED_INTERRUPT_HOOK_START,
   codexInterruptHookCommand,
   codexInterruptHookHash,
   installCodexInterruptHook,
@@ -160,4 +161,55 @@ test("restores a hook whose end comment moved before unchanged definitions witho
       expect(() => restoreCodexInterruptHook(markerInsideValue, installed.installed)).toThrow("markers changed after setup");
     }
   }
+});
+
+test("restores a hook whose trust-state table was relocated by the native TOML editor", () => {
+  const original = 'model = "gpt-5.6-sol"\n';
+  const installed = installCodexInterruptHook(original, "/Users/test/.codex/config.toml", {
+    runtimeCommand: ["/opt/runtime"],
+  });
+
+  const stateKeyStr = JSON.stringify(installed.installed.stateKey);
+  const stateTable = `[hooks.state.${stateKeyStr}]\ntrusted_hash = "${installed.installed.trustedHash}"\n`;
+  const managedBlock = `${MANAGED_INTERRUPT_HOOK_START}\n[[hooks.Interrupt]]\n\n[[hooks.Interrupt.hooks]]\ntype = "command"\ncommand = "/opt/runtime '\/Users\/test\/.codex\/config.toml' hook interrupt"\ntimeout = 3\n${MANAGED_INTERRUPT_HOOK_END}\n`;
+  const unrelatedState = `[hooks.state."other:hook"]\ntrusted_hash = "sha256:abc"\n`;
+  
+  // Actually, wait, the installed.command has the arguments...
+  // Let's just extract the managedBlock by stripping the state table from installed.fragment.
+  const stateTableMatch = installed.installed.fragment.match(new RegExp(`\\[hooks\\.state\\.${stateKeyStr.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\]\\n?trusted_hash = "[^"]+"\\n?`));
+  expect(stateTableMatch).not.toBeNull();
+  const stateTableActual = stateTableMatch![0];
+  const managedBlockActual = installed.installed.fragment.replace(stateTableActual, "");
+
+  // Simulate TOML rewrite: move state table before the interrupt block
+  const edited = `${original}\n${unrelatedState}\n${stateTableActual}\n${managedBlockActual}`;
+  
+  // Verify it doesn't throw
+  expect(() => verifyCodexInterruptHook(edited, installed.installed)).not.toThrow();
+
+  // Restore preserves unrelated config
+  const restored = restoreCodexInterruptHook(edited, installed.installed);
+  expect(restored).toBe(`${original}\n${unrelatedState}\n\n`);
+
+  // Negative cases for relocated layout
+  const editedTimeoutChanged = edited.replace("timeout = 3", "timeout = 2");
+  expect(() => verifyCodexInterruptHook(editedTimeoutChanged, installed.installed)).toThrow("changed after setup");
+
+  const editedCommandChanged = edited.replace("'hook' 'interrupt'", "'hook' 'other'");
+  expect(() => verifyCodexInterruptHook(editedCommandChanged, installed.installed)).toThrow("changed after setup");
+
+  const editedHashChanged = edited.replace(installed.installed.trustedHash, "sha256:invalid");
+  expect(() => verifyCodexInterruptHook(editedHashChanged, installed.installed)).toThrow("changed after setup");
+
+  const editedExtraField = edited.replace(stateTableActual, `${stateTableActual}extra_field = true\n`);
+  expect(() => verifyCodexInterruptHook(editedExtraField, installed.installed)).toThrow("changed after setup");
+
+  const editedExtraHookEntry = edited.replace(
+    'timeout = 3\n', 
+    'timeout = 3\n\n[[hooks.Interrupt.hooks]]\ntype = "command"\ncommand = "extra"\ntimeout = 3\n'
+  );
+  expect(() => verifyCodexInterruptHook(editedExtraHookEntry, installed.installed)).toThrow("changed after setup");
+
+  const editedDuplicateMarker = edited.replace(MANAGED_INTERRUPT_HOOK_END, `${MANAGED_INTERRUPT_HOOK_END}\n${MANAGED_INTERRUPT_HOOK_END}`);
+  expect(() => verifyCodexInterruptHook(editedDuplicateMarker, installed.installed)).toThrow("markers changed after setup");
 });
