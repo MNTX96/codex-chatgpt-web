@@ -1,5 +1,5 @@
 import { nativeImageReconciler } from "./image-factory/reconcile";
-import { callNativeAuthority, resolveNativeBinding, type NativeBindingSpec } from "./native-authority";
+import { callNativeAuthority, completeNativeTurnLifecycle, resolveNativeBinding, type NativeBindingSpec } from "./native-authority";
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
@@ -881,6 +881,7 @@ export function createChatGptWebAdapter(
         : undefined;
       return {
         captureLunaCheckpoint,
+        imageFactory: Boolean(imageFactory && broker.bindImageTools),
         ...(experimentalMultipartParts !== undefined
           ? { experimentalMultipartParts }
           : {}),
@@ -908,7 +909,12 @@ export function createChatGptWebAdapter(
     });
     const browserAbort = new AbortController();
     let browserOwnerSettled = false;
-    const trackBrowserOwner = (browser: Promise<string>): Promise<string> => browser.finally(() => {
+    const trackBrowserOwner = (browser: Promise<string>): Promise<string> => browser.then(async answer => {
+      if (!manualRequest && environment && identity.threadId && identity.turnId) {
+        await completeNativeTurnLifecycle(environment.cwd, identity.threadId, identity.turnId, releaseRetainedConversation);
+      }
+      return answer;
+    }).finally(() => {
       browserOwnerSettled = true;
     });
     const trace = new ChatGptTraceFeed();

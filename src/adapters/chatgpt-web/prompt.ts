@@ -34,6 +34,7 @@ export interface CompiledChatGptWebPrompt {
 export interface CompileChatGptWebPromptOptions {
   captureLunaCheckpoint?: boolean;
   experimentalMultipartParts?: ChatGptWebMultipartPartCount;
+  imageFactory?: boolean;
   /**
    * Manual Zero Risk transport keeps ChatGPT model/effort selection and prompt submission under the
    * user's control. The browser bridge may open the owned tab and copy this prompt, but it never
@@ -288,6 +289,32 @@ export function withoutSupersededModelSwitchContracts(messages: readonly CodexMe
   return messages.filter((_message, index) => !dropped.has(index));
 }
 
+/**
+ * Codex can provide large generated catalogs alongside the actual task contract. They are useful
+ * for local orchestration, but replaying them into ChatGPT Web wastes prompt budget after the
+ * catalog has already been consumed by the bridge. Keep semantic conversation data and remove only
+ * these generated catalog developer blocks.
+ */
+function withoutGeneratedCatalogBlocks(text: string): string {
+  return text
+    .replace(/<recommended_plugins>[\s\S]*?<\/recommended_plugins>/g, "")
+    .replace(/<skills_instructions>[\s\S]*?<\/skills_instructions>/g, "");
+}
+
+export function withoutContextCatalogNoise(messages: readonly CodexMessage[]): CodexMessage[] {
+  return messages.flatMap((message): CodexMessage[] => {
+    if (message.role !== "developer") return [message];
+
+    const text = plainMessageText(message);
+    if (text === undefined) return [message];
+
+    const content = withoutGeneratedCatalogBlocks(text);
+    return content.trim().length > 0
+      ? [{ ...message, content }]
+      : [];
+  });
+}
+
 function messageEnvelope(
   message: CodexMessage,
   images: ChatGptWebPromptImage[],
@@ -508,7 +535,10 @@ export function compileChatGptWebPrompt(
     : mode.localTools
     ? [
       "For local work required by the task, use the attached Codex Native tools directly according to their declared descriptions and schemas.",
-      ...(manualControl ? [] : [IMAGE_FACTORY_PROMPT_RULE]),
+      "For read-only workspace inspection, route by intent: directory listing or filename discovery uses the dedicated directory-listing tool; reading file contents uses the dedicated text-read tool; literal source/text search uses the dedicated text-search tool. Traverse directories with additional listing calls when needed. Use a general command tool only when the task actually requires command or process execution.",
+      ...(manualControl || options?.imageFactory !== true
+        ? []
+        : [IMAGE_FACTORY_PROMPT_RULE]),
       "Call a Codex Native tool only when the latest active request requires a local effect or fresh local evidence that is not already present in the supplied context; otherwise answer the request directly without a tool call.",
       "Use actual Codex Native results as evidence for local observations and effects.",
       "A Codex Native MCP tool result may require context compaction. If it does, follow the compaction instructions in that result exactly.",
@@ -678,7 +708,9 @@ export function compileChatGptWebPrompt(
     return { text, images };
   };
 
-  let sourceMessages = withoutSupersededModelSwitchContracts(parsed.context.messages);
+  let sourceMessages = withoutContextCatalogNoise(
+    withoutSupersededModelSwitchContracts(parsed.context.messages),
+  );
   const initialMessageCount = sourceMessages.length;
   let compiled = build(sourceMessages);
   if (!parsed._compactionRequest) return compiled;

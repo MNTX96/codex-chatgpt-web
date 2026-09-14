@@ -40,6 +40,7 @@ interface NativeAuthorityManifest {
   executable: string;
   args: string[];
   integrityFiles: string[];
+  lifecycleEvents?: Array<"turn_completed">;
 }
 interface Registration {
   workspace: string;
@@ -47,6 +48,7 @@ interface Registration {
   executableSha256: string;
   args: string[];
   integrityFiles: Array<{ path: string; sha256: string }>;
+  lifecycleEvents?: Array<"turn_completed">;
 }
 
 export const NATIVE_REQUEST_MARKER = "NATIVE_REQUEST ";
@@ -69,10 +71,13 @@ function readNativeAuthorityManifest(root: string): NativeAuthorityManifest {
   if (typeof value.executable !== "string" || !value.executable.trim()
     || !Array.isArray(value.args) || value.args.some(arg => typeof arg !== "string" || arg.includes("\0"))
     || !Array.isArray(value.integrityFiles) || value.integrityFiles.length === 0
-    || value.integrityFiles.some(file => typeof file !== "string" || !file.trim())) {
+    || value.integrityFiles.some(file => typeof file !== "string" || !file.trim())
+    || (value.lifecycleEvents !== undefined && (!Array.isArray(value.lifecycleEvents)
+      || value.lifecycleEvents.some(event => event !== "turn_completed")))) {
     throw new Error("native_authority_manifest_invalid");
   }
-  return { executable: value.executable, args: value.args, integrityFiles: value.integrityFiles };
+  return { executable: value.executable, args: value.args, integrityFiles: value.integrityFiles,
+    ...(value.lifecycleEvents ? { lifecycleEvents: value.lifecycleEvents } : {}) };
 }
 interface Binding {
   request_sha256: string;
@@ -82,7 +87,7 @@ interface Binding {
   payload: {
     model: string;
     reasoning_effort: string;
-    tool_policy: "read_only_evidence" | "image_factory" | "local_orchestrator";
+    tool_policy: "read_only_evidence" | "image_factory" | "flow_operation" | "delivery_operation";
     prompt_sha256: string;
     requested_count?: number;
     image_session_id?: string;
@@ -105,7 +110,7 @@ export function installNativeAuthority(workspace: string, directory = getConfigD
     return { path, sha256: hash(readFileSync(path)) };
   });
   const value: Registration = { workspace: root, executable, executableSha256: hash(readFileSync(executable)),
-    args, integrityFiles };
+    args, integrityFiles, ...(manifest.lifecycleEvents ? { lifecycleEvents: manifest.lifecycleEvents } : {}) };
   const path = join(directory, NATIVE_AUTHORITY_REGISTRY);
   const previous = existsSync(path) ? readRegistrations(path) : {};
   previous[root] = value;
@@ -195,7 +200,9 @@ function registration(workspace: string, directory = getConfigDir()): Registrati
     && value.args.every(arg => typeof arg === "string" && !arg.includes("\0"))
     && Array.isArray(value.integrityFiles)
     && value.integrityFiles.length > 0
-    && value.integrityFiles.every(file => typeof file?.path === "string" && digest.test(file.sha256));
+    && value.integrityFiles.every(file => typeof file?.path === "string" && digest.test(file.sha256))
+    && (value.lifecycleEvents === undefined || (Array.isArray(value.lifecycleEvents)
+      && value.lifecycleEvents.every(event => event === "turn_completed")));
   if (!validShape) throw new Error("native_authority_registry_invalid");
   let executable: string;
   try { executable = realpathSync(value.executable); }
@@ -250,6 +257,38 @@ export async function callNativeAuthority(
 }
 
 /** Resolve only a current native instruction marker or an existing task binding. */
+/** Called only after the browser completion fence and successful surface release. */
+export async function nativeTurnReleaseRequested(
+  workspace: string, threadId: string, turnId: string, directory = getConfigDir(),
+): Promise<boolean> {
+  const installed = registration(workspace, directory);
+  if (!installed?.lifecycleEvents?.includes("turn_completed")) return false;
+  const result = await callNativeAuthority(workspace,
+    { operation: "origin-release-needed", thread_id: threadId, turn_id: turnId }, directory);
+  return result.release_requested === true;
+}
+
+export async function notifyNativeTurnCompleted(
+  workspace: string, threadId: string, turnId: string, directory = getConfigDir(),
+): Promise<void> {
+  const installed = registration(workspace, directory);
+  if (!installed?.lifecycleEvents?.includes("turn_completed")) return;
+  if (!identity.test(threadId) || !identity.test(turnId)) throw new Error("native_lifecycle_identity_invalid");
+  await callNativeAuthority(workspace, { operation: "turn-completed", thread_id: threadId,
+    turn_id: turnId, completion_fence: true, surface_released: true }, directory);
+}
+
+export async function completeNativeTurnLifecycle(
+  workspace: string, threadId: string, turnId: string,
+  releaseRetained: (() => Promise<void>) | undefined, directory = getConfigDir(),
+): Promise<void> {
+  if (releaseRetained) {
+    if (!await nativeTurnReleaseRequested(workspace, threadId, turnId, directory)) return;
+    await releaseRetained();
+  }
+  await notifyNativeTurnCompleted(workspace, threadId, turnId, directory);
+}
+
 export async function resolveNativeBinding(
   workspace: string, threadId: string, currentInstruction: string, directory = getConfigDir(),
 ): Promise<NativeBindingSpec | undefined> {

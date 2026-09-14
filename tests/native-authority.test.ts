@@ -1,8 +1,8 @@
 import { test, expect, afterEach } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { NativeBrowserAuthority, callNativeAuthority, installNativeAuthority, resolveNativeBinding,
+import { NativeBrowserAuthority, callNativeAuthority, installNativeAuthority, resolveNativeBinding, notifyNativeTurnCompleted, completeNativeTurnLifecycle,
   nativeHelperInspectionEnvironment, validateNativeBinding, type NativeBindingSpec } from "../src/adapters/chatgpt-web/native-authority";
 import { ImageFactoryService } from "../src/adapters/chatgpt-web/image-factory/service";
 import { ImageFactoryStore } from "../src/adapters/chatgpt-web/image-factory/state";
@@ -101,7 +101,29 @@ test("same-workspace ordinary tasks do not invoke native authority or join its p
   }));
   installNativeAuthority(root, home);
   expect(await resolveNativeBinding(root, "ordinary-task", "Review this source", home)).toBeUndefined();
+  await notifyNativeTurnCompleted(root, "ordinary-task", "turn-1", home);
   await expect(resolveNativeBinding(root, "native-task", "NATIVE_REQUEST " + "a".repeat(64) + "\noriginal", home)).rejects.toThrow();
+});
+
+test("registered lifecycle emits exact turn completion and rejects unknown event subscriptions", async () => {
+  const { root } = fixture();
+  const home = join(root, "home"); mkdirSync(home);
+  mkdirSync(join(root, ".codex"));
+  const script = join(root, "authority.cjs");
+  writeFileSync(script, "let s='';process.stdin.on('data',c=>s+=c);process.stdin.on('end',()=>{require('node:fs').writeFileSync('event.json',s);process.stdout.write('{}')});");
+  const manifest = { executable: process.execPath, args: [script], integrityFiles: ["authority.cjs"],
+    lifecycleEvents: ["turn_completed"] };
+  const manifestPath = join(root, ".codex/native-authority.json");
+  writeFileSync(manifestPath, JSON.stringify(manifest));
+  installNativeAuthority(root, home);
+  await notifyNativeTurnCompleted(root, "thread-1", "turn-2", home);
+  expect(JSON.parse(readFileSync(join(root, "event.json"), "utf8"))).toEqual({
+    operation: "turn-completed", thread_id: "thread-1", turn_id: "turn-2",
+    completion_fence: true, surface_released: true,
+  });
+  await expect(notifyNativeTurnCompleted(root, "thread-1", "", home)).rejects.toThrow("identity_invalid");
+  writeFileSync(manifestPath, JSON.stringify({ ...manifest, lifecycleEvents: ["made_up"] }));
+  expect(() => installNativeAuthority(root, home)).toThrow("manifest_invalid");
 });
 
 test("workspace manifest can register an arbitrary native authority executable", async () => {
@@ -126,6 +148,27 @@ test("workspace manifest can register an arbitrary native authority executable",
   expect(installed.args).toEqual([join(root, "authority/runtime.js")]);
   const result = await callNativeAuthority(root, { operation: "probe", value: 7 }, home);
   expect(result).toEqual({ cwd: root, request: { operation: "probe", value: 7 } });
+});
+
+test("retained surface release must succeed before lifecycle completion is recorded", async () => {
+  const { root } = fixture();
+  const home = join(root, "home"); mkdirSync(home);
+  mkdirSync(join(root, ".codex"));
+  const script = join(root, "authority.cjs");
+  writeFileSync(script, "let s='';process.stdin.on('data',c=>s+=c);process.stdin.on('end',()=>{const p=JSON.parse(s);require('node:fs').appendFileSync('events.jsonl',JSON.stringify(p)+'\\n');process.stdout.write(JSON.stringify({release_requested:true}))});");
+  writeFileSync(join(root, ".codex/native-authority.json"), JSON.stringify({
+    executable: process.execPath, args: [script], integrityFiles: ["authority.cjs"], lifecycleEvents: ["turn_completed"],
+  }));
+  installNativeAuthority(root, home);
+  await expect(completeNativeTurnLifecycle(root, "thread-1", "turn-1", async () => {
+    throw new Error("release failed");
+  }, home)).rejects.toThrow("release failed");
+  const events = () => readFileSync(join(root, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line).operation);
+  expect(events()).toEqual(["origin-release-needed"]);
+  let released = false;
+  await completeNativeTurnLifecycle(root, "thread-1", "turn-1", async () => { released = true; }, home);
+  expect(released).toBe(true);
+  expect(events()).toEqual(["origin-release-needed", "origin-release-needed", "turn-completed"]);
 });
 test("reconciliation preserves existing job identity and never executes generation", async () => {
   const { root } = fixture();

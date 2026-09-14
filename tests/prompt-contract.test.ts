@@ -14,6 +14,7 @@ import { CHATGPT_WEB_LUNA_MODEL_ID, CHATGPT_WEB_MODEL_ID } from "../src/adapters
 import { biggerContextPartCount } from "../src/adapters/chatgpt-web/usage";
 import type { CodexParsedRequest } from "../src/types";
 import { SUMMARY_PREFIX } from "../src/responses/compaction";
+import { IMAGE_FACTORY_PROMPT_RULE } from "../src/adapters/chatgpt-web/image-factory/contracts";
 
 function request(reasoning: "low" | "medium" | "high" | "xhigh" | "max"): CodexParsedRequest {
   return {
@@ -64,6 +65,10 @@ test("Full-mode Pro prompts pass one stable turn token directly to native action
   expect(tokenMatches).toHaveLength(1);
   expect(compiled.text).toContain("[retired turn handle]");
   expect(transportOnly).toContain("For local work required by the task, use the attached Codex Native tools directly according to their declared descriptions and schemas.");
+  expect(transportOnly).toContain("directory listing or filename discovery uses the dedicated directory-listing tool");
+  expect(transportOnly).toContain("reading file contents uses the dedicated text-read tool");
+  expect(transportOnly).toContain("literal source/text search uses the dedicated text-search tool");
+  expect(transportOnly).toContain("Use a general command tool only when the task actually requires command or process execution");
   expect(transportOnly).toContain("Call a Codex Native tool only when the latest active request requires a local effect or fresh local evidence that is not already present in the supplied context; otherwise answer the request directly without a tool call.");
   expect(transportOnly).toContain("Use actual Codex Native results as evidence for local observations and effects.");
   expect(transportOnly).toContain("A Codex Native MCP tool result may require context compaction. If it does, follow the compaction instructions in that result exactly.");
@@ -624,4 +629,29 @@ test("keeps large contexts intact in the inline text envelope", () => {
   expect(compiled.text).not.toContain(`<codex_context_attachment>`);
   expect(compiled.text).not.toContain("sha256");
   expect(compiled.text).not.toContain("SHA-256");
+});
+
+test("Image Factory routing rule is emitted only when image tools are bound", () => {
+  const token = "turn_12345678901234567890123456789012";
+  const capabilities = {
+    localToolsEnabled: true,
+    solAvailable: true,
+    proAvailable: true,
+  };
+
+  const withoutImageFactory = compileChatGptWebPrompt(
+    request("max"),
+    capabilities,
+    token,
+  );
+
+  const withImageFactory = compileChatGptWebPrompt(
+    request("max"),
+    capabilities,
+    token,
+    { imageFactory: true },
+  );
+
+  expect(withoutImageFactory.text).not.toContain(IMAGE_FACTORY_PROMPT_RULE);
+  expect(withImageFactory.text).toContain(IMAGE_FACTORY_PROMPT_RULE);
 });

@@ -2,7 +2,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { buildResponseJSON } from "../src/bridge";
@@ -17,7 +17,7 @@ import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
 import {
   CODEX_ACTIVE_COMPACTION_REQUEST_MARKER,
 } from "../src/adapters/chatgpt-web/native-compaction-control";
-import { chatGptReadOnlyContextWarning, compileChatGptWebPrompt, withoutSupersededModelSwitchContracts } from "../src/adapters/chatgpt-web/prompt";
+import { chatGptReadOnlyContextWarning, compileChatGptWebPrompt, withoutContextCatalogNoise, withoutSupersededModelSwitchContracts } from "../src/adapters/chatgpt-web/prompt";
 import { MAX_CHATGPT_WEB_TURN_RETRIES } from "../src/adapters/chatgpt-web/retry-policy";
 import { ChatGptTextFeed, ChatGptTraceFeed, ChatGptTurnSessions, chatGptCompactionSourceExecutionKey, chatGptInstructionLineage, chatGptThreadOwnershipKey, chatGptTurnExecutionKey, chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
 import { callTurnBroker, TurnBroker, type BrokerToolResult } from "../src/adapters/chatgpt-web/turn-broker";
@@ -28,7 +28,7 @@ import { defaultBrokerEndpoint } from "../src/config";
 import { estimateChatGptWebUsage } from "../src/adapters/chatgpt-web/usage";
 import { decodeCompactionSummary, SUMMARY_PREFIX } from "../src/responses/compaction";
 import { parseRequest } from "../src/responses/parser";
-import type { AdapterEvent, CodexParsedRequest, CodexProviderConfig, CodexTool } from "../src/types";
+import type { AdapterEvent, CodexParsedRequest, CodexProviderConfig, CodexTool, CodexMessage } from "../src/types";
 
 const tempRoot = join(tmpdir(), `codex-chatgpt-web-harness-${process.pid}-${Date.now()}`);
 mkdirSync(tempRoot, { recursive: true });
@@ -62,6 +62,41 @@ test("current-turn MCP progress tracks active calls without claiming completion"
   expect(chatGptExternalProgressIsLive(progress.snapshot(), 62_999, 60_000)).toBeTrue();
   expect(chatGptExternalProgressIsLive(progress.snapshot(), 63_000, 60_000)).toBeFalse();
   expect(() => progress.recordToolResult()).toThrow("without an active call");
+});
+
+test("removes generated context catalog developer blocks while preserving developer instructions", () => {
+  const messages: CodexMessage[] = [
+    { role: "developer" as const, content: "<skills_instructions>\nfirebase skill\nflutter skill\n</skills_instructions>", timestamp: 1 },
+    { role: "developer" as const, content: "<recommended_plugins>\nSpotify\nGmail\nGithub\n</recommended_plugins>", timestamp: 2 },
+    { role: "developer" as const, content: "Follow repository coding style", timestamp: 3 },
+  ];
+
+  const filtered = withoutContextCatalogNoise(messages);
+
+  expect(filtered).toHaveLength(1);
+  expect(filtered[0]!.content).toBe("Follow repository coding style");
+});
+
+test("strips generated catalog blocks without dropping surrounding developer text", () => {
+  const filtered = withoutContextCatalogNoise([
+    {
+      role: "developer" as const,
+      content: [
+        "Keep this instruction",
+        "<skills_instructions>",
+        "generated skill catalog",
+        "</skills_instructions>",
+        "Keep this instruction too",
+      ].join("\n"),
+      timestamp: 1,
+    },
+  ]);
+
+  expect(filtered).toHaveLength(1);
+  expect(filtered[0]!.content).toContain("Keep this instruction");
+  expect(filtered[0]!.content).toContain("Keep this instruction too");
+  expect(filtered[0]!.content).not.toContain("<skills_instructions>");
+  expect(filtered[0]!.content).not.toContain("generated skill catalog");
 });
 
 test("current-turn MCP progress wait remains abortable", async () => {
@@ -2702,6 +2737,9 @@ describe("ChatGPT outer-native harness v4", () => {
       expect(listed.tools.map(tool => tool.name).sort()).toEqual([
         "codex_apply_patch",
         "codex_exec",
+        "codex_list_directory",
+        "codex_read_text",
+        "codex_search_text",
         "codex_tool_call",
         "codex_tool_inventory",
         "codex_view_image",
@@ -2718,7 +2756,7 @@ describe("ChatGPT outer-native harness v4", () => {
       // ChatGPT caches the complete tools/list contract under a connector identity.
       // An intentional hash change therefore requires an explicit connector refresh or identity migration.
       expect(createHash("sha256").update(canonicalJson(publicConnectorAbi)).digest("hex"))
-        .toBe("5cb59b378c7d1939e260a2b4a60f58e22da31208fe09c2cc17a2cf31eb5ff3ad");
+        .toBe("47ca07632b0c428ac6441c5e830c89063413153f67f870fe1ad7e5aa86d6cf17");
       for (const tool of listed.tools) {
         const properties = tool.inputSchema.properties as Record<string, unknown>;
         expect(properties.turn_token).toEqual({ type: "string", minLength: 20, maxLength: 256 });
@@ -2731,6 +2769,20 @@ describe("ChatGPT outer-native harness v4", () => {
         idempotentHint: false,
         openWorldHint: true,
       });
+      expect(listed.tools.find(tool => tool.name === "codex_exec")?.description)
+        .toContain("Use this only when the task actually requires command or process execution");
+      expect(listed.tools.find(tool => tool.name === "codex_exec")?.description)
+        .toContain("Prefer the dedicated read-only Codex Native tools");
+      expect(listed.tools.find(tool => tool.name === "codex_list_directory")?.description)
+        .toContain("Use this first for repository navigation, filename discovery, and locating files or directories");
+      for (const name of ["codex_read_text", "codex_list_directory", "codex_search_text"]) {
+        expect(listed.tools.find(tool => tool.name === name)?.annotations).toMatchObject({
+          readOnlyHint: true,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false,
+        });
+      }
       expect(listed.tools.find(tool => tool.name === "codex_write_stdin")?.annotations).toMatchObject({
         readOnlyHint: false,
         destructiveHint: true,
@@ -3085,6 +3137,52 @@ describe("ChatGPT outer-native harness v4", () => {
       // A fully local inventory lookup still crosses the broker's activity fence even though it
       // does not enqueue an outer Codex tool call.
       expect(broker.beginCompletionFence(token)).toBe(2);
+
+      const readFixture = join(tempRoot, "read-tools.txt");
+      writeFileSync(readFixture, "Alpha\nNeedle\nOmega\n", "utf8");
+
+      const read = call("codex_read_text", {
+        turn_token: token,
+        path: readFixture,
+        start_line: 1,
+        end_line: 3,
+      });
+      const [readRequest] = await broker.nextToolBatch(token);
+      expect(readRequest).toMatchObject({ wireName: "exec_command", freeform: false });
+      expect(readRequest?.arguments).toMatchObject({
+        workdir: tempRoot,
+        yield_time_ms: 10_000,
+        max_output_tokens: 6_000,
+        tty: false,
+      });
+      expect(String(readRequest?.arguments?.cmd)).toContain(process.platform === "win32" ? "Get-Content" : "sed -n");
+      broker.completeTool(token, readRequest!.callId, toolResult({ output: "Alpha\nNeedle\nOmega", exit_code: 0 }));
+      expect((await read).structuredContent).toMatchObject({ output: "Alpha\nNeedle\nOmega", exit_code: 0 });
+
+      const list = call("codex_list_directory", { turn_token: token, path: tempRoot, limit: 25 });
+      const [listRequest] = await broker.nextToolBatch(token);
+      expect(listRequest).toMatchObject({ wireName: "exec_command", freeform: false });
+      expect(String(listRequest?.arguments?.cmd)).toContain(process.platform === "win32" ? "Get-ChildItem" : "ls -la");
+      broker.completeTool(token, listRequest!.callId, toolResult({ output: "read-tools.txt", exit_code: 0 }));
+      expect((await list).structuredContent).toMatchObject({ output: "read-tools.txt", exit_code: 0 });
+
+      const search = call("codex_search_text", {
+        turn_token: token,
+        query: "Needle",
+        path: tempRoot,
+        max_results: 10,
+        case_sensitive: true,
+      });
+      const [searchRequest] = await broker.nextToolBatch(token);
+      expect(searchRequest).toMatchObject({ wireName: "exec_command", freeform: false });
+      expect(String(searchRequest?.arguments?.cmd)).toContain("rg -n -F");
+      expect(String(searchRequest?.arguments?.cmd)).toContain("Needle");
+      broker.completeTool(token, searchRequest!.callId, toolResult({ output: `${readFixture}:2:Needle`, exit_code: 0 }));
+      expect((await search).structuredContent).toMatchObject({ output: `${readFixture}:2:Needle`, exit_code: 0 });
+
+      const outside = await call("codex_list_directory", { turn_token: token, path: tmpdir() });
+      expect(outside.isError).toBe(true);
+      expect(JSON.stringify(outside.content)).toContain("codex_workspace_read_path_outside_roots");
 
       const exec = call("codex_exec", {
         turn_token: token,

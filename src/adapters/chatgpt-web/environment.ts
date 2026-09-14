@@ -19,7 +19,7 @@ export interface ChatGptTurnEnvironment {
     workspace: string;
     request_sha256: string;
     thread_id: string;
-    tool_policy: "read_only_evidence" | "image_factory" | "local_orchestrator";
+    tool_policy: "read_only_evidence" | "image_factory" | "flow_operation" | "delivery_operation";
   };
 }
 

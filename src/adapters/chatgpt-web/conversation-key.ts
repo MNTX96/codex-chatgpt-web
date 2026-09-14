@@ -39,6 +39,7 @@ export function chatGptConversationKey(
     modelId: parsed.modelId,
     reasoning: parsed.options.reasoning,
     compaction: compactionEpoch(raw?.input),
+    systemPrompt: parsed.context.systemPrompt ?? [],
   })).digest("hex");
 }
 
@@ -48,10 +49,14 @@ export function retainedConversationResumeRequest(
 ): CodexParsedRequest | undefined {
   const lastAssistant = parsed.context.messages.findLastIndex(message => message.role === "assistant");
   if (lastAssistant < 0 || lastAssistant === parsed.context.messages.length - 1) return undefined;
+
+  const context = { ...parsed.context };
+  delete context.systemPrompt;
+
   return {
     ...parsed,
     context: {
-      ...parsed.context,
+      ...context,
       messages: parsed.context.messages.slice(lastAssistant + 1),
     },
   };

@@ -1,4 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
+import { realpathSync, statSync } from "node:fs";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import * as z from "zod/v4";
@@ -22,6 +24,9 @@ export type ChatGptMcpContract = "native" | "safe";
 
 const BRIDGE_TOOL_NAMES = new Set([
   "codex_turn_start",
+  "codex_read_text",
+  "codex_list_directory",
+  "codex_search_text",
   "codex_exec",
   "codex_write_stdin",
   "codex_apply_patch",
@@ -39,6 +44,10 @@ const GATEWAY_AGENT_WAIT_TOOL_NAMES = new Set([
 
 const turnTokenSchema = z.string().min(20).max(256);
 const jsonArgumentsSchema = z.record(z.string(), z.unknown()).default({});
+const READ_COMMAND_YIELD_MS = 10_000;
+const READ_COMMAND_MAX_OUTPUT_TOKENS = 6_000;
+const READ_TEXT_MAX_LINES = 800;
+const SEARCH_TEXT_MAX_RESULTS = 100;
 // Match Codex's default wait interval while returning before the MCP invocation deadline.
 export const CHATGPT_WEB_AGENT_WAIT_POLL_MS = 30_000;
 const AGENT_WAIT_TRANSPORT_RULE = `ChatGPT Web transport rule: wait for exactly ${CHATGPT_WEB_AGENT_WAIT_POLL_MS / 1_000} seconds per call, matching the Codex default, then release the MCP channel so spawned Web agents can use their own tools. A wait timeout is not task completion; check agent progress and wait again if needed. Keep the native tool's declared arguments.`;
@@ -116,6 +125,54 @@ function afterSafeStart(contract: ChatGptMcpContract, description: string): stri
 
 function wireName(tool: CodexTool): string {
   return namespacedToolName(tool.namespace, tool.name);
+}
+
+function pathInside(root: string, candidate: string): boolean {
+  const path = relative(root, candidate);
+  return path === "" || (path !== ".." && !path.startsWith(`..${sep}`) && !isAbsolute(path));
+}
+
+function workspaceReadPath(environment: ChatGptTurnEnvironment, requestedPath: string): string {
+  if (!requestedPath || requestedPath.includes("\0")) throw new Error("codex_workspace_read_path_invalid");
+  const candidate = realpathSync(resolve(environment.cwd, requestedPath));
+  const roots = environment.roots.length > 0 ? environment.roots : [environment.cwd];
+  const allowed = roots.some(root => {
+    try { return pathInside(realpathSync(root), candidate); }
+    catch { return false; }
+  });
+  if (!allowed) throw new Error("codex_workspace_read_path_outside_roots");
+  return candidate;
+}
+
+function shellQuoted(value: string): string {
+  return process.platform === "win32"
+    ? `'${value.replaceAll("'", "''")}'`
+    : `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
+function readTextCommand(path: string, startLine: number, endLine: number): string {
+  if (process.platform === "win32") {
+    return `Get-Content -LiteralPath ${shellQuoted(path)} | Select-Object -Skip ${startLine - 1} -First ${endLine - startLine + 1}`;
+  }
+  return `sed -n '${startLine},${endLine}p;${endLine}q' ${shellQuoted(path)}`;
+}
+
+function listDirectoryCommand(path: string, limit: number): string {
+  if (process.platform === "win32") {
+    return `Get-ChildItem -Force -LiteralPath ${shellQuoted(path)} | Select-Object -First ${limit} Mode,Length,LastWriteTime,Name | Format-Table -AutoSize`;
+  }
+  return `ls -la ${shellQuoted(path)} | head -n ${limit + 1}`;
+}
+
+function searchTextCommand(query: string, path: string, maxResults: number, caseSensitive: boolean): string {
+  if (query.includes("\0") || query.includes("\r") || query.includes("\n")) {
+    throw new Error("codex_workspace_search_query_invalid");
+  }
+  const insensitive = caseSensitive ? "" : " -i";
+  const rg = `rg -n -F --no-heading --color never --max-filesize 2M${insensitive} -- ${shellQuoted(query)} ${shellQuoted(path)}`;
+  return process.platform === "win32"
+    ? `${rg} | Select-Object -First ${maxResults}`
+    : `${rg} | head -n ${maxResults}`;
 }
 
 function exactTool(environment: ChatGptTurnEnvironment, name: string): CodexTool | undefined {
@@ -515,8 +572,7 @@ export async function runChatGptMcpServer(options: {
     const claimed = await claimTurn(toolName, turnToken, extra);
     try {
       const policy = claimed.environment.nativePolicy;
-      if (policy && (toolName === "codex_apply_patch" || (policy.tool_policy !== "local_orchestrator"
-        && ["codex_exec", "codex_write_stdin"].includes(toolName)))) {
+      if (policy && ["codex_apply_patch", "codex_exec", "codex_write_stdin"].includes(toolName)) {
         throw new Error("native_tool_policy_forbids_mutation");
       }
       return await action(claimed);
@@ -603,6 +659,41 @@ export async function runChatGptMcpServer(options: {
     }
   };
 
+  const invokeReadCommand = (
+    claimed: ClaimedTurn,
+    command: string,
+    signal?: AbortSignal,
+  ) => {
+    const bound = claimed.environment;
+    if (bound.nativePolicy) {
+      throw new Error("native_tool_outside_bound_policy");
+    }
+    const execCommandArguments = {
+      cmd: command,
+      workdir: bound.cwd,
+      yield_time_ms: READ_COMMAND_YIELD_MS,
+      max_output_tokens: READ_COMMAND_MAX_OUTPUT_TOKENS,
+      tty: false,
+    };
+    const shellCommandArguments = {
+      command,
+      workdir: bound.cwd,
+      timeout_ms: READ_COMMAND_YIELD_MS,
+    };
+    const tool = exactTool(bound, "exec_command") ?? exactTool(bound, "shell_command");
+    if (tool) {
+      const args = tool.name === "exec_command" ? execCommandArguments : shellCommandArguments;
+      return invoke(claimed.bindingId, bound, tool, { arguments: args }, signal);
+    }
+    const gateway = execGateway(bound);
+    if (!gateway) {
+      throw new Error("This Codex turn did not advertise a native command tool or the native exec gateway");
+    }
+    return invoke(claimed.bindingId, bound, gateway, {
+      input: execCommandGatewayProgram(execCommandArguments, shellCommandArguments),
+    }, signal);
+  };
+
   const invokeNestedNative = (
     bindingId: string,
     bound: ChatGptTurnEnvironment & { expiresAt?: number },
@@ -621,10 +712,93 @@ export async function runChatGptMcpServer(options: {
   };
 
   server.registerTool(
+    "codex_read_text",
+    {
+      title: "Read workspace text",
+      description: afterSafeStart(contract,
+        "Read a bounded range of lines from one text file inside the current Codex workspace. Prefer this for source, config, and document inspection when shell execution is unnecessary."),
+      inputSchema: {
+        ...turnReferenceInput(contract),
+        path: z.string().min(1).max(16_384),
+        start_line: z.number().int().min(1).default(1),
+        end_line: z.number().int().min(1).optional(),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async (input, extra) => withClaimedTurn(
+      "codex_read_text",
+      turnReference(contract, input),
+      extra,
+      claimed => {
+        const path = workspaceReadPath(claimed.environment, input.path);
+        if (!statSync(path).isFile()) throw new Error("codex_workspace_read_file_required");
+        const startLine = input.start_line;
+        const endLine = input.end_line ?? startLine + READ_TEXT_MAX_LINES - 1;
+        if (endLine < startLine || endLine - startLine + 1 > READ_TEXT_MAX_LINES) {
+          throw new Error(`codex_workspace_read_range_exceeds_${READ_TEXT_MAX_LINES}_lines`);
+        }
+        return invokeReadCommand(claimed, readTextCommand(path, startLine, endLine), extra.signal);
+      },
+    ),
+  );
+
+  server.registerTool(
+    "codex_list_directory",
+    {
+      title: "List a workspace directory",
+      description: afterSafeStart(contract,
+        "List entries from one directory inside the current Codex workspace without modifying files. Use this first for repository navigation, filename discovery, and locating files or directories; traverse subdirectories with additional calls when needed."),
+      inputSchema: {
+        ...turnReferenceInput(contract),
+        path: z.string().min(1).max(16_384).default("."),
+        limit: z.number().int().min(1).max(1_000).default(200),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async (input, extra) => withClaimedTurn(
+      "codex_list_directory",
+      turnReference(contract, input),
+      extra,
+      claimed => {
+        const path = workspaceReadPath(claimed.environment, input.path);
+        if (!statSync(path).isDirectory()) throw new Error("codex_workspace_read_directory_required");
+        return invokeReadCommand(claimed, listDirectoryCommand(path, input.limit), extra.signal);
+      },
+    ),
+  );
+
+  server.registerTool(
+    "codex_search_text",
+    {
+      title: "Search workspace text",
+      description: afterSafeStart(contract,
+        "Search for literal text inside one workspace file or directory with bounded output. Prefer this for repository/source search when a general shell command is unnecessary."),
+      inputSchema: {
+        ...turnReferenceInput(contract),
+        query: z.string().min(1).max(500),
+        path: z.string().min(1).max(16_384).default("."),
+        max_results: z.number().int().min(1).max(SEARCH_TEXT_MAX_RESULTS).default(50),
+        case_sensitive: z.boolean().default(false),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async (input, extra) => withClaimedTurn(
+      "codex_search_text",
+      turnReference(contract, input),
+      extra,
+      claimed => {
+        const path = workspaceReadPath(claimed.environment, input.path);
+        return invokeReadCommand(claimed,
+          searchTextCommand(input.query, path, input.max_results, input.case_sensitive), extra.signal);
+      },
+    ),
+  );
+
+  server.registerTool(
     "codex_exec",
     {
       title: "Run a native Codex command",
-      description: afterSafeStart(contract, "Invoke the command tool advertised by the current outer Codex harness. A long-running command returns its native session_id."),
+      description: afterSafeStart(contract, "Invoke the command tool advertised by the current outer Codex harness. Use this only when the task actually requires command or process execution. Prefer the dedicated read-only Codex Native tools for workspace file reading, directory listing or filename discovery, and literal text search. A long-running command returns its native session_id."),
       inputSchema: {
         ...turnReferenceInput(contract),
         cmd: z.string().min(1).max(100_000),
@@ -783,7 +957,7 @@ export async function runChatGptMcpServer(options: {
         const { query, offset, limit, include_schema } = input;
         const bound = claimed.environment;
         const needle = query?.trim().toLowerCase();
-        if (bound.nativePolicy && bound.nativePolicy.tool_policy !== "local_orchestrator") {
+        if (bound.nativePolicy) {
           const tools = [
             { wire_name: "native_read_bound_file", name: "native_read_bound_file", kind: "function",
               description: "Read only text files in this native request's verified evidence closure.",
@@ -908,7 +1082,7 @@ export async function runChatGptMcpServer(options: {
           if (input !== undefined || typeof args?.path !== "string") throw new Error("native_bound_path_required");
           await callNativeAuthority(bound.nativePolicy.workspace,
             { ...bound.nativePolicy, operation: "authorize-read", path: args.path });
-        } else if (bound.nativePolicy && bound.nativePolicy.tool_policy !== "local_orchestrator"
+        } else if (bound.nativePolicy
           && !(bound.nativePolicy.tool_policy === "image_factory" && isImageTool(wire_name))) {
           throw new Error("native_tool_outside_bound_policy");
         }
