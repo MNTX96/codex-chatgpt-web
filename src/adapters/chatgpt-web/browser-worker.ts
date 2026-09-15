@@ -6082,6 +6082,12 @@ export class ChatGptBrowserWorker {
               try {
                 return markdownBuffer.finish();
               } catch (error) {
+                if (error instanceof ChatGptMarkdownConsistencyError && error.diagnostic) {
+                  console.warn(
+                    `[chatgpt-web] browser turn ${turn.traceId} ignored completed-block Markdown rewrite at finalization: ${JSON.stringify(error.diagnostic)}`,
+                  );
+                  return { markdown: markdownBuffer.streamedMarkdown(), delta: "" };
+                }
                 return throwMarkdownConsistencyError(error);
               }
             })();

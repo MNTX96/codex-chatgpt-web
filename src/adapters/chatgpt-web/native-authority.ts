@@ -293,15 +293,17 @@ export async function resolveNativeBinding(
   workspace: string, threadId: string, currentInstruction: string, directory = getConfigDir(),
 ): Promise<NativeBindingSpec | undefined> {
   const marker = new RegExp(`^${NATIVE_REQUEST_MARKER}([a-f0-9]{64})(?:\\n|$)`).exec(currentInstruction);
+  const root = realpathSync(workspace);
+  const ownerPath = join(directory, "runtime/native-thread-bindings", hash(root + "\0" + threadId) + ".json");
+  // A request with neither an explicit native marker nor an existing native thread binding is
+  // unrelated to native authority. Return before validating the installed registration so a
+  // stale native-authority snapshot cannot break ordinary custom-model requests in this cwd.
+  if (!marker && !existsSync(ownerPath)) return undefined;
   const installed = registration(workspace, directory);
   if (!installed) {
     if (marker) throw new Error("native_authority_not_installed");
     return undefined;
   }
-  const ownerPath = join(directory, "runtime/native-thread-bindings", hash(realpathSync(workspace) + "\0" + threadId) + ".json");
-  // Ordinary tasks in the same workspace are not native-authority transactions. Do not invoke
-  // its CLI, inspect its database, or enroll a task just because its cwd matches.
-  if (!marker && !existsSync(ownerPath)) return undefined;
   const loaded = marker
     ? await callNativeAuthority(workspace, { operation: "bind", request_sha256: marker[1], thread_id: threadId }, directory)
     : (await callNativeAuthority(workspace, { operation: "lookup", thread_id: threadId }, directory)).binding;
@@ -309,8 +311,8 @@ export async function resolveNativeBinding(
   if (marker && hash(currentInstruction.slice(marker[0].length)) !== loaded.payload.prompt_sha256) {
     throw new Error("native_original_prompt_hash_mismatch");
   }
-  const spec = { workspace: realpathSync(workspace), threadId, requestSha256: loaded.request_sha256,
-    scope: hash(realpathSync(workspace)), ordinal: 1 };
+  const spec = { workspace: root, threadId, requestSha256: loaded.request_sha256,
+    scope: hash(root), ordinal: 1 };
   atomicWriteFile(ownerPath, JSON.stringify(spec) + "\n", { mode: 0o600 });
   return spec;
 }

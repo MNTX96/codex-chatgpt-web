@@ -1977,6 +1977,7 @@ describe("ChatGPT outer-native harness v4", () => {
     };
     expect(buffer.observe([rewritten, tail], 200)).toBe("");
     expect(buffer.currentSnapshotIsConsistent()).toBe(false);
+    expect(buffer.streamedMarkdown()).toBe("Stable");
     expect(() => buffer.finish()).toThrow("changed a completed text block");
     try {
       buffer.finish();

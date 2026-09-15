@@ -105,6 +105,26 @@ test("same-workspace ordinary tasks do not invoke native authority or join its p
   await expect(resolveNativeBinding(root, "native-task", "NATIVE_REQUEST " + "a".repeat(64) + "\noriginal", home)).rejects.toThrow();
 });
 
+test("stale native registration does not break ordinary custom-model requests", async () => {
+  const { root } = fixture();
+  const home = join(root, "home"); mkdirSync(home);
+  mkdirSync(join(root, ".codex"), { recursive: true });
+  mkdirSync(join(root, "authority"), { recursive: true });
+  const runtime = join(root, "authority/runtime.txt");
+  writeFileSync(runtime, "registered snapshot\n");
+  writeFileSync(join(root, ".codex/native-authority.json"), JSON.stringify({
+    executable: process.execPath,
+    args: ["-e", "process.exit(1)"],
+    integrityFiles: ["authority/runtime.txt"],
+  }));
+  installNativeAuthority(root, home);
+  writeFileSync(runtime, "changed after registration\n");
+
+  expect(await resolveNativeBinding(root, "ordinary-task", "Review this source", home)).toBeUndefined();
+  await expect(resolveNativeBinding(root, "native-task",
+    "NATIVE_REQUEST " + "a".repeat(64) + "\noriginal", home)).rejects.toThrow("native_authority_installation_drift");
+});
+
 test("registered lifecycle emits exact turn completion and rejects unknown event subscriptions", async () => {
   const { root } = fixture();
   const home = join(root, "home"); mkdirSync(home);

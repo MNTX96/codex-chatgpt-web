@@ -269,6 +269,10 @@ export class ChatGptMarkdownBuffer {
     return this.consistencyError === undefined;
   }
 
+  streamedMarkdown(): string {
+    return this.markdown;
+  }
+
   private reconcile(
     segments: ChatGptMarkdownSegment[],
   ): ChatGptMarkdownSegment[] | ChatGptMarkdownConsistencyError {
