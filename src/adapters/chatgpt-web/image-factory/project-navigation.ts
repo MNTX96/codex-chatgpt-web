@@ -1,5 +1,6 @@
 import type { Locator, Page } from "playwright-core";
 import { CHATGPT_COMPOSER_SELECTOR } from "../../../chatgpt-session";
+import { chatGptRequestPacer } from "../../../chatgpt-request-pacing";
 import { ChatGptWebAdapterError } from "../adapter-error";
 import { throwIfChatGptRateLimitDialog, withChatGptNavigationGuard } from "../rate-limit";
 import type { ImageFactoryProjectLog } from "./project-manager";
@@ -7,6 +8,7 @@ import type { ImageFactoryProjectLog } from "./project-manager";
 const directoryUrl = "https://chatgpt.com/projects";
 export const IMAGE_FACTORY_PROJECT_NAME = "Image Factory";
 const PROJECT_OPTIONS_LABEL_PREFIX = "Open project options for ";
+const IMAGE_FACTORY_CONVERSATION_URL_TIMEOUT_MS = 60_000;
 
 export async function readProjectRowLabel(row: Locator): Promise<string> {
   const optionsButton = row.locator(`button[aria-label^="${PROJECT_OPTIONS_LABEL_PREFIX}"]`).first();
@@ -75,7 +77,7 @@ export function verifiedImageFactoryConversationUrl(value: string | undefined, p
 export async function waitForImageFactoryConversationUrl(
   page: Page,
   projectId: string,
-  timeoutMs = 10_000,
+  timeoutMs = IMAGE_FACTORY_CONVERSATION_URL_TIMEOUT_MS,
 ): Promise<string> {
   const current = verifiedImageFactoryConversationUrl(page.url(), projectId);
   if (current) return current;
@@ -102,7 +104,10 @@ export async function prepareProjectDirectory(page: Page, abortSignal?: AbortSig
     if (page.url() !== directoryUrl) {
       const link = page.locator('a[href="/projects"]').first();
       if (await link.isVisible()) await link.click({ signal });
-      else await page.goto(directoryUrl, { waitUntil: "domcontentloaded", timeout: 30_000, signal });
+      else {
+        await chatGptRequestPacer.wait("browser_navigation", signal);
+        await page.goto(directoryUrl, { waitUntil: "domcontentloaded", timeout: 30_000, signal });
+      }
     }
     await page.waitForURL(directoryUrl, { timeout: 15_000, signal });
     await page.getByRole("button", { name: "New", exact: true }).waitFor({ state: "visible", timeout: 15_000, signal });
@@ -149,6 +154,7 @@ export async function openImageFactoryProject(
   try {
     log("project_direct_navigation_started");
     await withChatGptNavigationGuard(page, async signal => {
+      await chatGptRequestPacer.wait("browser_navigation", signal);
       await page.goto(`https://chatgpt.com/g/${encodeURIComponent(normalizedProjectId)}/project`, {
         waitUntil: "domcontentloaded", timeout: 30_000, signal,
       });
@@ -181,6 +187,7 @@ export async function openPinnedImageFactoryProject(
     const section = page.locator('[class~="group/sidebar-expando-section"]').filter({ has: pinnedHeading });
     // A failed document load may leave an error page; recover the sidebar once, without /projects.
     if (!/^https:\/\/chatgpt\.com(?:\/|$)/.test(page.url())) {
+      await chatGptRequestPacer.wait("browser_navigation", signal);
       await page.goto("https://chatgpt.com/", { waitUntil: "domcontentloaded", timeout: 30_000, signal });
     }
     const header = section.getByRole("button", { name: "Pinned", exact: true });

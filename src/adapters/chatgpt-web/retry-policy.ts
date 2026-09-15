@@ -1,4 +1,5 @@
 import { ChatGptWebAdapterError } from "./adapter-error";
+import { chatGptRequestPacer } from "../../chatgpt-request-pacing";
 
 /** Maximum number of automatic browser-turn retries after the initial send. */
 export const MAX_CHATGPT_WEB_TURN_RETRIES = 3;
@@ -37,6 +38,9 @@ export class ChatGptWebTurnRetryPolicy {
   constructor(private readonly ttlMs = RETRY_BUDGET_TTL_MS) {}
 
   recordRetryableFailure(key: string, error: ChatGptWebAdapterError, now = Date.now()): ChatGptWebAdapterError {
+    if (error.status === 429 && chatGptRequestPacer.cooldownRemainingMs(now) === 0) {
+      chatGptRequestPacer.noteRateLimit();
+    }
     this.prune(now);
     const previous = this.entries.get(key);
     const entry: RetryBudgetEntry = {

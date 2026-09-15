@@ -1,5 +1,6 @@
 import { NATIVE_AUTHORITY_PROTOCOL, NativeBrowserAuthority, type NativeBindingSpec, type NativeImageReconcile } from "./native-authority";
 import { readLauncherBrowserHostDescriptor } from "../../launcher-browser-host";
+import { chatGptRequestPacer } from "../../chatgpt-request-pacing";
 import { chatGptRateLimitDialog, throwIfChatGptRateLimitDialog, withChatGptNavigationGuard } from "./rate-limit";
 import { observeChatGptConversationResponses } from "./browser-network-diagnostics";
 export { throwIfChatGptRateLimitDialog } from "./rate-limit";
@@ -2386,6 +2387,7 @@ export class ChatGptBrowserWorker {
             abortSignal?.throwIfAborted();
             log("account_page_check_started", { url: imageFactoryPageLocation(page) });
             if (!/^https:\/\/chatgpt\.com(?:\/|$)/i.test(page.url())) {
+              await chatGptRequestPacer.wait("browser_navigation", abortSignal);
               await page.goto("https://chatgpt.com/", { waitUntil: "domcontentloaded", timeout: 60_000 });
             }
             const profileButton = page.locator(
@@ -2593,6 +2595,7 @@ export class ChatGptBrowserWorker {
       headless: !this.config.headed,
     });
     this.context = await this.browser.newContext({ storageState: this.config.storageStatePath });
+    await chatGptRequestPacer.wait("browser_tab");
     this.page = await this.context.newPage();
     return this.page;
   }
@@ -2634,6 +2637,7 @@ export class ChatGptBrowserWorker {
       throw new Error("Launcher turns require an explicitly leased browser surface");
     }
     const { context } = await this.ensureManagedBrowser();
+    await chatGptRequestPacer.wait("browser_tab");
     return await context.newPage();
   }
 
@@ -2871,6 +2875,7 @@ export class ChatGptBrowserWorker {
     // document and made the first verification race a second SPA bootstrap. A leased turn starts on
     // about:blank and therefore still performs exactly one navigation through this same method.
     if (page.url() !== CHATGPT_TEMPORARY_CHAT_URL) {
+      await chatGptRequestPacer.wait("browser_navigation");
       await page.goto(CHATGPT_TEMPORARY_CHAT_URL, {
         waitUntil: "domcontentloaded",
         timeout: 60_000,
@@ -3993,6 +3998,7 @@ export class ChatGptBrowserWorker {
     await submissionLifecycle?.onSendActivated?.();
     await effectiveAttachmentGuard.assertReady(abortSignal);
     abortSignal?.throwIfAborted();
+    await chatGptRequestPacer.wait("browser_submit", abortSignal);
     await sendButton.press("Enter", {
       noWaitAfter: true,
       signal: abortSignal,
@@ -4066,6 +4072,7 @@ export class ChatGptBrowserWorker {
     }
     await attachmentGuard.assertReady(abortSignal);
     abortSignal?.throwIfAborted();
+    await chatGptRequestPacer.wait("browser_submit", abortSignal);
     await sendButton.press("Enter", {
       noWaitAfter: true,
       signal: abortSignal,
@@ -4179,6 +4186,7 @@ export class ChatGptBrowserWorker {
       await submissionLifecycle?.nativeAuthority?.claim();
     await submissionLifecycle?.onSendActivated?.();
       abortSignal?.throwIfAborted();
+      await chatGptRequestPacer.wait("browser_submit", abortSignal);
       await send.press("Enter", { noWaitAfter: true, signal: abortSignal, timeout: 0 });
       const evidence = await this.waitForSubmissionAcceptedWithRecovery(
         page,

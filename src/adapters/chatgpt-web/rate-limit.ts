@@ -1,5 +1,20 @@
 import type { Locator, Page } from "playwright-core";
 import { ChatGptWebAdapterError } from "./adapter-error";
+import { chatGptRequestPacer } from "../../chatgpt-request-pacing";
+
+function armRateLimitCooldown(): void {
+  if (chatGptRequestPacer.cooldownRemainingMs() > 0) return;
+  const cooldown = chatGptRequestPacer.noteRateLimit();
+  console.warn(`[chatgpt-web] rate_limit_cooldown cooldownMs=${cooldown.cooldownMs}`);
+}
+
+function rateLimitError(): ChatGptWebAdapterError {
+  armRateLimitCooldown();
+  return new ChatGptWebAdapterError(
+    "ChatGPT rate limit: too many requests. Try again in a few minutes.",
+    { status: 429, errorType: "rate_limit_error", code: "rate_limit_exceeded", retryable: true },
+  );
+}
 
 export const chatGptRateLimitDialog = (page: Page): Locator => page.locator('[role="dialog"]')
   .filter({ hasText: /Too many requests|太多要求|太多请求|リクエストが多すぎます/i })
@@ -18,16 +33,14 @@ export async function throwIfChatGptRateLimitDialog(page: Page): Promise<void> {
     try {
       await acknowledge.press("Enter", { timeout: 1000 });
     } catch (error) {
+      armRateLimitCooldown();
       throw new ChatGptWebAdapterError(
         `ChatGPT rate limit: too many requests, and the dialog could not be dismissed (${error instanceof Error ? error.message : String(error)}). Try again in a few minutes.`,
         { status: 429, errorType: "rate_limit_error", code: "rate_limit_exceeded", retryable: true },
       );
     }
   }
-  throw new ChatGptWebAdapterError(
-    "ChatGPT rate limit: too many requests. Try again in a few minutes.",
-    { status: 429, errorType: "rate_limit_error", code: "rate_limit_exceeded", retryable: true },
-  );
+  throw rateLimitError();
 }
 
 /** Stop pending navigation as soon as ChatGPT displays a rate-limit modal. */
@@ -43,10 +56,7 @@ export async function withChatGptNavigationGuard<T>(
   const watch = async (dialog: Locator): Promise<never> => {
     await dialog.waitFor({ state: "visible", timeout: 60_000, signal });
     // Report first. The owner must cancel a pending click before dismissing its blocking modal.
-    throw new ChatGptWebAdapterError(
-      "ChatGPT rate limit: too many requests. Try again in a few minutes.",
-      { status: 429, errorType: "rate_limit_error", code: "rate_limit_exceeded", retryable: true },
-    );
+    throw rateLimitError();
   };
   try {
     const result = await Promise.race([

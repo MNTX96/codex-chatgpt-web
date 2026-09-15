@@ -418,6 +418,10 @@ class BrowserHost {
         backgroundThrottling: true,
       },
     });
+    const primaryUserAgent = this.view.webContents.getUserAgent?.();
+    this.browserUserAgent = typeof primaryUserAgent === "string" && primaryUserAgent.trim()
+      ? primaryUserAgent
+      : null;
     window.contentView.addChildView(this.view);
     this.windowVisibilityListener = () => this.syncViewVisibility();
     for (const event of WINDOW_VISIBILITY_EVENTS) {
@@ -564,6 +568,11 @@ class BrowserHost {
         backgroundThrottling: false,
       },
     });
+    if (this.browserUserAgent && typeof view.webContents.setUserAgent === "function") {
+      // Keep every owned surface on the same real Electron identity as the primary persistent
+      // session. This prevents accidental per-tab UA drift without impersonating another browser.
+      view.webContents.setUserAgent(this.browserUserAgent);
+    }
     const tab = {
       id,
       ...(nativeScope ? { nativeScope } : {}),
@@ -635,6 +644,9 @@ class BrowserHost {
         backgroundThrottling: false,
       },
     });
+    if (this.browserUserAgent && typeof view.webContents.setUserAgent === "function") {
+      view.webContents.setUserAgent(this.browserUserAgent);
+    }
     const tab = {
       id,
       surfaceId: null,

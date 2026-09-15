@@ -5,6 +5,7 @@ import {
   decodeCompactionSummary,
 } from "./responses/compaction";
 import { BRIDGE_REASONING_PREFIX } from "./responses/reasoning-envelope";
+import { chatGptRequestPacer, retryAfterDelayMs } from "./chatgpt-request-pacing";
 
 const CODEX_BACKEND = "https://chatgpt.com/backend-api/codex";
 const FIRST_PARTY_CODEX_ORIGINATORS = new Set([
@@ -258,7 +259,15 @@ export async function forwardNativeCodexRequest(
     // forwarding account headers to a redirect destination.
     redirect: imageRequest ? "manual" : "follow",
   });
+  await chatGptRequestPacer.wait("native_api", request.signal);
   const upstream = await fetchUpstream(upstreamRequest);
+  if (upstream.status === 429) {
+    const cooldown = chatGptRequestPacer.noteRateLimit(retryAfterDelayMs(upstream.headers.get("retry-after")));
+    console.warn(`[codex-chatgpt-web] native_rate_limit_cooldown ${JSON.stringify({
+      endpoint,
+      cooldownMs: cooldown.cooldownMs,
+    })}`);
+  }
   if (compactionRequest && !upstream.ok) {
     console.warn(`[codex-chatgpt-web] native_compaction_upstream_failed ${JSON.stringify({
       endpoint, model, status: upstream.status,

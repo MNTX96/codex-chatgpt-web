@@ -177,10 +177,15 @@ describe("Image Factory contract", () => {
     const conversationUrl = `https://chatgpt.com/g/${projectId}-image-factory/c/6aa36a93-7164-83ec-8342-0441376d4255`;
     let currentUrl = `https://chatgpt.com/g/${projectId}/project`;
     let waits = 0;
+    let observedTimeout: number | undefined;
     const page = {
       url: () => currentUrl,
-      waitForURL: async (matcher: string | RegExp | ((url: URL) => boolean)) => {
+      waitForURL: async (
+        matcher: string | RegExp | ((url: URL) => boolean),
+        options?: { timeout?: number },
+      ) => {
         waits += 1;
+        observedTimeout = options?.timeout;
         currentUrl = conversationUrl;
         const matched = typeof matcher === "function"
           ? matcher(new URL(currentUrl))
@@ -193,6 +198,7 @@ describe("Image Factory contract", () => {
 
     await expect(waitForImageFactoryConversationUrl(page, projectId)).resolves.toBe(conversationUrl);
     expect(waits).toBe(1);
+    expect(observedTimeout).toBe(60_000);
     await expect(waitForImageFactoryConversationUrl(page, projectId)).resolves.toBe(conversationUrl);
     expect(waits).toBe(1);
   });

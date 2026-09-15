@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright-core";
+import { chatGptRequestPacer } from "./chatgpt-request-pacing";
 import { expandUserPath } from "./config";
 import { processRunning } from "./process";
 
@@ -685,6 +686,7 @@ export async function notifyLauncherTurn(
   connectorBound?: boolean;
   cancelledByUser?: boolean;
 }> {
+  if (activity.phase === "start") await chatGptRequestPacer.wait("browser_tab");
   const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);

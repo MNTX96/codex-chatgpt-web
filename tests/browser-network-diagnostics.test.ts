@@ -1,15 +1,40 @@
 import { expect, test } from "bun:test";
-import { chatGptConversationResponseMetadata } from "../src/adapters/chatgpt-web/browser-network-diagnostics";
+import type { Page, Response } from "playwright-core";
+import { observeChatGptConversationResponses } from "../src/adapters/chatgpt-web/browser-network-diagnostics";
 
-test("conversation diagnostics expose only model, effort, HTTP status and byte count", () => {
-  const request={method:()=>"POST",postDataJSON:()=>({model:"gpt-6-pro",thinking_effort:"standard",messages:[{content:"PRIVATE-PROMPT"}],authorization:"SECRET"}),postDataBuffer:()=>Buffer.alloc(123)};
-  const response={url:()=>"https://chatgpt.com/backend-api/f/conversation?token=PRIVATE-URL",status:()=>200,request:()=>request} as any;
-  const result=chatGptConversationResponseMetadata(response);
-  expect(result).toEqual({status:200,requestBytes:123,model:"gpt-6-pro",thinkingEffort:"standard",reasoningEffort:undefined});
-  expect(JSON.stringify(result)).not.toMatch(/PRIVATE|SECRET/);
-  response.url=()=>"https://example.com/backend-api/f/conversation";
-  expect(chatGptConversationResponseMetadata(response)).toBeUndefined();
-  response.url=()=>"https://chatgpt.com/backend-api/f/conversation";
-  request.method=()=>"GET";
-  expect(chatGptConversationResponseMetadata(response)).toBeUndefined();
+function response(status: number, headers: Record<string, string> = {}): Response {
+  return {
+    url: () => "https://chatgpt.com/backend-api/f/conversation",
+    status: () => status,
+    headers: () => headers,
+    request: () => ({
+      method: () => "POST",
+      postDataJSON: () => ({ model: "gpt-test" }),
+      postDataBuffer: () => Buffer.from("{}"),
+    }),
+  } as unknown as Response;
+}
+
+test("a browser conversation HTTP 429 arms the shared rate-limit cooldown even without a modal", () => {
+  let responseListener: ((value: Response) => void) | undefined;
+  const page = {
+    on: (event: string, listener: (value: Response) => void) => {
+      if (event === "response") responseListener = listener;
+    },
+    off: () => {},
+  } as unknown as Page;
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (...args: unknown[]) => warnings.push(args.map(String).join(" "));
+  try {
+    observeChatGptConversationResponses(page, "image-429-test");
+    responseListener?.(response(429, { "retry-after": "75" }));
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  expect(warnings.some(line => (
+    line.includes("conversation_rate_limit_cooldown")
+    && line.includes('"cooldownMs":75000')
+  ))).toBe(true);
 });

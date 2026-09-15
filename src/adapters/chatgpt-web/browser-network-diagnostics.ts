@@ -1,4 +1,5 @@
 import type { Page, Response } from "playwright-core";
+import { chatGptRequestPacer, retryAfterDelayMs } from "../../chatgpt-request-pacing";
 
 const field = (value: unknown): string | undefined => typeof value === "string" && /^[A-Za-z0-9_.:-]{1,80}$/.test(value) ? value : undefined;
 
@@ -22,7 +23,16 @@ export function observeChatGptConversationResponses(page: Page, traceId: string)
   const observe = (response: Response) => {
     try {
       const metadata=chatGptConversationResponseMetadata(response);
-      if(metadata) console.info(`[chatgpt-web] conversation_response ${JSON.stringify({traceId,...metadata})}`);
+      if (!metadata) return;
+      console.info(`[chatgpt-web] conversation_response ${JSON.stringify({traceId,...metadata})}`);
+      if (metadata.status === 429) {
+        const retryAfter = retryAfterDelayMs(response.headers()["retry-after"] ?? null);
+        const cooldown = chatGptRequestPacer.noteRateLimit(retryAfter);
+        console.warn(`[chatgpt-web] conversation_rate_limit_cooldown ${JSON.stringify({
+          traceId,
+          cooldownMs: cooldown.cooldownMs,
+        })}`);
+      }
     } catch {}
   };
   page.on("response",observe);
