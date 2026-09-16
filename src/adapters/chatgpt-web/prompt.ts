@@ -27,6 +27,8 @@ export interface CompiledChatGptWebPrompt {
   images: ChatGptWebPromptImage[];
   /** DEV-only transactional context transport. Production prompts remain inline. */
   multipart?: ChatGptWebMultipartPrompt;
+  /** Older ordinary-turn history items removed after a retryable ChatGPT server failure. */
+  trimmedRetryMessages?: number;
   /** Oldest history items removed by native-style compaction fit recovery; absent on normal turns. */
   trimmedCompactionMessages?: number;
 }
@@ -35,6 +37,8 @@ export interface CompileChatGptWebPromptOptions {
   captureLunaCheckpoint?: boolean;
   experimentalMultipartParts?: ChatGptWebMultipartPartCount;
   imageFactory?: boolean;
+  /** Progressive standard-context history reduction for retries after ChatGPT "Something went wrong". */
+  retryHistoryReductionLevel?: number;
   /**
    * Manual Zero Risk transport keeps ChatGPT model/effort selection and prompt submission under the
    * user's control. The browser bridge may open the owned tab and copy this prompt, but it never
@@ -315,6 +319,63 @@ export function withoutContextCatalogNoise(messages: readonly CodexMessage[]): C
   });
 }
 
+interface RetryHistoryGroup {
+  indices: number[];
+  protected: boolean;
+}
+
+/**
+ * Reduce only history that predates the latest user request. Developer instructions and the newest
+ * cumulative checkpoint are protected, while each older user/agent turn keeps its assistant/tool
+ * tail together so retries do not leave orphaned tool results behind.
+ */
+export function trimChatGptWebRetryHistory(
+  messages: readonly CodexMessage[],
+  reductionLevel: number,
+): CodexMessage[] {
+  const level = Math.max(0, Math.min(3, Math.trunc(reductionLevel)));
+  if (level === 0 || messages.length < 2) return [...messages];
+
+  const latestUserIndex = messages.findLastIndex(message => message.role === "user");
+  if (latestUserIndex <= 0) return [...messages];
+
+  const latestCheckpointIndex = messages.findLastIndex((message, index) => {
+    if (index >= latestUserIndex || message.role !== "user") return false;
+    const content = plainMessageText(message);
+    return content !== undefined && isReadableCompactionSummaryText(content);
+  });
+  const groups: RetryHistoryGroup[] = [];
+  let current: RetryHistoryGroup | undefined;
+  const flush = (): void => {
+    if (!current || current.indices.length === 0) return;
+    groups.push(current);
+    current = undefined;
+  };
+
+  for (let index = 0; index < latestUserIndex; index += 1) {
+    const message = messages[index]!;
+    if (message.role === "developer" && current === undefined) {
+      groups.push({ indices: [index], protected: true });
+      continue;
+    }
+    if ((message.role === "user" || message.role === "agentMessage") && current !== undefined) {
+      flush();
+    }
+    current ??= { indices: [], protected: false };
+    current.indices.push(index);
+    if (message.role === "developer" || index === latestCheckpointIndex) current.protected = true;
+  }
+  flush();
+
+  const expendable = groups.filter(group => !group.protected);
+  if (expendable.length === 0) return [...messages];
+  const discardGroups = level >= 3
+    ? expendable.length
+    : Math.ceil(expendable.length * level / 3);
+  const discarded = new Set(expendable.slice(0, discardGroups).flatMap(group => group.indices));
+  return messages.filter((_message, index) => !discarded.has(index));
+}
+
 function messageEnvelope(
   message: CodexMessage,
   images: ChatGptWebPromptImage[],
@@ -499,6 +560,23 @@ export function compileChatGptWebPrompt(
   if (!mode.localTools && turnToken !== undefined) {
     throw new Error("A read-only ChatGPT Web effort must not receive a local-tool capability token");
   }
+  const retryHistoryReductionLevel = Math.max(
+    0,
+    Math.min(3, Math.trunc(options?.retryHistoryReductionLevel ?? 0)),
+  );
+  let sourceMessages = withoutContextCatalogNoise(
+    withoutSupersededModelSwitchContracts(parsed.context.messages),
+  );
+  const initialMessageCount = sourceMessages.length;
+  if (
+    retryHistoryReductionLevel > 0
+    && !parsed._compactionRequest
+    && !multipartEnabled
+    && !manualControl
+  ) {
+    sourceMessages = trimChatGptWebRetryHistory(sourceMessages, retryHistoryReductionLevel);
+  }
+  const trimmedRetryMessages = initialMessageCount - sourceMessages.length;
   const system = parsed.context.systemPrompt ?? [];
   const sharedContract = [
     "Act as the model backend for the Codex task encoded below.",
@@ -594,7 +672,9 @@ export function compileChatGptWebPrompt(
     : [];
   const contextState = multipartEnabled
     ? "All expected context parts have been sent; use the entire multipart transaction, not just the final payload."
-    : "The task context is complete.";
+    : trimmedRetryMessages > 0
+      ? `The current request, system/developer instructions, latest checkpoint if present, and retained recent context are complete; ${trimmedRetryMessages} older history item(s) were omitted after a retryable ChatGPT server failure.`
+      : "The task context is complete.";
   const transportResume = parsed._compactionRequest
     ? manualControl
       ? [
@@ -705,13 +785,12 @@ export function compileChatGptWebPrompt(
         "</codex_transport_resume>",
       ] : transportResume),
     ].join("\n");
-    return { text, images };
+    return {
+      text,
+      images,
+      ...(trimmedRetryMessages > 0 ? { trimmedRetryMessages } : {}),
+    };
   };
-
-  let sourceMessages = withoutContextCatalogNoise(
-    withoutSupersededModelSwitchContracts(parsed.context.messages),
-  );
-  const initialMessageCount = sourceMessages.length;
   let compiled = build(sourceMessages);
   if (!parsed._compactionRequest) return compiled;
 

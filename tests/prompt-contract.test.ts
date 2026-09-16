@@ -116,6 +116,80 @@ test("read-only prompts resume without exposing a bind capability", () => {
   expect(compiled.text).not.toContain("CODEX_INTERNAL_CONTEXT_COMPACT");
 });
 
+test("standard-context retries progressively trim old turn groups while preserving active context", () => {
+  const parsed = request("high");
+  const checkpoint = `${SUMMARY_PREFIX}\nState: preserve this cumulative checkpoint.`;
+  parsed.context.messages = [
+    { role: "developer", content: "preserve-developer", timestamp: 1 },
+    { role: "user", content: "old-user-1", timestamp: 2 },
+    { role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "inspect", arguments: {} }], timestamp: 3 },
+    { role: "toolResult", toolCallId: "call-1", toolName: "inspect", content: "old-tool-result-1", isError: false, timestamp: 4 },
+    { role: "assistant", content: [{ type: "text", text: "old-answer-1" }], timestamp: 5 },
+    { role: "user", content: "old-user-2", timestamp: 6 },
+    { role: "assistant", content: [{ type: "text", text: "old-answer-2" }], timestamp: 7 },
+    { role: "user", content: "old-user-3", timestamp: 8 },
+    { role: "assistant", content: [{ type: "text", text: "old-answer-3" }], timestamp: 9 },
+    { role: "user", content: checkpoint, timestamp: 10 },
+    { role: "user", content: "CURRENT-USER-REQUEST", timestamp: 11 },
+  ];
+  const capabilities = { localToolsEnabled: false, solAvailable: true, proAvailable: true };
+  const compiled = [0, 1, 2, 3].map(level => compileChatGptWebPrompt(
+    parsed,
+    capabilities,
+    undefined,
+    level === 0 ? undefined : { retryHistoryReductionLevel: level },
+  ));
+  const context = compiled.map(item => {
+    const match = item.text.match(/<codex_context_json>\n([^\n]+)\n<\/codex_context_json>/);
+    expect(match).not.toBeNull();
+    return JSON.parse(match![1]!) as {
+      system: string[];
+      messages: Array<{ role: string; content: unknown }>;
+    };
+  });
+  const encoded = context.map(item => JSON.stringify(item.messages));
+
+  expect(compiled[0]!.trimmedRetryMessages).toBeUndefined();
+  expect(compiled[1]!.trimmedRetryMessages).toBe(4);
+  expect(compiled[2]!.trimmedRetryMessages).toBe(6);
+  expect(compiled[3]!.trimmedRetryMessages).toBe(8);
+  for (let level = 0; level <= 3; level += 1) {
+    expect(compiled[level]!.multipart).toBeUndefined();
+    expect(context[level]!.system).toEqual(["preserve-system"]);
+    expect(encoded[level]).toContain("preserve-developer");
+    expect(encoded[level]).toContain("CURRENT-USER-REQUEST");
+    expect(encoded[level]).toContain("preserve this cumulative checkpoint");
+  }
+  expect(encoded[0]).toContain("old-tool-result-1");
+  expect(encoded[1]).not.toContain("old-user-1");
+  expect(encoded[1]).not.toContain("old-tool-result-1");
+  expect(encoded[1]).toContain("old-user-2");
+  expect(encoded[2]).not.toContain("old-user-2");
+  expect(encoded[2]).toContain("old-user-3");
+  expect(encoded[3]).not.toContain("old-user-3");
+  expect(compiled[3]!.text).toContain("8 older history item(s) were omitted after a retryable ChatGPT server failure");
+});
+
+test("retry history reduction is ignored when Bigger Context multipart is explicitly active", () => {
+  const parsed = request("high");
+  parsed.context.messages.push(
+    { role: "assistant", content: [{ type: "text", text: "old-answer" }], timestamp: 3 },
+    { role: "user", content: "LATEST-REQUEST", timestamp: 4 },
+  );
+  const compiled = compileChatGptWebPrompt(
+    parsed,
+    { localToolsEnabled: false, solAvailable: true, proAvailable: true },
+    undefined,
+    { experimentalMultipartParts: CHATGPT_BIGGER_CONTEXT_PARTS, retryHistoryReductionLevel: 3 },
+  );
+
+  expect(compiled.multipart).toBeDefined();
+  expect(compiled.trimmedRetryMessages).toBeUndefined();
+  expect(compiled.multipart!.parts.join("\n")).toContain("perform the task");
+  expect(compiled.multipart!.parts.join("\n")).toContain("old-answer");
+  expect(compiled.multipart!.parts.join("\n")).toContain("LATEST-REQUEST");
+});
+
 test("Bigger Context sends three semantic record envelopes and starts work from the final part", () => {
   const token = "turn_12345678901234567890123456789012";
   const parsed = request("high");

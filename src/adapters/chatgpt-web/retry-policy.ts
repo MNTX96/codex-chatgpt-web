@@ -63,6 +63,19 @@ export class ChatGptWebTurnRetryPolicy {
     return entry && entry.retries > MAX_CHATGPT_WEB_TURN_RETRIES ? exhaustedError(entry) : undefined;
   }
 
+  retryCountForLastError(
+    key: string,
+    code: string,
+    messageIncludes?: string,
+    now = Date.now(),
+  ): number {
+    this.prune(now);
+    const entry = this.entries.get(key);
+    if (!entry || entry.lastError.code !== code) return 0;
+    if (messageIncludes !== undefined && !entry.lastError.message.includes(messageIncludes)) return 0;
+    return entry.retries;
+  }
+
   clear(key: string): void {
     this.entries.delete(key);
   }

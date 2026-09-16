@@ -553,24 +553,6 @@ async function main(): Promise<void> {
     throw new Error("--home does not apply to DEV mode; use CODEX_WEB_GPT_DEV_HOME for an explicit isolated DEV profile");
   }
   if (command === "help") stdout.write(HELP);
-  else if (command === "native-authority") {
-    const action = args.shift();
-    const workspace = takeOption(args, "--workspace");
-    const canaryId = takeOption(args, "--canary-id");
-    assertNoArgs(args);
-    if (!workspace) throw new Error("native-authority requires --workspace PATH");
-    if (action === "inspect" && canaryId) {
-      const { inspectLoadedNativeRuntime } = await import("./adapters/chatgpt-web/native-authority");
-      stdout.write(JSON.stringify(await inspectLoadedNativeRuntime(workspace, canaryId)) + "\n");
-      return;
-    }
-    if (action !== "install" || canaryId) throw new Error("Use native-authority install --workspace PATH or inspect --workspace PATH --canary-id ID");
-    const { installNativeAuthority, NATIVE_AUTHORITY_PROTOCOL } = await import("./adapters/chatgpt-web/native-authority");
-    const installed = installNativeAuthority(workspace);
-    stdout.write(JSON.stringify({ protocol: NATIVE_AUTHORITY_PROTOCOL, workspace: installed.workspace,
-      executableSha256: installed.executableSha256, integrityFiles: installed.integrityFiles,
-      restartRequired: true }) + "\n");
-  }
   else if (command === "setup") await setupCommand(args);
   else if (command === "login") await loginCommand(args);
   else if (command === "doctor" || command === "status") await doctorCommand(args);

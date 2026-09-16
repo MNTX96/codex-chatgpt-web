@@ -29,8 +29,7 @@ interface RunMessage {
   };
   turn: {
     traceId: string;
-    nativeBinding?: BrowserTurn["nativeBinding"];
-    nativeImageReconcile?: BrowserTurn["nativeImageReconcile"];
+    imageReconcile?: BrowserTurn["imageReconcile"];
     modelId: string;
     reasoning?: string;
     capabilities: ChatGptWebCapabilities;
@@ -338,8 +337,7 @@ async function run(message: RunMessage): Promise<void> {
     ...(message.turn.nativeConnector ? { nativeConnector: true } : {}),
     prepare: prepareSelected,
     ...(message.turn.resumeAvailable ? { prepareResume: prepareSelected } : {}),
-    ...(message.turn.nativeImageReconcile ? { nativeImageReconcile: message.turn.nativeImageReconcile } : {}),
-    ...(message.turn.nativeBinding ? { nativeBinding: message.turn.nativeBinding } : {}),
+    ...(message.turn.imageReconcile ? { imageReconcile: message.turn.imageReconcile } : {}),
     ...(message.turn.retainConversation ? { retainConversation: true } : {}),
     ...(message.turn.requireRetainedConversation ? { requireRetainedConversation: true } : {}),
     ...(message.turn.resumeConversationUrl ? { resumeConversationUrl: message.turn.resumeConversationUrl } : {}),
@@ -707,15 +705,6 @@ process.once("SIGTERM", () => {
   void requestShutdown();
 });
 
-// Advertise the optional frames this helper understands so the daemon can negotiate them explicitly.
-if (process.argv.includes("--native-runtime-info")) {
-  writeProtocol({ protocol: "native-authority", helper_sha256: LOADED_RUNTIME_IDENTITY.sha256,
-    started_at: LOADED_RUNTIME_IDENTITY.started_at, tool_schema_hashes: imageToolSchemaHashes(),
-    features: ["image-transfer-v1", "image-factory-v2", "native-authority"],
-    observed_limits: { max_stable_parallel_dispatches: 2, image_job_deadline_seconds: IMAGE_FACTORY_TIMEOUTS.job / 1000,
-      image_reference_limit: 10, image_upload_max_bytes: 20_000_000 } });
-  process.exit(0);
-}
 writeProtocol({
   type: "ready",
   features: [
@@ -727,9 +716,6 @@ writeProtocol({
     "image-factory-v1",
     "image-factory-v2",
     "image-transfer-v1",
-    "native-authority",
     "follow-up-v1",
   ],
 });
-import { LOADED_RUNTIME_IDENTITY } from "../../runtime-build-identity";
-import { IMAGE_FACTORY_TIMEOUTS, imageToolSchemaHashes } from "./image-factory/contracts";

@@ -15,7 +15,6 @@ const id = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/);
 const imageCount = z.number().int().min(1).max(4).default(1);
 export const imageGenerateSchema = z.object({
   request_id: id,
-  request_binding_sha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
   prompt: z.string().trim().min(1).max(100_000),
   reference_image_paths: z.array(z.string().min(1).max(4096)).max(10).optional(),
   image_session_id: id.optional(),
@@ -23,7 +22,6 @@ export const imageGenerateSchema = z.object({
 }).strict();
 export const imageEditSchema = z.object({
   request_id: id,
-  request_binding_sha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
   image_session_id: id,
   source_artifact_id: id,
   prompt: z.string().trim().min(1).max(100_000),
@@ -46,6 +44,7 @@ export interface ImageJobSubmission {
   requestedCount: number;
   generatedCount: number;
   downloadedCount: number;
+  assistantTurnId?: string;
   candidateKeys: string[];
   excessCandidateKeys: string[];
   failures: ImageJobCandidateError[];
@@ -116,7 +115,7 @@ export function imageToolInventory() {
   }));
 }
 
-/** Hash the loaded public schemas, including native binding and reconciliation arguments. */
+/** Hash the loaded public Image Factory schemas. */
 export function imageToolSchemaHashes(): Record<string, string> {
   return Object.fromEntries(imageToolInventory().map(tool => [tool.name,
     createHash("sha256").update(JSON.stringify(tool.parameters)).digest("hex")]));

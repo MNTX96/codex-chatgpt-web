@@ -1,4 +1,3 @@
-import { NATIVE_AUTHORITY_PROTOCOL, NativeBrowserAuthority, type NativeBindingSpec, type NativeImageReconcile } from "./native-authority";
 import { readLauncherBrowserHostDescriptor } from "../../launcher-browser-host";
 import { chatGptRequestPacer } from "../../chatgpt-request-pacing";
 import { chatGptRateLimitDialog, throwIfChatGptRateLimitDialog, withChatGptNavigationGuard } from "./rate-limit";
@@ -1219,13 +1218,16 @@ export interface BrowserTurn {
   onPreparedSelected?: (reused: boolean) => void | Promise<void>;
   abortSignal?: AbortSignal;
   onHeartbeat?: () => void;
-  /** Send activation is the ambiguity boundary after which a fresh surface must not replay this prompt. */
-  nativeBinding?: NativeBindingSpec;
-  nativeImageReconcile?: NativeImageReconcile;
-  nativeAuthority?: NativeBrowserAuthority;
+  /** Capture an already observed Image Factory assistant turn without submitting a new prompt. */
+  imageReconcile?: {
+    assistantTurnId: string;
+    excludeCandidateKeys: string[];
+  };
   onSendActivated?: () => void | Promise<void>;
   /** Semantic submission evidence proved that ChatGPT accepted the prompt. */
   onSubmitted?: (conversationUrl?: string) => void;
+  /** The current assistant response has a stable ChatGPT turn id. */
+  onResponseVisible?: (assistantTurnId: string) => void;
   /** One inert Bigger Context stage completed its exact acknowledgement boundary. */
   onMultipartStageAcknowledged?: (stageIndex: number) => void | Promise<void>;
   /** Visible ChatGPT reasoning-summary step titles only; never hidden chain-of-thought. */
@@ -3959,7 +3961,7 @@ export class ChatGptBrowserWorker {
     captureDiagnostic?: (checkpoint: string) => Promise<void>,
     abortSignal?: AbortSignal,
     externalProgress?: ChatGptTurnProgressReader,
-    submissionLifecycle?: Pick<BrowserTurn, "onSendActivated" | "onSubmitted" | "persistentProjectId" | "nativeAuthority">,
+    submissionLifecycle?: Pick<BrowserTurn, "onSendActivated" | "onSubmitted" | "persistentProjectId">,
     completionTracker?: ChatGptCompletionTracker,
     recoverObservation?: ChatGptObservationRecovery,
     attachmentGuard?: AttachmentGuard,
@@ -3994,7 +3996,6 @@ export class ChatGptBrowserWorker {
     await captureDiagnostic?.("send-ready");
     await effectiveAttachmentGuard.assertReady(abortSignal);
     const initialToolBatchRevision = externalProgress?.snapshot().lastToolBatchRevision ?? 0;
-    await submissionLifecycle?.nativeAuthority?.claim();
     await submissionLifecycle?.onSendActivated?.();
     await effectiveAttachmentGuard.assertReady(abortSignal);
     abortSignal?.throwIfAborted();
@@ -4022,12 +4023,6 @@ export class ChatGptBrowserWorker {
         abortSignal,
       )
       : browserPageUrl(page);
-    if (submissionLifecycle?.nativeAuthority) {
-      const state = await this.submissionDomState(page, baseline.domCache, abortSignal);
-      const userId = chatGptNewTurnIdentity(baseline.initialTurnIdentities, state.userIdentities);
-      if (!userId) throw new Error("native_user_turn_missing");
-      await submissionLifecycle.nativeAuthority.submitted(userId, submittedUrl);
-    }
     submissionLifecycle?.onSubmitted?.(submittedUrl);
     return evidence;
   }
@@ -4104,7 +4099,7 @@ export class ChatGptBrowserWorker {
     source: OutputImageSource,
     prompt: string,
     abortSignal?: AbortSignal,
-    submissionLifecycle?: Pick<BrowserTurn, "onSendActivated" | "onSubmitted" | "persistentProjectId" | "nativeAuthority">,
+    submissionLifecycle?: Pick<BrowserTurn, "onSendActivated" | "onSubmitted" | "persistentProjectId">,
     completionTracker?: ChatGptCompletionTracker,
     recoverObservation?: ChatGptObservationRecovery,
   ): Promise<ChatGptSubmissionEvidence> {
@@ -4183,8 +4178,7 @@ export class ChatGptBrowserWorker {
         await budget.pause();
       }
       const initialToolBatchRevision = 0;
-      await submissionLifecycle?.nativeAuthority?.claim();
-    await submissionLifecycle?.onSendActivated?.();
+      await submissionLifecycle?.onSendActivated?.();
       abortSignal?.throwIfAborted();
       await chatGptRequestPacer.wait("browser_submit", abortSignal);
       await send.press("Enter", { noWaitAfter: true, signal: abortSignal, timeout: 0 });
@@ -4211,7 +4205,6 @@ export class ChatGptBrowserWorker {
           abortSignal,
         )
         : browserPageUrl(page);
-      await submissionLifecycle?.nativeAuthority?.submitted(userTurnId, submittedUrl);
       submissionLifecycle?.onSubmitted?.(submittedUrl);
       return evidence;
     } finally {
@@ -4998,15 +4991,6 @@ export class ChatGptBrowserWorker {
   }
 
   private async runExclusive(turn: BrowserTurn): Promise<string> {
-    const nativeAbort = new AbortController();
-    if (turn.nativeBinding) {
-      turn = { ...turn, abortSignal: turn.abortSignal ? AbortSignal.any([turn.abortSignal, nativeAbort.signal]) : nativeAbort.signal };
-      if (this.config.browserHost !== "launcher" || !readLauncherBrowserHostDescriptor(this.config.browserHostDescriptorPath!).features?.includes(NATIVE_AUTHORITY_PROTOCOL)) {
-        throw new Error("native_launcher_restart_required");
-      }
-      turn.nativeAuthority = new NativeBrowserAuthority(turn.nativeBinding!);
-      await turn.nativeAuthority.admit(Boolean(turn.nativeImageReconcile));
-    }
     if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
     if (this.config.browserHost !== "launcher") return this.runBrowserTurn(turn);
     if (turn.executionTarget?.output === "image" || turn.requireOutputArtifact) {
@@ -5015,7 +4999,6 @@ export class ChatGptBrowserWorker {
 
     const acquireLease = () => notifyLauncherTurn(this.config.browserHostDescriptorPath!, {
         phase: "start",
-        ...(turn.nativeBinding ? { nativeScope: turn.nativeBinding.scope } : {}),
         traceId: turn.traceId,
         helperPid: process.pid,
         ...(turn.conversationKey ? { conversationKey: turn.conversationKey } : {}),
@@ -5038,7 +5021,6 @@ export class ChatGptBrowserWorker {
       });
     const lease = await acquireLease();
     const surfaceId = lease.surfaceId;
-    if (turn.nativeAuthority) turn.nativeAuthority.surface(lease.tabId!, surfaceId!, turn.conversationKey ?? turn.nativeBinding!.requestSha256);
     const reused = lease.reused === true;
     let terminal: "completed" | "failed" | "aborted" = "completed";
     let terminalMessage: string | undefined;
@@ -5049,7 +5031,6 @@ export class ChatGptBrowserWorker {
     const sendHeartbeat = () => {
       if (heartbeatInFlight) return;
       heartbeatInFlight = true;
-      void turn.nativeAuthority?.heartbeat().catch(error => nativeAbort.abort(error));
       void notifyLauncherTurn(this.config.browserHostDescriptorPath!, {
         phase: "heartbeat",
         traceId: turn.traceId,
@@ -5097,7 +5078,7 @@ export class ChatGptBrowserWorker {
           helperPid: process.pid,
           status: terminal,
           ...(terminalMessage ? { message: terminalMessage } : {}),
-          ...(terminal === "completed" && turn.retainConversation && !turn.nativeBinding ? { retain: true } : {}),
+          ...(terminal === "completed" && turn.retainConversation ? { retain: true } : {}),
           ...(terminal === "completed" && (turn.nativeConnector || turn.capabilities.localToolsEnabled)
             ? { connectorBound: true }
             : {}),
@@ -5167,11 +5148,6 @@ export class ChatGptBrowserWorker {
     const prepare = reuseConversation ? turn.prepareResume : turn.prepare;
     if (!prepare) throw new Error("The retained ChatGPT conversation has no continuation prompt");
     const prepared = await this.preparePrompt(turn, prepare);
-    if (turn.nativeAuthority) {
-      if (prepared.multipart) throw new Error("native_multipart_requires_separate_bound_requests");
-      if (turn.nativeImageReconcile) await turn.nativeAuthority.prepareReconcile(turn.nativeImageReconcile);
-      else await turn.nativeAuthority.prepare(prepared.text, turn.reasoning ?? "");
-    }
     const diagnostics = new ChatGptBrowserDiagnostics(
       turn.traceId,
       this.config.browserDiagnosticsPath ?? join(getConfigDir(), "diagnostics", "browser-turns"),
@@ -5278,14 +5254,14 @@ export class ChatGptBrowserWorker {
       });
       if (!maintenancePage && !launcherSurfaceId) managedPage = page;
       diagnosticPage = page;
-      if (turn.nativeImageReconcile) {
-        if (!turn.nativeAuthority || !turn.outputArtifactTarget || !turn.outputArtifactExecutionKey || !launcherSurfaceId) {
-          throw new Error("native_reconcile_target_required");
+      if (turn.imageReconcile) {
+        if (!turn.outputArtifactTarget || !turn.outputArtifactExecutionKey || !launcherSurfaceId) {
+          throw new Error("image_reconcile_target_required");
         }
-        const source = turn.nativeImageReconcile;
+        const source = turn.imageReconcile;
         const responseTurn = page.locator(`[data-turn-id=${JSON.stringify(source.assistantTurnId)}]`);
         await responseTurn.waitFor({ state: "attached", timeout: 30_000, signal: turn.abortSignal });
-        if (await responseTurn.count() !== 1) throw new Error("native_reconcile_response_ambiguous");
+        if (await responseTurn.count() !== 1) throw new Error("image_reconcile_response_ambiguous");
         const capture = await new OutputImageAdapter().captureFinal({
           page, responseTurn, assistantTurnId: source.assistantTurnId, traceId: turn.traceId,
           executionKey: turn.outputArtifactExecutionKey, target: turn.outputArtifactTarget,
@@ -5296,16 +5272,13 @@ export class ChatGptBrowserWorker {
             jobId: turn.outputArtifactTarget.metadata!.jobId! },
         });
         for (const artifact of capture.artifacts) {
-          turn.nativeAuthority.artifact(artifact);
           turn.onOutputArtifact?.(artifact);
         }
-        turn.nativeAuthority.capture(capture);
         turn.onOutputArtifactCapture?.(capture);
         const responseText = await responseTurn.innerText();
-        await turn.nativeAuthority.complete(source.assistantTurnId, createHash("sha256").update(responseText).digest("hex"), responseText);
         return responseText;
       }
-      releaseNetworkDiagnostics = turn.nativeBinding ? undefined : observeChatGptConversationResponses(page, turn.traceId);
+      releaseNetworkDiagnostics = observeChatGptConversationResponses(page, turn.traceId);
       const rebindLauncherPage = async (
         attempt: number,
         cause: Error,
@@ -5360,7 +5333,7 @@ export class ChatGptBrowserWorker {
         turnConnection = connection.browser;
         releaseNetworkDiagnostics?.();
         page = connection.page;
-        releaseNetworkDiagnostics = turn.nativeBinding ? undefined : observeChatGptConversationResponses(page, turn.traceId);
+        releaseNetworkDiagnostics = observeChatGptConversationResponses(page, turn.traceId);
         diagnosticPage = page;
         console.warn(
           `[chatgpt-web] browser turn ${turn.traceId} rebound its existing launcher page after a stalled DOM probe`,
@@ -5979,6 +5952,7 @@ export class ChatGptBrowserWorker {
           if (!capturedResponse) {
             capturedResponse = true;
             await diagnostics.capture(page, "response-visible");
+            turn.onResponseVisible?.(responseTurn.identity);
           }
           const textDelta = (() => {
             try {
@@ -6055,7 +6029,6 @@ export class ChatGptBrowserWorker {
             }
             const outputArtifactTarget = turn.outputArtifactTarget;
             const outputArtifactExecutionKey = turn.outputArtifactExecutionKey;
-            await turn.nativeAuthority?.visible(responseTurn.identity);
             if (outputArtifactTarget && outputArtifactExecutionKey && snapshot.generatedImageKeys.length > 0) {
               const capture = await outputImageAdapter.captureFinal({
                 page, responseTurn: responseTurn.locator, assistantTurnId: responseTurn.identity,
@@ -6071,10 +6044,8 @@ export class ChatGptBrowserWorker {
                 } : undefined,
               });
               for (const artifact of capture.artifacts) {
-                turn.nativeAuthority?.artifact(artifact);
                 turn.onOutputArtifact?.(artifact);
               }
-              turn.nativeAuthority?.capture(capture);
               turn.onOutputArtifactCapture?.(capture);
               if (capture.failures.length > 0 || capture.artifacts.length === 0) {
                 const failureCodes = capture.failures.map(failure => `${failure.candidateKey}:${failure.code}`).join(",");
@@ -6112,7 +6083,6 @@ export class ChatGptBrowserWorker {
             } else {
               finalText = final.markdown;
             }
-            await turn.nativeAuthority?.complete(responseTurn.identity, createHash("sha256").update(finalText).digest("hex"), finalText);
             break;
           }
           if (!loggedCompletionWait && Date.now() - sentAt >= 60_000) {

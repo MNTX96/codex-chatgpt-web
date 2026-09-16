@@ -332,9 +332,6 @@ export class LauncherBrowserHelperClient {
     if (turn.outputArtifactTarget && !this.helperFeatures.has("output-artifact-v1")) {
       throw new Error("Launcher browser helper does not support output artifacts; update or restart the launcher");
     }
-    if (turn.nativeBinding && !this.helperFeatures.has("native-authority")) {
-      throw new Error("Launcher helper lacks native-authority; wait for the user's Launcher restart");
-    }
     if (turn.executionTarget?.output === "image" && !this.helperFeatures.has("image-factory-v1")) {
       throw new Error(
         "Launcher browser helper does not support Image Factory turns; update or restart the launcher",
@@ -409,8 +406,7 @@ export class LauncherBrowserHelperClient {
             capabilities: turn.capabilities,
             ...(turn.nativeConnector ? { nativeConnector: true } : {}),
             ...(turn.prepareResume ? { resumeAvailable: true } : {}),
-            ...(turn.nativeImageReconcile ? { nativeImageReconcile: turn.nativeImageReconcile } : {}),
-            ...(turn.nativeBinding ? { nativeBinding: turn.nativeBinding } : {}),
+            ...(turn.imageReconcile ? { imageReconcile: turn.imageReconcile } : {}),
             ...(turn.retainConversation ? { retainConversation: true } : {}),
             ...(turn.requireRetainedConversation ? { requireRetainedConversation: true } : {}),
             ...(turn.resumeConversationUrl ? { resumeConversationUrl: turn.resumeConversationUrl } : {}),

@@ -1357,8 +1357,10 @@ describe("ChatGPT outer-native harness v4", () => {
     const worker = ChatGptBrowserWorker.forProvider(provider);
     const originalRun = worker.run.bind(worker);
     let browserStarts = 0;
+    const prompts: string[] = [];
     (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
       browserStarts += 1;
+      prompts.push((await turn.prepare()).text);
       turn.onSendActivated?.();
       throw new ChatGptWebAdapterError("ChatGPT rate limit: too many requests. Try again in a few minutes.", {
         status: 429,
@@ -1385,6 +1387,71 @@ describe("ChatGPT outer-native harness v4", () => {
         }
       }
       expect(browserStarts).toBe(MAX_CHATGPT_WEB_TURN_RETRIES + 1);
+      expect(new Set(prompts).size).toBe(1);
+    } finally {
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+      await TurnBroker.forSocket(socketPath).close();
+    }
+  });
+
+  test("progressively trims standard context across Something went wrong retries", async () => {
+    const socketPath = brokerTestEndpoint(`cgw-h4-context-retry-${process.pid}-${Date.now()}`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://chatgpt-context-retry-${Date.now()}`,
+      chatgptWeb: { brokerSocketPath: socketPath, localToolsEnabled: false, solAvailable: true, proAvailable: true },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    const prompts: string[] = [];
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+      const prepared = await turn.prepare();
+      prompts.push(prepared.text);
+      turn.onSendActivated?.();
+      throw new ChatGptWebAdapterError("ChatGPT ended the turn with 'Something went wrong'. Retry the turn.", {
+        status: 502,
+        errorType: "server_error",
+        code: "upstream_server_error",
+        retryable: true,
+      });
+    };
+    const request = rawWireRequest(environmentXml);
+    request.context.messages = [
+      { role: "developer", content: "PRESERVE-DEVELOPER", timestamp: 1 },
+      { role: "user", content: `OLD-ONE-${"a".repeat(2_000)}`, timestamp: 2 },
+      { role: "assistant", content: [{ type: "text", text: `OLD-ANSWER-ONE-${"b".repeat(2_000)}` }], timestamp: 3 },
+      { role: "user", content: `OLD-TWO-${"c".repeat(2_000)}`, timestamp: 4 },
+      { role: "assistant", content: [{ type: "text", text: `OLD-ANSWER-TWO-${"d".repeat(2_000)}` }], timestamp: 5 },
+      { role: "user", content: `OLD-THREE-${"e".repeat(2_000)}`, timestamp: 6 },
+      { role: "assistant", content: [{ type: "text", text: `OLD-ANSWER-THREE-${"f".repeat(2_000)}` }], timestamp: 7 },
+      { role: "user", content: "CURRENT-USER-MUST-STAY", timestamp: 8 },
+    ];
+    try {
+      for (let attempt = 0; attempt <= MAX_CHATGPT_WEB_TURN_RETRIES; attempt += 1) {
+        const events: AdapterEvent[] = [];
+        await createChatGptWebAdapter(provider).runTurn!(
+          request,
+          { headers: new Headers() },
+          event => events.push(event),
+        );
+        expect(events.at(-1)).toMatchObject({ type: "error", code: "upstream_server_error" });
+      }
+
+      expect(prompts).toHaveLength(MAX_CHATGPT_WEB_TURN_RETRIES + 1);
+      expect(prompts[1]!.length).toBeLessThan(prompts[0]!.length);
+      expect(prompts[2]!.length).toBeLessThan(prompts[1]!.length);
+      expect(prompts[3]!.length).toBeLessThan(prompts[2]!.length);
+      for (const prompt of prompts) {
+        expect(prompt).toContain("PRESERVE-DEVELOPER");
+        expect(prompt).toContain("CURRENT-USER-MUST-STAY");
+        expect(prompt).not.toContain("codex_multipart_stage");
+      }
+      expect(prompts[0]).toContain("OLD-ONE-");
+      expect(prompts[1]).not.toContain("OLD-ONE-");
+      expect(prompts[1]).toContain("OLD-TWO-");
+      expect(prompts[2]).not.toContain("OLD-TWO-");
+      expect(prompts[2]).toContain("OLD-THREE-");
+      expect(prompts[3]).not.toContain("OLD-THREE-");
     } finally {
       (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
       await TurnBroker.forSocket(socketPath).close();

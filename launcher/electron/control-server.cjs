@@ -335,13 +335,6 @@ class BrowserControlServer {
           body.requireRetainedConversation === true,
         ];
         if (resumeConversationUrl) beginTurnArgs.push(resumeConversationUrl, persistentProjectId);
-        if (body.nativeScope !== undefined) {
-          if (typeof body.nativeScope !== "string" || !/^[a-f0-9]{64}$/.test(body.nativeScope)) {
-            throw new Error("native scope is invalid");
-          }
-          while (beginTurnArgs.length < 8) beginTurnArgs.push(undefined);
-          beginTurnArgs.push(body.nativeScope);
-        }
         const lease = await host.beginTurn(...beginTurnArgs);
         this.logger.info("browser.turn_started", { traceId: body.traceId });
         writeJson(response, 200, { ok: true, ...lease });

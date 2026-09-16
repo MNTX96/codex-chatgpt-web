@@ -418,7 +418,6 @@ export async function readLauncherImageFactoryProjectId(
 export type LauncherTurnActivity =
   | {
       phase: "start";
-      nativeScope?: string;
       traceId: string;
       helperPid: number;
       conversationKey?: string;
@@ -717,9 +716,6 @@ export async function notifyLauncherTurn(
     }
     const body = await response.json().catch(() => ({})) as Record<string, unknown>;
     if (activity.phase === "start") {
-      if (activity.nativeScope && (typeof body.tabId !== "string" || !body.tabId)) {
-        throw new Error("Native Launcher did not return its bound tab id");
-      }
       if (typeof body.surfaceId !== "string" || !/^[A-Za-z0-9_-]{32}$/.test(body.surfaceId)) {
         throw new Error("Launcher browser control channel returned an invalid turn surface id");
       }

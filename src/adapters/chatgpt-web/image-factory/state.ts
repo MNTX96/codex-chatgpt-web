@@ -3,7 +3,6 @@ import { existsSync, lstatSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { atomicWriteFile } from "../../../config";
 import type { OutputImageSource } from "../artifacts/types";
-import type { NativeBindingSpec } from "../native-authority";
 import {
   ImageFactoryError,
   type ImageFactoryInput,
@@ -26,7 +25,6 @@ export interface ImageSession {
   updatedAt: number;
 }
 export interface StoredImageJob {
-  nativeBinding?: NativeBindingSpec;
   key: string;
   owner: string;
   payloadHash: string;

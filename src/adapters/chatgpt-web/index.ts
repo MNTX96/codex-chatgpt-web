@@ -1,5 +1,4 @@
-import { nativeImageReconciler } from "./image-factory/reconcile";
-import { callNativeAuthority, completeNativeTurnLifecycle, resolveNativeBinding, type NativeBindingSpec } from "./native-authority";
+import { imageFactoryReconciler } from "./image-factory/reconcile";
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
@@ -630,8 +629,6 @@ export function createChatGptWebAdapter(
           let capture: OutputImageCaptureResult | undefined;
           try {
             const answer = await imageFactoryWorker.run({
-              ...(options.nativeBinding ? { nativeBinding: { ...options.nativeBinding,
-                imageJobId: options.request.jobId, imageSessionId: session.id } } : {}),
               traceId: `image_${options.request.jobId.slice(0, 46)}_${attempt}`,
               modelId: imageModelId,
               reasoning: imageModelPolicy.reasoning,
@@ -669,6 +666,14 @@ export function createChatGptWebAdapter(
                   updatedAt: Date.now(),
                 };
                 options.update({ session, phase: "submitted", result: currentResult() });
+              },
+              onResponseVisible: assistantTurnId => {
+                submission.assistantTurnId = assistantTurnId;
+                session = {
+                  ...session,
+                  updatedAt: Date.now(),
+                };
+                options.update({ session, result: currentResult() });
               },
               onTextDelta: () => {},
               outputArtifactTarget: childTarget,
@@ -777,7 +782,7 @@ export function createChatGptWebAdapter(
       },
       reservations => chatGptBrowserCapacityAvailable(reservations),
       {},
-      nativeImageReconciler(provider),
+      imageFactoryReconciler(provider, executionNamespace),
     ))
     : undefined;
   const retainedLauncherDescriptor = provider.chatgptWeb?.browserHost === "launcher"
@@ -816,6 +821,7 @@ export function createChatGptWebAdapter(
     hooks: {
       onCompactionProgress?: () => void;
       onSendActivated?: () => void | Promise<void>;
+      retryHistoryReductionLevel?: number;
     } = {},
   ): ChatGptTurnRuntime => {
     const manualRequest = isChatGptWebZeroRiskBackendModel(parsed.modelId);
@@ -830,13 +836,6 @@ export function createChatGptWebAdapter(
       ? { localTools: true }
       : resolveChatGptWebModelMode(parsed.modelId, parsed.options.reasoning, turnCapabilities);
     const identity = extractChatGptTurnIdentity(parsed);
-    let nativeBinding: NativeBindingSpec | undefined;
-    const nativeBindingReady = environment && identity.threadId
-      ? resolveNativeBinding(environment.cwd, identity.threadId,
-        parsed._compactionRequest ? "" : followUpRevisionText(extractChatGptTurnUserRevision(parsed)))
-      : Promise.resolve(undefined);
-    // A rejected registration must remain observed even on a non-Full route.
-    void nativeBindingReady.catch(() => {});
 
     const outputArtifactTarget = !parsed._compactionRequest && !manualRequest
       ? resolveOutputArtifactTarget(environment, chatGptTurnExecutionKey(parsed), provider.chatgptWeb?.generatedImageArtifacts)
@@ -882,6 +881,9 @@ export function createChatGptWebAdapter(
       return {
         captureLunaCheckpoint,
         imageFactory: Boolean(imageFactory && broker.bindImageTools),
+        ...(hooks.retryHistoryReductionLevel
+          ? { retryHistoryReductionLevel: hooks.retryHistoryReductionLevel }
+          : {}),
         ...(experimentalMultipartParts !== undefined
           ? { experimentalMultipartParts }
           : {}),
@@ -909,12 +911,7 @@ export function createChatGptWebAdapter(
     });
     const browserAbort = new AbortController();
     let browserOwnerSettled = false;
-    const trackBrowserOwner = (browser: Promise<string>): Promise<string> => browser.then(async answer => {
-      if (!manualRequest && environment && identity.threadId && identity.turnId) {
-        await completeNativeTurnLifecycle(environment.cwd, identity.threadId, identity.turnId, releaseRetainedConversation);
-      }
-      return answer;
-    }).finally(() => {
+    const trackBrowserOwner = (browser: Promise<string>): Promise<string> => browser.finally(() => {
       browserOwnerSettled = true;
     });
     const trace = new ChatGptTraceFeed();
@@ -1181,7 +1178,6 @@ export function createChatGptWebAdapter(
               throw new Error("Image Factory requires the structured automatic turn broker");
             }
             const result = await imageFactory.call({
-              ...(nativeBinding ? { nativeBinding } : {}),
               threadId: identity.threadId ?? identity.turnId ?? traceId,
               modelId: parsed.modelId,
               reasoning: parsed.options.reasoning,
@@ -1215,16 +1211,7 @@ export function createChatGptWebAdapter(
         throw error;
       }
     };
-    const browserTurn = cancellableBrowserTurn(trackBrowserOwner(finalizeCheckpoint(nativeBindingReady.then(async binding => {
-      nativeBinding = binding;
-      if (binding) {
-        const registered = await callNativeAuthority(binding.workspace, { operation: "load", request_sha256: binding.requestSha256 });
-        environment.nativePolicy = { workspace: binding.workspace, request_sha256: binding.requestSha256,
-          thread_id: binding.threadId, tool_policy: registered.payload.tool_policy };
-      }
-      return worker.run({
-      ...(binding ? { nativeBinding: { ...binding,
-        eventId: `${identity.turnId ?? traceId}:${parsed._compactionRequest ? "compaction" : "turn"}` } } : {}),
+    const browserTurn = cancellableBrowserTurn(trackBrowserOwner(finalizeCheckpoint(worker.run({
       traceId,
       modelId: parsed.modelId,
       reasoning: parsed.options.reasoning,
@@ -1241,7 +1228,7 @@ export function createChatGptWebAdapter(
       onTextDelta: delta => text.push(delta),
       ...outputArtifactLifecycle,
       externalProgress,
-      ...(followUp && !binding ? { followUp } : {}),
+      ...(followUp ? { followUp } : {}),
       completionFence: {
         begin: async () => broker.beginCompletionFence(await token.promise),
         commit: async revision => broker.commitCompletionFence(await token.promise, revision),
@@ -1250,7 +1237,6 @@ export function createChatGptWebAdapter(
         captureLunaCheckpoint: true,
         onLunaCheckpoint: captureCheckpoint,
       } : {}),
-    });
     }))), browserAbort);
     void browserTurn.browser.catch(error => {
       if (!tokenSettled) {
@@ -1269,7 +1255,7 @@ export function createChatGptWebAdapter(
       usageInput: checkpointInput.parsed,
       ...(conversationKey ? { conversationKey } : {}),
       ...(releaseRetainedConversation ? { releaseRetainedConversation } : {}),
-      get followUp() { return nativeBinding ? undefined : followUp; },
+      ...(followUp ? { followUp } : {}),
       retireCapability: async () => {
         if (activeToken) await broker.revoke(activeToken);
       },
@@ -1327,6 +1313,11 @@ export function createChatGptWebAdapter(
           });
           return;
         }
+        const retryHistoryReductionLevel = chatGptWebTurnRetryPolicy.retryCountForLastError(
+          retryKey,
+          "upstream_server_error",
+          "Something went wrong",
+        );
         let environment: ReturnType<typeof extractChatGptTurnEnvironment> | undefined;
         if (mode.localTools || (!manualRequest && provider.chatgptWeb?.generatedImageArtifacts?.mode !== "off")) {
           try {
@@ -1623,7 +1614,7 @@ export function createChatGptWebAdapter(
         const session = await chatGptTurnSessions.getOrCreateAfterOwnerRetirement(
           executionKey,
           ownerKey,
-          () => startRuntime(parsed, environment, traceId, turnCapabilities),
+          () => startRuntime(parsed, environment, traceId, turnCapabilities, { retryHistoryReductionLevel }),
           traceId,
           incoming.abortSignal,
           nativeTurnId,

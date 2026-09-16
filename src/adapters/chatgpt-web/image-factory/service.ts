@@ -20,7 +20,6 @@ import {
   type ImageToolName,
 } from "./contracts";
 import { ImageFactoryStore, imageKey, normalizeStoredImageJob, type ImageSession, type StoredImageJob } from "./state";
-import { bindNativeImageRequest, type NativeBindingSpec } from "../native-authority";
 
 export interface ImageFactoryBrowserRequest {
   stateDirectory: string;
@@ -30,7 +29,6 @@ export interface ImageFactoryBrowserRequest {
   sourceTurnId: string;
 }
 export interface ImageJobExecution {
-  nativeBinding?: NativeBindingSpec;
   request: ImageFactoryBrowserRequest;
   modelId: string;
   reasoning?: string;
@@ -52,7 +50,6 @@ export interface ImageFactoryBrowserUpdate {
   result?: Partial<ImageJobResult>;
 }
 export interface ImageFactoryParent {
-  nativeBinding?: NativeBindingSpec;
   threadId: string;
   modelId: string;
   reasoning?: string;
@@ -148,13 +145,7 @@ export class ImageFactoryService {
     if (name === "chatgpt_image_generate" || name === "chatgpt_image_edit") {
       const operation = name === "chatgpt_image_generate" ? "generate" : "edit";
       const input = operation === "generate" ? imageGenerateSchema.parse(args) : imageEditSchema.parse(args);
-      const nativeBinding = parent.nativeBinding
-        ? await bindNativeImageRequest(parent.nativeBinding, input.request_binding_sha256 ?? "",
-          input.prompt, input.count, "reference_image_paths" in input ? input.reference_image_paths ?? [] : [],
-          "source_artifact_id" in input ? input.source_artifact_id : undefined, input.image_session_id)
-        : undefined;
-      if (!parent.nativeBinding && input.request_binding_sha256) throw new ImageFactoryError("native_parent_binding_required");
-      return this.start(parent, owner, operation, input, nativeBinding);
+      return this.start(parent, owner, operation, input);
     }
     const { job_id: jobId } = imageJobSchema.parse(args);
     const key = imageKey("job-id", owner, jobId);
@@ -198,7 +189,7 @@ export class ImageFactoryService {
     return structuredClone(stored.result);
   }
 
-  private start(parent: ImageFactoryParent, owner: string, operation: ImageFactoryOperation, input: ImageFactoryInput, nativeBinding?: NativeBindingSpec): ImageJobResult {
+  private start(parent: ImageFactoryParent, owner: string, operation: ImageFactoryOperation, input: ImageFactoryInput): ImageJobResult {
     const jobId = imageKey(owner, input.request_id);
     const key = imageKey("job-id", owner, jobId);
     const payloadHash = normalizedPayloadHash(operation, input);
@@ -261,7 +252,6 @@ export class ImageFactoryService {
       ...(sourceArtifactId ? { sourceArtifactId } : {}),
     };
     const job: StoredImageJob = {
-      ...(nativeBinding ? { nativeBinding } : {}),
       key,
       owner,
       payloadHash,
@@ -296,7 +286,7 @@ export class ImageFactoryService {
     const abort = new AbortController();
     const onParentAbort = () => abort.abort(parent.signal.reason);
     parent.signal.addEventListener("abort", onParentAbort, { once: true });
-    const maxSubmissions = nativeBinding ? 1 : Math.max(
+    const maxSubmissions = Math.max(
       1,
       Math.min(
         IMAGE_FACTORY_TIMEOUTS.maxSubmissions,
@@ -331,7 +321,6 @@ export class ImageFactoryService {
     const done = Promise.resolve().then(async () => {
       abort.signal.throwIfAborted();
       const executionResult = await this.execute({
-        ...(nativeBinding ? { nativeBinding } : {}),
         request: { stateDirectory: this.store.directory, session: session!, jobId, jobKey: key, sourceTurnId: parent.threadId },
         modelId: parent.modelId,
         reasoning: parent.reasoning,

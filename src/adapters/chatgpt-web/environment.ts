@@ -15,12 +15,6 @@ export interface ChatGptTurnEnvironment {
   writableRoots: string[];
   sandboxPolicy: ChatGptSandboxPolicy;
   tools: CodexTool[];
-  nativePolicy?: {
-    workspace: string;
-    request_sha256: string;
-    thread_id: string;
-    tool_policy: "read_only_evidence" | "image_factory" | "flow_operation" | "delivery_operation";
-  };
 }
 
 export interface ChatGptTurnIdentity {

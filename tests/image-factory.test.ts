@@ -1,5 +1,5 @@
 import { ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-error";
-import { describe, expect, test, afterEach } from "bun:test";
+import { describe, expect, test, afterEach, spyOn } from "bun:test";
 import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { join } from "node:path";
@@ -15,7 +15,9 @@ import {
   waitForImageFactoryConversationUrl,
 } from "../src/adapters/chatgpt-web/image-factory/project-navigation";
 import { ImageFactoryService } from "../src/adapters/chatgpt-web/image-factory/service";
-import { ImageFactoryStore, imageKey } from "../src/adapters/chatgpt-web/image-factory/state";
+import { imageFactoryReconciler } from "../src/adapters/chatgpt-web/image-factory/reconcile";
+import { ImageFactoryStore, imageKey, type ImageSession, type StoredImageJob } from "../src/adapters/chatgpt-web/image-factory/state";
+import { ChatGptBrowserWorker } from "../src/adapters/chatgpt-web/browser-worker";
 import { configuredImageFactoryProjectId, imageFactoryResumePlan, resolveImageFactoryProjectConfig, resolveImageFactoryProjectId } from "../src/adapters/chatgpt-web/index";
 import { callTurnBroker, TurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
 import { LAUNCHER_BROWSER_HOST_KIND, LAUNCHER_BROWSER_IDLE_URL } from "../src/launcher-browser-host";
@@ -170,6 +172,119 @@ describe("Image Factory contract", () => {
       requireRetainedConversation: true,
       resumeConversationUrl: conversationUrl,
     });
+  });
+
+  test("reconcile uses the assistant turn recorded by that job instead of session-wide legacy state", async () => {
+    const directory = mkdtempSync(join(process.env.TMPDIR ?? "/tmp", "image-factory-reconcile-job-turn-"));
+    temporaryDirectories.push(directory);
+    const namespace = "namespace";
+    const threadId = "thread-reconcile";
+    const owner = imageKey(namespace, threadId);
+    const projectId = "g-p-image-factory";
+    const conversationUrl = `https://chatgpt.com/g/${projectId}-image-factory/c/6aa36a93-7164-83ec-8342-0441376d4255`;
+    const submission = {
+      id: "submission-1",
+      attempt: 1,
+      requestedCount: 1,
+      generatedCount: 1,
+      downloadedCount: 0,
+      assistantTurnId: "assistant-target-job",
+      candidateKeys: ["candidate-target"],
+      excessCandidateKeys: [],
+      failures: [],
+    };
+    const job: StoredImageJob = {
+      key: imageKey("job", "reconcile"),
+      owner,
+      payloadHash: imageKey("payload", "reconcile"),
+      operation: "generate",
+      input: { request_id: "request-reconcile", prompt: "draw", count: 1 },
+      requestedCount: 1,
+      attemptCount: 1,
+      submissions: [submission],
+      phase: "terminal",
+      updatedAt: Date.now(),
+      result: {
+        jobId: "job-reconcile",
+        imageSessionId: "session-reconcile",
+        status: "failed",
+        requestedCount: 1,
+        generatedCount: 1,
+        downloadedCount: 0,
+        attemptCount: 1,
+        artifacts: [],
+        submissions: [submission],
+      },
+    };
+    const session = {
+      id: "session-reconcile",
+      owner,
+      projectId,
+      conversationUrl,
+      hasConversation: true,
+      updatedAt: Date.now(),
+      // Simulate stale state written by the removed session-wide implementation.
+      lastAssistantTurnId: "assistant-from-another-job",
+    } as ImageSession & { lastAssistantTurnId: string };
+    const environment = {
+      cwd: directory,
+      roots: [directory],
+      writableRoots: [directory],
+      sandboxPolicy: { type: "workspaceWrite" as const, writableRoots: [directory], networkAccess: true },
+      tools: [],
+    };
+    const artifact = {
+      kind: "generated_image" as const,
+      id: "img_recovered",
+      relativePath: ".codex/chatgpt-web-artifacts/reconcile/recovered.png",
+      absolutePath: join(directory, "recovered.png"),
+      mimeType: "image/png" as const,
+      byteLength: 8,
+      sha256: "d".repeat(64),
+      source: {
+        assistantTurnId: "assistant-target-job",
+        candidateKey: "candidate-target",
+        imageSessionId: session.id,
+        projectId,
+        conversationUrl,
+      },
+    };
+    let observedAssistantTurnId: string | undefined;
+    const workerFactory = spyOn(ChatGptBrowserWorker, "forProvider").mockReturnValue({
+      run: async (turn: Parameters<ChatGptBrowserWorker["run"]>[0]) => {
+        observedAssistantTurnId = turn.imageReconcile?.assistantTurnId;
+        turn.onOutputArtifact?.(artifact);
+        turn.onOutputArtifactCapture?.({
+          artifacts: [artifact],
+          failures: [],
+          candidateKeys: ["candidate-target"],
+          excessCandidateKeys: [],
+          detectedCandidates: 1,
+          ignoredCandidates: 0,
+        });
+        return "recovered";
+      },
+    } as unknown as ChatGptBrowserWorker);
+    try {
+      const provider: CodexProviderConfig = {
+        adapter: "chatgpt-web",
+        baseUrl: "browser://image-factory-reconcile-test",
+        chatgptWeb: { solAvailable: true },
+      };
+      const result = await imageFactoryReconciler(provider, namespace)(job, session, {
+        threadId,
+        modelId: "gpt-5.6-sol",
+        reasoning: "high",
+        environment,
+        signal: new AbortController().signal,
+        activity: () => () => {},
+      });
+      expect(observedAssistantTurnId).toBe("assistant-target-job");
+      expect(result.status).toBe("completed");
+      expect(result.artifacts.map(value => value.id)).toEqual(["img_recovered"]);
+    } finally {
+      workerFactory.mockRestore();
+    }
   });
 
   test("Image Factory waits for the retained conversation route after first project submission", async () => {

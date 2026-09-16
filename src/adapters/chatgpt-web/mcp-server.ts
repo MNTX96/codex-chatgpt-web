@@ -11,7 +11,6 @@ import { CODEX_COMPACTION_CONTROL_WIRE_NAME } from "./native-compaction-control"
 import { callTurnBroker, TurnBrokerTimeoutError, type BrokerToolResult } from "./turn-broker";
 
 import { imageToolInventory, isImageTool, NATIVE_IMAGE_TOOLS, assertWebImageToolRouting } from "./image-factory/contracts";
-import { callNativeAuthority } from "./native-authority";
 
 interface ClaimedTurn {
   imageFactory?: boolean;
@@ -571,10 +570,6 @@ export async function runChatGptMcpServer(options: {
   ): Promise<T> => {
     const claimed = await claimTurn(toolName, turnToken, extra);
     try {
-      const policy = claimed.environment.nativePolicy;
-      if (policy && ["codex_apply_patch", "codex_exec", "codex_write_stdin"].includes(toolName)) {
-        throw new Error("native_tool_policy_forbids_mutation");
-      }
       return await action(claimed);
     } finally {
       // The broker's terminal fence treats even a fully local inventory lookup as live MCP work.
@@ -665,9 +660,6 @@ export async function runChatGptMcpServer(options: {
     signal?: AbortSignal,
   ) => {
     const bound = claimed.environment;
-    if (bound.nativePolicy) {
-      throw new Error("native_tool_outside_bound_policy");
-    }
     const execCommandArguments = {
       cmd: command,
       workdir: bound.cwd,
@@ -922,8 +914,6 @@ export async function runChatGptMcpServer(options: {
       async claimed => {
         const { path, detail } = input;
         const bound = claimed.environment;
-        if (bound.nativePolicy) await callNativeAuthority(bound.nativePolicy.workspace,
-          { ...bound.nativePolicy, operation: "authorize-read", path });
         const tool = exactTool(bound, "view_image");
         const payload = { arguments: { path, ...(detail ? { detail } : {}) } };
         return tool
@@ -957,20 +947,6 @@ export async function runChatGptMcpServer(options: {
         const { query, offset, limit, include_schema } = input;
         const bound = claimed.environment;
         const needle = query?.trim().toLowerCase();
-        if (bound.nativePolicy) {
-          const tools = [
-            { wire_name: "native_read_bound_file", name: "native_read_bound_file", kind: "function",
-              description: "Read only text files in this native request's verified evidence closure.",
-              parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"], additionalProperties: false } },
-            { wire_name: "view_image", name: "view_image", kind: "function",
-              description: "Inspect a hash-bound candidate or reference using the native Codex vision tool.",
-              parameters: { type: "object", properties: { path: { type: "string" }, detail: { enum: ["high", "original"] } }, required: ["path"], additionalProperties: false } },
-            ...(bound.nativePolicy.tool_policy === "image_factory" ? imageToolInventory() : []),
-          ].filter(tool => !needle || (tool.name + "\n" + tool.description).toLowerCase().includes(needle));
-          const page = tools.slice(offset, offset + limit).map(({ parameters, ...tool }) =>
-            ({ ...tool, ...(include_schema ? { parameters } : {}) }));
-          return result({ tools: page, total: tools.length, next_offset: offset + page.length < tools.length ? offset + page.length : null });
-        }
         const directMatches = safeVisibleTools(bound, contract).filter(tool => !claimed.imageFactory || !NATIVE_IMAGE_TOOLS.has(wireName(tool))).filter(tool => !needle || [
           wireName(tool),
           tool.name,
@@ -1073,19 +1049,6 @@ export async function runChatGptMcpServer(options: {
       }
       return withClaimedTurn("codex_tool_call", requestId, extra, async claimed => {
         const bound = claimed.environment;
-        if (bound.nativePolicy && wire_name === "native_read_bound_file") {
-          if (input !== undefined || typeof args?.path !== "string") throw new Error("native_bound_path_required");
-          return result(await callNativeAuthority(bound.nativePolicy.workspace,
-            { ...bound.nativePolicy, operation: "read", path: args.path }));
-        }
-        if (bound.nativePolicy && wire_name === "view_image") {
-          if (input !== undefined || typeof args?.path !== "string") throw new Error("native_bound_path_required");
-          await callNativeAuthority(bound.nativePolicy.workspace,
-            { ...bound.nativePolicy, operation: "authorize-read", path: args.path });
-        } else if (bound.nativePolicy
-          && !(bound.nativePolicy.tool_policy === "image_factory" && isImageTool(wire_name))) {
-          throw new Error("native_tool_outside_bound_policy");
-        }
         if (claimed.imageFactory) assertWebImageToolRouting(wire_name);
         if (claimed.imageFactory && isImageTool(wire_name)) {
           if (input !== undefined) throw new Error("Image Factory calls require structured arguments");
