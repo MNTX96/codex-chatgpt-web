@@ -18,6 +18,11 @@ test.each([[true, false, true], [false, false, true], [true, true, true], [true,
   let released = false;
   let selectedEffort: string | undefined;
   const page = { evaluate: async () => ({}), isClosed: () => false };
+  const generationLease = {
+    acquired: false,
+    acquire: async () => { generationLease.acquired = true; },
+    release: async () => { generationLease.acquired = false; },
+  };
   const worker = Object.assign(Object.create(ChatGptBrowserWorker.prototype), {
     config: { appName: "Codex Native2", browserDiagnosticsPath: diagnostics, ...(owned ? { browserHostDescriptorPath: "owned-descriptor" } : {}) },
     runStage: async (_trace: string, name: string, timeout: number, action: (signal: AbortSignal) => Promise<unknown>) => {
@@ -74,7 +79,7 @@ test.each([[true, false, true], [false, false, true], [true, true, true], [true,
         commit: async () => { throw new Error("fixture must stop before completion"); },
       } : undefined,
       prepare: async () => ({ text: "Summarize the context", images: [], multipart: multipart ? { parts: ['{"part":1}', '{"part":2}', '{"part":3}'], commit: "Summarize" } : undefined, release: () => { released = true; } }),
-    }, owned ? "owned-surface" : undefined, page)).rejects.toBe(finalResponse);
+    }, generationLease, owned ? "owned-surface" : undefined, page)).rejects.toBe(finalResponse);
     expect(recoveryCallbacks.map(callback => typeof callback)).toEqual(
       Array(multipart ? 6 : 2).fill(owned ? "function" : "undefined"),
     );

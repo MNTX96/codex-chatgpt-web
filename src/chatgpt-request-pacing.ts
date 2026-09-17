@@ -1,4 +1,9 @@
-export type ChatGptPacedAction = "browser_tab" | "browser_navigation" | "browser_submit" | "native_api";
+export type ChatGptPacedAction =
+  | "browser_tab"
+  | "browser_navigation"
+  | "browser_reload"
+  | "browser_submit"
+  | "native_api";
 
 export interface ChatGptRequestPacingOptions {
   intervalsMs?: Partial<Record<ChatGptPacedAction, number>>;
@@ -17,9 +22,10 @@ export interface ChatGptRateLimitCooldown {
 
 export const DEFAULT_CHATGPT_PACING_INTERVALS_MS: Readonly<Record<ChatGptPacedAction, number>> = Object.freeze({
   browser_tab: 1_500,
-  browser_navigation: 1_250,
-  browser_submit: 2_500,
-  native_api: 750,
+  browser_navigation: 3_000,
+  browser_reload: 5_000,
+  browser_submit: 15_000,
+  native_api: 15_000,
 });
 export const DEFAULT_CHATGPT_PACING_JITTER_MS = 350;
 export const CHATGPT_RATE_LIMIT_COOLDOWN_MIN_MS = 60_000;
@@ -148,6 +154,7 @@ const testPacingOptions: ChatGptRequestPacingOptions | undefined = process.env.N
     intervalsMs: {
       browser_tab: 0,
       browser_navigation: 0,
+      browser_reload: 0,
       browser_submit: 0,
       native_api: 0,
     },

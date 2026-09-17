@@ -40,6 +40,16 @@ const IDLE_BROWSER_URL = "data:text/html;charset=utf-8,%3C!doctype%20html%3E%3Ch
 const PRIMARY_VIEW_BOOTSTRAP_TIMEOUT_MS = 10_000;
 const MAX_BROWSER_VIEW_DIMENSION = 16_384;
 const MAX_BROWSER_TABS = 5;
+const MAX_ACTIVE_GENERATIONS = 2;
+const MAX_ACTIVE_IMAGE_GENERATIONS = 1;
+const GENERATION_SEND_START_GAP_MS = 15_000;
+const GENERATION_SEND_START_JITTER_MS = 350;
+const GENERATION_RATE_LIMIT_COOLDOWN_MIN_MS = 60_000;
+const GENERATION_RATE_LIMIT_COOLDOWN_MAX_MS = 120_000;
+const GENERATION_REPEATED_RATE_LIMIT_COOLDOWN_MIN_MS = 120_000;
+const GENERATION_REPEATED_RATE_LIMIT_COOLDOWN_MAX_MS = 240_000;
+const GENERATION_RATE_LIMIT_REPEAT_WINDOW_MS = 15 * 60_000;
+const GENERATION_RECOVERY_SUCCESS_THRESHOLD = 10;
 const MAX_CONSECUTIVE_GENERATION_RETRY_GRANTS = 2;
 const MAX_CANCELLED_TURN_TRACES = 256;
 const MANUAL_SUBMIT_TIMEOUT_MS = 30_000;
@@ -371,9 +381,19 @@ class BrowserHost {
     this.visible = false;
     this.surfaceActive = true;
     this.turnTabs = new Map();
-    this.generationOwner = null;
+    this.generationOwners = new Map();
     this.generationWaiters = [];
+    this.generationSendWaiters = [];
     this.consecutiveGenerationRetryGrants = 0;
+    this.generationEffectiveMaxActive = MAX_ACTIVE_GENERATIONS;
+    this.generationNextSendAt = 0;
+    this.generationCooldownUntil = 0;
+    this.generationDispatchTimer = null;
+    this.generationDispatchTimerAt = 0;
+    this.generationSendDispatchTimer = null;
+    this.generationSendDispatchTimerAt = 0;
+    this.generationLastRateLimitAt = 0;
+    this.generationSuccessesSinceRateLimit = 0;
     this.imageDownloads = new OwnedImageDownloads({ logger });
     this.closedTurnOwners = new Map();
     this.userCancelledTurnOwners = new Map();
@@ -1363,17 +1383,75 @@ class BrowserHost {
     return this.snapshot();
   }
 
-  acquireGenerationPermit(traceId, helperPid, priority = "normal", signal) {
+  generationNowMs() {
+    return typeof this.generationNow === "function" ? this.generationNow() : Date.now();
+  }
+
+  generationRandomValue() {
+    const value = typeof this.generationRandom === "function" ? this.generationRandom() : Math.random();
+    return Math.min(0.999999999, Math.max(0, Number.isFinite(value) ? value : 0));
+  }
+
+  generationActiveImageCount() {
+    if (!this.generationOwners) this.generationOwners = new Map();
+    let count = 0;
+    for (const owner of this.generationOwners.values()) {
+      if (owner.kind === "image") count += 1;
+    }
+    return count;
+  }
+
+  generationMaxActive() {
+    return Math.max(1, Math.min(
+      MAX_ACTIVE_GENERATIONS,
+      Number.isInteger(this.generationEffectiveMaxActive)
+        ? this.generationEffectiveMaxActive
+        : MAX_ACTIVE_GENERATIONS,
+    ));
+  }
+
+  scheduleGenerationDispatch(notBefore) {
+    const now = BrowserHost.prototype.generationNowMs.call(this);
+    const target = Math.max(now, Number.isFinite(notBefore) ? notBefore : now);
+    if (this.generationDispatchTimer && this.generationDispatchTimerAt <= target) return;
+    if (this.generationDispatchTimer) clearTimeout(this.generationDispatchTimer);
+    this.generationDispatchTimerAt = target;
+    this.generationDispatchTimer = setTimeout(() => {
+      this.generationDispatchTimer = null;
+      this.generationDispatchTimerAt = 0;
+      BrowserHost.prototype.dispatchGenerationWaiters.call(this);
+    }, Math.max(0, target - now));
+    this.generationDispatchTimer.unref?.();
+  }
+
+  scheduleGenerationSendDispatch(notBefore) {
+    const now = BrowserHost.prototype.generationNowMs.call(this);
+    const target = Math.max(now, Number.isFinite(notBefore) ? notBefore : now);
+    if (this.generationSendDispatchTimer && this.generationSendDispatchTimerAt <= target) return;
+    if (this.generationSendDispatchTimer) clearTimeout(this.generationSendDispatchTimer);
+    this.generationSendDispatchTimerAt = target;
+    this.generationSendDispatchTimer = setTimeout(() => {
+      this.generationSendDispatchTimer = null;
+      this.generationSendDispatchTimerAt = 0;
+      BrowserHost.prototype.dispatchGenerationSendWaiters.call(this);
+    }, Math.max(0, target - now));
+    this.generationSendDispatchTimer.unref?.();
+  }
+
+  acquireGenerationPermit(traceId, helperPid, priority = "normal", signal, kind = "semantic") {
+    if (!this.generationOwners) this.generationOwners = new Map();
     if (!this.generationWaiters) this.generationWaiters = [];
     if (!Number.isInteger(this.consecutiveGenerationRetryGrants)) this.consecutiveGenerationRetryGrants = 0;
     if (priority !== "normal" && priority !== "retry") throw new Error("generation priority is invalid");
+    if (kind !== "semantic" && kind !== "image") throw new Error("generation kind is invalid");
     if (signal?.aborted) {
       throw signal.reason instanceof Error ? signal.reason : generationQueueAbortError();
     }
-    if (this.generationOwner?.traceId === traceId) {
-      if (this.generationOwner.helperPid !== helperPid) {
+    const currentOwner = this.generationOwners.get(traceId);
+    if (currentOwner) {
+      if (currentOwner.helperPid !== helperPid) {
         throw new Error(
-          `Generation helper ownership mismatch: expected ${this.generationOwner.helperPid}, received ${helperPid}`,
+          `Generation helper ownership mismatch: expected ${currentOwner.helperPid}, received ${helperPid}`,
         );
       }
       return Promise.resolve({ acquired: true, reused: true });
@@ -1396,6 +1474,7 @@ class BrowserHost {
       traceId,
       helperPid,
       priority,
+      kind,
       signal,
       promise,
       resolve: resolveWaiter,
@@ -1419,6 +1498,7 @@ class BrowserHost {
       traceId,
       helperPid,
       priority,
+      kind,
       queuedCount: this.generationWaiters.length,
     });
     BrowserHost.prototype.dispatchGenerationWaiters.call(this);
@@ -1426,12 +1506,22 @@ class BrowserHost {
   }
 
   dispatchGenerationWaiters() {
+    if (!this.generationOwners) this.generationOwners = new Map();
     if (!this.generationWaiters) this.generationWaiters = [];
     if (!Number.isInteger(this.consecutiveGenerationRetryGrants)) this.consecutiveGenerationRetryGrants = 0;
-    if (this.generationOwner) return;
+    const now = BrowserHost.prototype.generationNowMs.call(this);
+    const blockedUntil = this.generationCooldownUntil ?? 0;
+    if (now < blockedUntil) {
+      BrowserHost.prototype.scheduleGenerationDispatch.call(this, blockedUntil);
+      return;
+    }
+    if (this.generationOwners.size >= BrowserHost.prototype.generationMaxActive.call(this)) return;
     while (this.generationWaiters.length > 0) {
-      const retryIndex = this.generationWaiters.findIndex(waiter => waiter.priority === "retry");
-      const normalIndex = this.generationWaiters.findIndex(waiter => waiter.priority === "normal");
+      const imageSlotAvailable = BrowserHost.prototype.generationActiveImageCount.call(this) < MAX_ACTIVE_IMAGE_GENERATIONS;
+      const isEligible = waiter => waiter.kind !== "image" || imageSlotAvailable;
+      const retryIndex = this.generationWaiters.findIndex(waiter => isEligible(waiter) && waiter.priority === "retry");
+      const normalIndex = this.generationWaiters.findIndex(waiter => isEligible(waiter) && waiter.priority === "normal");
+      if (retryIndex < 0 && normalIndex < 0) return;
       const index = retryIndex < 0
         ? normalIndex
         : normalIndex < 0
@@ -1445,35 +1535,155 @@ class BrowserHost {
         waiter.reject(waiter.signal.reason instanceof Error ? waiter.signal.reason : generationQueueAbortError());
         continue;
       }
-      this.generationOwner = {
+      const acquiredAt = BrowserHost.prototype.generationNowMs.call(this);
+      this.generationOwners.set(waiter.traceId, {
         traceId: waiter.traceId,
         helperPid: waiter.helperPid,
         priority: waiter.priority,
-        acquiredAt: Date.now(),
-      };
+        kind: waiter.kind,
+        acquiredAt,
+      });
       if (waiter.priority === "retry") this.consecutiveGenerationRetryGrants += 1;
       else this.consecutiveGenerationRetryGrants = 0;
       this.logger?.info?.("browser.generation_acquired", {
         traceId: waiter.traceId,
         helperPid: waiter.helperPid,
         priority: waiter.priority,
+        kind: waiter.kind,
+        activeCount: this.generationOwners.size,
+        effectiveMaxActive: BrowserHost.prototype.generationMaxActive.call(this),
         queuedCount: this.generationWaiters.length,
       });
       waiter.resolve({ acquired: true, reused: false });
+      if (this.generationOwners.size >= BrowserHost.prototype.generationMaxActive.call(this)) return;
+    }
+  }
+
+  reserveGenerationSendStart(traceId, helperPid, signal) {
+    if (!this.generationOwners) this.generationOwners = new Map();
+    if (!this.generationSendWaiters) this.generationSendWaiters = [];
+    const owner = this.generationOwners.get(traceId);
+    if (!owner || owner.helperPid !== helperPid) {
+      throw new Error("Generation send reservation does not match an active permit owner");
+    }
+    if (signal?.aborted) {
+      throw signal.reason instanceof Error ? signal.reason : generationQueueAbortError();
+    }
+    let resolveWaiter;
+    let rejectWaiter;
+    const promise = new Promise((resolve, reject) => {
+      resolveWaiter = resolve;
+      rejectWaiter = reject;
+    });
+    const waiter = {
+      traceId,
+      helperPid,
+      signal,
+      resolve: resolveWaiter,
+      reject: rejectWaiter,
+      onAbort: null,
+    };
+    if (signal) {
+      waiter.onAbort = () => {
+        const index = this.generationSendWaiters.indexOf(waiter);
+        if (index < 0) return;
+        this.generationSendWaiters.splice(index, 1);
+        signal.removeEventListener("abort", waiter.onAbort);
+        rejectWaiter(signal.reason instanceof Error ? signal.reason : generationQueueAbortError());
+        this.logger?.debug?.("browser.generation_send_wait_aborted", { traceId, helperPid });
+        BrowserHost.prototype.dispatchGenerationSendWaiters.call(this);
+      };
+      signal.addEventListener("abort", waiter.onAbort, { once: true });
+    }
+    this.generationSendWaiters.push(waiter);
+    this.logger?.debug?.("browser.generation_send_queued", {
+      traceId,
+      helperPid,
+      queuedCount: this.generationSendWaiters.length,
+    });
+    BrowserHost.prototype.dispatchGenerationSendWaiters.call(this);
+    return promise;
+  }
+
+  dispatchGenerationSendWaiters() {
+    if (!this.generationOwners) this.generationOwners = new Map();
+    if (!this.generationSendWaiters) this.generationSendWaiters = [];
+    const now = BrowserHost.prototype.generationNowMs.call(this);
+    const blockedUntil = Math.max(this.generationCooldownUntil ?? 0, this.generationNextSendAt ?? 0);
+    if (now < blockedUntil) {
+      BrowserHost.prototype.scheduleGenerationSendDispatch.call(this, blockedUntil);
       return;
+    }
+    while (this.generationSendWaiters.length > 0) {
+      const waiter = this.generationSendWaiters.shift();
+      if (waiter.onAbort) waiter.signal?.removeEventListener("abort", waiter.onAbort);
+      if (waiter.signal?.aborted) {
+        waiter.reject(waiter.signal.reason instanceof Error ? waiter.signal.reason : generationQueueAbortError());
+        continue;
+      }
+      const owner = this.generationOwners.get(waiter.traceId);
+      if (!owner || owner.helperPid !== waiter.helperPid) {
+        waiter.reject(generationQueueAbortError("ChatGPT generation permit ended before Send admission"));
+        continue;
+      }
+      const reservedAt = BrowserHost.prototype.generationNowMs.call(this);
+      const gapMs = Number.isFinite(this.generationSendStartGapMs)
+        ? Math.max(0, this.generationSendStartGapMs)
+        : GENERATION_SEND_START_GAP_MS;
+      const jitterMs = Number.isFinite(this.generationSendStartJitterMs)
+        ? Math.max(0, this.generationSendStartJitterMs)
+        : GENERATION_SEND_START_JITTER_MS;
+      this.generationNextSendAt = reservedAt
+        + gapMs
+        + Math.floor(BrowserHost.prototype.generationRandomValue.call(this) * (jitterMs + 1));
+      this.logger?.info?.("browser.generation_send_admitted", {
+        traceId: waiter.traceId,
+        helperPid: waiter.helperPid,
+        nextSendAt: this.generationNextSendAt,
+        queuedCount: this.generationSendWaiters.length,
+      });
+      waiter.resolve({ reserved: true, reservedAt, nextSendAt: this.generationNextSendAt });
+      const nextNow = BrowserHost.prototype.generationNowMs.call(this);
+      if (this.generationSendWaiters.length > 0 && nextNow < this.generationNextSendAt) {
+        BrowserHost.prototype.scheduleGenerationSendDispatch.call(this, this.generationNextSendAt);
+        return;
+      }
+    }
+  }
+
+  cancelGenerationSendWaiters(traceId, helperPid, reason) {
+    if (!this.generationSendWaiters) this.generationSendWaiters = [];
+    for (const waiter of [...this.generationSendWaiters]) {
+      if (waiter.traceId !== traceId) continue;
+      if (waiter.helperPid !== helperPid) {
+        throw new Error(`Generation helper ownership mismatch: expected ${waiter.helperPid}, received ${helperPid}`);
+      }
+      const index = this.generationSendWaiters.indexOf(waiter);
+      if (index < 0) continue;
+      this.generationSendWaiters.splice(index, 1);
+      if (waiter.onAbort) waiter.signal?.removeEventListener("abort", waiter.onAbort);
+      waiter.reject(generationQueueAbortError(`ChatGPT generation Send reservation cancelled: ${reason}`));
     }
   }
 
   releaseGenerationPermit(traceId, helperPid, reason = "explicit_release") {
+    if (!this.generationOwners) this.generationOwners = new Map();
     if (!this.generationWaiters) this.generationWaiters = [];
-    if (this.generationOwner?.traceId === traceId) {
-      if (this.generationOwner.helperPid !== helperPid) {
+    const owner = this.generationOwners.get(traceId);
+    if (owner) {
+      if (owner.helperPid !== helperPid) {
         throw new Error(
-          `Generation helper ownership mismatch: expected ${this.generationOwner.helperPid}, received ${helperPid}`,
+          `Generation helper ownership mismatch: expected ${owner.helperPid}, received ${helperPid}`,
         );
       }
-      this.generationOwner = null;
-      this.logger?.info?.("browser.generation_released", { traceId, helperPid, reason });
+      this.generationOwners.delete(traceId);
+      BrowserHost.prototype.cancelGenerationSendWaiters.call(this, traceId, helperPid, reason);
+      this.logger?.info?.("browser.generation_released", {
+        traceId,
+        helperPid,
+        reason,
+        activeCount: this.generationOwners.size,
+      });
       BrowserHost.prototype.dispatchGenerationWaiters.call(this);
       return { released: true };
     }
@@ -1493,16 +1703,99 @@ class BrowserHost {
     return { released: false };
   }
 
+  noteGenerationRateLimit(traceId, helperPid, retryAfterMs = 0) {
+    if (!this.generationOwners) this.generationOwners = new Map();
+    const owner = this.generationOwners.get(traceId);
+    if (!owner || owner.helperPid !== helperPid) {
+      throw new Error("Generation rate-limit feedback does not match an active permit owner");
+    }
+    const now = BrowserHost.prototype.generationNowMs.call(this);
+    const repeated = this.generationLastRateLimitAt > 0
+      && now - this.generationLastRateLimitAt <= GENERATION_RATE_LIMIT_REPEAT_WINDOW_MS;
+    const minMs = repeated
+      ? GENERATION_REPEATED_RATE_LIMIT_COOLDOWN_MIN_MS
+      : GENERATION_RATE_LIMIT_COOLDOWN_MIN_MS;
+    const maxMs = repeated
+      ? GENERATION_REPEATED_RATE_LIMIT_COOLDOWN_MAX_MS
+      : GENERATION_RATE_LIMIT_COOLDOWN_MAX_MS;
+    const sampledMs = minMs
+      + Math.floor(BrowserHost.prototype.generationRandomValue.call(this) * (maxMs - minMs + 1));
+    const requestedMs = Number.isFinite(retryAfterMs) ? Math.max(0, retryAfterMs) : 0;
+    this.generationCooldownUntil = Math.max(
+      this.generationCooldownUntil ?? 0,
+      now + Math.max(sampledMs, requestedMs),
+    );
+    this.generationEffectiveMaxActive = 1;
+    this.generationLastRateLimitAt = now;
+    this.generationSuccessesSinceRateLimit = 0;
+    this.logger?.warn?.("browser.generation_rate_limited", {
+      traceId,
+      helperPid,
+      repeated,
+      cooldownMs: Math.max(0, this.generationCooldownUntil - now),
+      effectiveMaxActive: this.generationEffectiveMaxActive,
+    });
+    BrowserHost.prototype.scheduleGenerationDispatch.call(this, this.generationCooldownUntil);
+    BrowserHost.prototype.scheduleGenerationSendDispatch.call(this, this.generationCooldownUntil);
+    return {
+      cooldownMs: Math.max(0, this.generationCooldownUntil - now),
+      until: this.generationCooldownUntil,
+      effectiveMaxActive: this.generationEffectiveMaxActive,
+      repeated,
+    };
+  }
+
+  noteGenerationSuccess(traceId, helperPid) {
+    if (!this.generationOwners) this.generationOwners = new Map();
+    const owner = this.generationOwners.get(traceId);
+    if (!owner || owner.helperPid !== helperPid) {
+      throw new Error("Generation success feedback does not match an active permit owner");
+    }
+    if (this.generationEffectiveMaxActive >= MAX_ACTIVE_GENERATIONS || !this.generationLastRateLimitAt) {
+      return {
+        recovered: false,
+        successes: this.generationSuccessesSinceRateLimit ?? 0,
+        effectiveMaxActive: BrowserHost.prototype.generationMaxActive.call(this),
+      };
+    }
+    this.generationSuccessesSinceRateLimit = (this.generationSuccessesSinceRateLimit ?? 0) + 1;
+    const now = BrowserHost.prototype.generationNowMs.call(this);
+    const recovered = now >= (this.generationCooldownUntil ?? 0)
+      && this.generationSuccessesSinceRateLimit >= GENERATION_RECOVERY_SUCCESS_THRESHOLD;
+    if (recovered) {
+      this.generationEffectiveMaxActive = MAX_ACTIVE_GENERATIONS;
+      this.generationSuccessesSinceRateLimit = 0;
+      this.logger?.info?.("browser.generation_concurrency_recovered", {
+        traceId,
+        helperPid,
+        effectiveMaxActive: this.generationEffectiveMaxActive,
+      });
+      BrowserHost.prototype.dispatchGenerationWaiters.call(this);
+    }
+    return {
+      recovered,
+      successes: this.generationSuccessesSinceRateLimit,
+      effectiveMaxActive: BrowserHost.prototype.generationMaxActive.call(this),
+    };
+  }
+
   reapOrphanGenerationPermits() {
+    if (!this.generationOwners) this.generationOwners = new Map();
     if (!this.generationWaiters) this.generationWaiters = [];
-    const owner = this.generationOwner;
-    if (owner && !processRunning(owner.helperPid)) {
+    for (const owner of [...this.generationOwners.values()]) {
+      if (processRunning(owner.helperPid)) continue;
       this.logger?.warn?.("browser.generation_orphan_reaped", {
         traceId: owner.traceId,
         helperPid: owner.helperPid,
         evidence: "owner_process_exited",
       });
-      this.generationOwner = null;
+      this.generationOwners.delete(owner.traceId);
+      BrowserHost.prototype.cancelGenerationSendWaiters.call(
+        this,
+        owner.traceId,
+        owner.helperPid,
+        "owner_process_exited",
+      );
     }
     for (const waiter of [...this.generationWaiters]) {
       if (processRunning(waiter.helperPid)) continue;
@@ -3193,8 +3486,18 @@ class BrowserHost {
   }
 
   destroy() {
-    this.generationOwner = null;
+    this.generationOwners?.clear?.();
+    if (this.generationDispatchTimer) clearTimeout(this.generationDispatchTimer);
+    this.generationDispatchTimer = null;
+    this.generationDispatchTimerAt = 0;
+    if (this.generationSendDispatchTimer) clearTimeout(this.generationSendDispatchTimer);
+    this.generationSendDispatchTimer = null;
+    this.generationSendDispatchTimerAt = 0;
     for (const waiter of this.generationWaiters.splice(0)) {
+      if (waiter.onAbort) waiter.signal?.removeEventListener("abort", waiter.onAbort);
+      waiter.reject(generationQueueAbortError("ChatGPT browser host was destroyed"));
+    }
+    for (const waiter of this.generationSendWaiters.splice(0)) {
       if (waiter.onAbort) waiter.signal?.removeEventListener("abort", waiter.onAbort);
       waiter.reject(generationQueueAbortError("ChatGPT browser host was destroyed"));
     }

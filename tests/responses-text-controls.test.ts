@@ -26,6 +26,10 @@ test("verbosity and JSON-schema controls survive parser-to-prompt transport", ()
   expect(compiled.text).toContain("Codex requested high response verbosity.");
   expect(compiled.text).toContain('strict JSON-schema final answer named "result"');
   expect(compiled.text).toContain(JSON.stringify(schema));
+  const schemaEnd = compiled.text.indexOf("</codex_output_schema_json>");
+  const bareJsonReminder = compiled.text.indexOf("Return the final answer as the bare JSON value only.");
+  expect(schemaEnd).toBeGreaterThanOrEqual(0);
+  expect(bareJsonReminder).toBeGreaterThan(schemaEnd);
 });
 
 test("strict JSON validation accepts only the exact full schema-conforming answer", () => {

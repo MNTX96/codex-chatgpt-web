@@ -449,18 +449,27 @@ export const LAUNCHER_TURN_HEARTBEAT_TIMEOUT_MS = 5_000;
 export const LAUNCHER_TURN_END_TIMEOUT_MS = 15_000;
 
 export type LauncherGenerationPriority = "normal" | "retry";
+export type LauncherGenerationKind = "semantic" | "image";
+export type LauncherGenerationFeedback =
+  | { type: "rate_limit"; retryAfterMs?: number }
+  | { type: "success" };
 
 export interface LauncherGenerationOwner {
   traceId: string;
   helperPid: number;
   priority?: LauncherGenerationPriority;
+  kind?: LauncherGenerationKind;
 }
 
 async function launcherGenerationRequest(
   descriptorPath: string,
-  action: "acquire" | "release",
+  action: "acquire" | "send" | "release" | "feedback",
   owner: LauncherGenerationOwner,
-  options: { abortSignal?: AbortSignal; timeoutMs?: number } = {},
+  options: {
+    abortSignal?: AbortSignal;
+    timeoutMs?: number;
+    feedback?: LauncherGenerationFeedback;
+  } = {},
 ): Promise<{ response: Response; body: Record<string, unknown> }> {
   const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
   const controller = new AbortController();
@@ -476,10 +485,21 @@ async function launcherGenerationRequest(
         authorization: `Bearer ${descriptor.control.token}`,
         "content-type": "application/json",
       },
-      body: JSON.stringify(action === "acquire" ? owner : {
-        traceId: owner.traceId,
-        helperPid: owner.helperPid,
-      }),
+      body: JSON.stringify(action === "acquire"
+        ? owner
+        : action === "feedback"
+          ? {
+            traceId: owner.traceId,
+            helperPid: owner.helperPid,
+            feedback: options.feedback?.type,
+            ...(options.feedback?.type === "rate_limit" && options.feedback.retryAfterMs !== undefined
+              ? { retryAfterMs: options.feedback.retryAfterMs }
+              : {}),
+          }
+          : {
+            traceId: owner.traceId,
+            helperPid: owner.helperPid,
+          }),
       signal: controller.signal,
     });
     const body = await response.json().catch(() => ({})) as Record<string, unknown>;
@@ -503,7 +523,11 @@ export async function acquireLauncherGenerationPermit(
   const { response, body } = await launcherGenerationRequest(
     descriptorPath,
     "acquire",
-    { ...owner, priority: owner.priority ?? "normal" },
+    {
+      ...owner,
+      priority: owner.priority ?? "normal",
+      kind: owner.kind ?? "semantic",
+    },
     { abortSignal },
   );
   if (!response.ok) throw launcherGenerationControlError(response, body);
@@ -538,6 +562,42 @@ export async function releaseLauncherGenerationPermit(
   throw lastError;
 }
 
+export async function reserveLauncherGenerationSendStart(
+  descriptorPath: string,
+  owner: LauncherGenerationOwner,
+  abortSignal?: AbortSignal,
+): Promise<void> {
+  const { response, body } = await launcherGenerationRequest(
+    descriptorPath,
+    "send",
+    owner,
+    { abortSignal },
+  );
+  if (!response.ok) throw launcherGenerationControlError(response, body);
+  if (body.ok !== true || body.reserved !== true) {
+    throw new Error("Launcher generation control returned an invalid Send acknowledgement");
+  }
+}
+
+export async function reportLauncherGenerationFeedback(
+  descriptorPath: string,
+  owner: LauncherGenerationOwner,
+  feedback: LauncherGenerationFeedback,
+  timeoutMs = LAUNCHER_TURN_END_TIMEOUT_MS,
+): Promise<Record<string, unknown>> {
+  const { response, body } = await launcherGenerationRequest(
+    descriptorPath,
+    "feedback",
+    owner,
+    { timeoutMs, feedback },
+  );
+  if (!response.ok) throw launcherGenerationControlError(response, body);
+  if (body.ok !== true) {
+    throw new Error("Launcher generation control returned an invalid feedback acknowledgement");
+  }
+  return body;
+}
+
 export class LauncherGenerationLease {
   private acquiredState = false;
   private pendingAcquire?: Promise<void>;
@@ -549,6 +609,18 @@ export class LauncherGenerationLease {
 
   get acquired(): boolean {
     return this.acquiredState;
+  }
+
+  async reportFeedback(feedback: LauncherGenerationFeedback): Promise<void> {
+    if (!this.acquiredState) return;
+    await reportLauncherGenerationFeedback(this.descriptorPath, this.owner, feedback);
+  }
+
+  async reserveSendStart(signal?: AbortSignal): Promise<void> {
+    if (!this.acquiredState) {
+      throw new Error("Launcher generation Send requires an acquired generation permit");
+    }
+    await reserveLauncherGenerationSendStart(this.descriptorPath, this.owner, signal);
   }
 
   async acquire(signal?: AbortSignal): Promise<void> {

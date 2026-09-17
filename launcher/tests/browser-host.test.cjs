@@ -2702,14 +2702,18 @@ test("failed and aborted browser turns release their tab slots", async () => {
     };
     const fixture = Object.assign(Object.create(BrowserHost.prototype), {
       turnTabs: new Map([[tab.id, tab]]),
-      generationOwner: {
+      generationOwners: new Map([[tab.traceId, {
         traceId: tab.traceId,
         helperPid: tab.helperPid,
         priority: "normal",
+        kind: "semantic",
         acquiredAt: Date.now(),
-      },
+      }]]),
       generationWaiters: [],
+      generationSendWaiters: [],
       consecutiveGenerationRetryGrants: 0,
+      generationEffectiveMaxActive: 2,
+      generationCooldownUntil: 0,
       closedTurnOwners: new Map(),
       userCancelledTurnOwners: new Map(),
       selectedTabId: tab.id,
@@ -2732,7 +2736,7 @@ test("failed and aborted browser turns release their tab slots", async () => {
     );
 
     assert.equal(fixture.turnTabs.size, 0);
-    assert.equal(fixture.generationOwner, null);
+    assert.equal(fixture.generationOwners.size, 0);
     assert.equal(fixture.selectedTabId, "home");
     assert.equal(tab.status, status === "aborted" ? "aborted" : "error");
     assert.equal(closed, true);
@@ -2740,53 +2744,83 @@ test("failed and aborted browser turns release their tab slots", async () => {
 });
 
 function generationGateFixture() {
-  return Object.assign(Object.create(BrowserHost.prototype), {
-    generationOwner: null,
+  let now = 1_000;
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    generationOwners: new Map(),
     generationWaiters: [],
+    generationSendWaiters: [],
     consecutiveGenerationRetryGrants: 0,
+    generationEffectiveMaxActive: 2,
+    generationNextSendAt: 0,
+    generationCooldownUntil: 0,
+    generationDispatchTimer: null,
+    generationDispatchTimerAt: 0,
+    generationSendDispatchTimer: null,
+    generationSendDispatchTimerAt: 0,
+    generationLastRateLimitAt: 0,
+    generationSuccessesSinceRateLimit: 0,
+    generationSendStartGapMs: 0,
+    generationSendStartJitterMs: 0,
+    generationNow: () => now,
+    generationRandom: () => 0,
     logger: { debug() {}, info() {}, warn() {} },
   });
+  fixture.setGenerationNow = value => { now = value; };
+  return fixture;
 }
 
-test("launcher generation gate serializes different helper processes", async () => {
+function clearGenerationFixtureTimers(fixture) {
+  if (fixture.generationDispatchTimer) clearTimeout(fixture.generationDispatchTimer);
+  if (fixture.generationSendDispatchTimer) clearTimeout(fixture.generationSendDispatchTimer);
+}
+
+test("launcher generation gate allows two active helpers and queues the third", async () => {
   const fixture = generationGateFixture();
   assert.deepEqual(await fixture.acquireGenerationPermit("gen_owner_a", 101, "normal"), {
     acquired: true,
     reused: false,
   });
-  let secondAcquired = false;
-  const second = fixture.acquireGenerationPermit("gen_owner_b", 202, "normal").then(result => {
-    secondAcquired = true;
+  assert.deepEqual(await fixture.acquireGenerationPermit("gen_owner_b", 202, "normal"), {
+    acquired: true,
+    reused: false,
+  });
+  let thirdAcquired = false;
+  const third = fixture.acquireGenerationPermit("gen_owner_c", 303, "normal").then(result => {
+    thirdAcquired = true;
     return result;
   });
   await Promise.resolve();
-  assert.equal(secondAcquired, false);
-  assert.equal(fixture.generationOwner.traceId, "gen_owner_a");
+  assert.equal(thirdAcquired, false);
+  assert.deepEqual([...fixture.generationOwners.keys()], ["gen_owner_a", "gen_owner_b"]);
 
   assert.deepEqual(fixture.releaseGenerationPermit("gen_owner_a", 101), { released: true });
-  assert.deepEqual(await second, { acquired: true, reused: false });
-  assert.equal(fixture.generationOwner.traceId, "gen_owner_b");
+  assert.deepEqual(await third, { acquired: true, reused: false });
+  assert.deepEqual([...fixture.generationOwners.keys()], ["gen_owner_b", "gen_owner_c"]);
   fixture.releaseGenerationPermit("gen_owner_b", 202);
+  fixture.releaseGenerationPermit("gen_owner_c", 303);
 });
 
 test("launcher generation gate removes an aborted waiter without blocking the next helper", async () => {
   const fixture = generationGateFixture();
-  await fixture.acquireGenerationPermit("gen_abort_owner", 301, "normal");
+  await fixture.acquireGenerationPermit("gen_abort_owner_a", 301, "normal");
+  await fixture.acquireGenerationPermit("gen_abort_owner_b", 302, "normal");
   const controller = new AbortController();
   const reason = new Error("cancel queued generation");
-  const aborted = fixture.acquireGenerationPermit("gen_abort_waiter", 302, "normal", controller.signal);
+  const aborted = fixture.acquireGenerationPermit("gen_abort_waiter", 303, "normal", controller.signal);
   controller.abort(reason);
   await assert.rejects(aborted, error => error === reason);
 
-  const next = fixture.acquireGenerationPermit("gen_abort_next", 303, "normal");
-  fixture.releaseGenerationPermit("gen_abort_owner", 301);
+  const next = fixture.acquireGenerationPermit("gen_abort_next", 304, "normal");
+  fixture.releaseGenerationPermit("gen_abort_owner_a", 301);
   await next;
-  assert.equal(fixture.generationOwner.traceId, "gen_abort_next");
-  fixture.releaseGenerationPermit("gen_abort_next", 303);
+  assert.equal(fixture.generationOwners.has("gen_abort_next"), true);
+  fixture.releaseGenerationPermit("gen_abort_owner_b", 302);
+  fixture.releaseGenerationPermit("gen_abort_next", 304);
 });
 
 test("launcher generation gate bounds retry priority so normal work cannot starve", async () => {
   const fixture = generationGateFixture();
+  fixture.generationEffectiveMaxActive = 1;
   await fixture.acquireGenerationPermit("gen_priority_owner", 401, "normal");
   const normal = fixture.acquireGenerationPermit("gen_priority_normal", 402, "normal");
   const retry1 = fixture.acquireGenerationPermit("gen_priority_retry_1", 403, "retry");
@@ -2795,41 +2829,118 @@ test("launcher generation gate bounds retry priority so normal work cannot starv
 
   fixture.releaseGenerationPermit("gen_priority_owner", 401);
   await retry1;
-  assert.equal(fixture.generationOwner.traceId, "gen_priority_retry_1");
+  assert.equal(fixture.generationOwners.has("gen_priority_retry_1"), true);
   fixture.releaseGenerationPermit("gen_priority_retry_1", 403);
   await retry2;
-  assert.equal(fixture.generationOwner.traceId, "gen_priority_retry_2");
+  assert.equal(fixture.generationOwners.has("gen_priority_retry_2"), true);
   fixture.releaseGenerationPermit("gen_priority_retry_2", 404);
   await normal;
-  assert.equal(fixture.generationOwner.traceId, "gen_priority_normal");
+  assert.equal(fixture.generationOwners.has("gen_priority_normal"), true);
   fixture.releaseGenerationPermit("gen_priority_normal", 402);
   await retry3;
-  assert.equal(fixture.generationOwner.traceId, "gen_priority_retry_3");
+  assert.equal(fixture.generationOwners.has("gen_priority_retry_3"), true);
   fixture.releaseGenerationPermit("gen_priority_retry_3", 405);
 });
 
 test("launcher generation ownership is exact, idempotent, and reaps a dead helper", async () => {
   const fixture = generationGateFixture();
+  fixture.generationEffectiveMaxActive = 1;
   await fixture.acquireGenerationPermit("gen_exact_owner", 501, "normal");
   assert.throws(
     () => fixture.releaseGenerationPermit("gen_exact_owner", 502),
     /Generation helper ownership mismatch/,
   );
-  assert.equal(fixture.generationOwner.helperPid, 501);
+  assert.equal(fixture.generationOwners.get("gen_exact_owner").helperPid, 501);
   assert.deepEqual(fixture.releaseGenerationPermit("gen_exact_owner", 501), { released: true });
   assert.deepEqual(fixture.releaseGenerationPermit("gen_exact_owner", 501), { released: false });
 
-  fixture.generationOwner = {
+  fixture.generationOwners.set("gen_dead_owner", {
     traceId: "gen_dead_owner",
     helperPid: 2_000_000_000,
     priority: "normal",
+    kind: "semantic",
     acquiredAt: Date.now(),
-  };
+  });
   const successor = fixture.acquireGenerationPermit("gen_live_successor", process.pid, "normal");
   fixture.reapOrphanGenerationPermits();
   await successor;
-  assert.equal(fixture.generationOwner.traceId, "gen_live_successor");
+  assert.equal(fixture.generationOwners.has("gen_live_successor"), true);
   fixture.releaseGenerationPermit("gen_live_successor", process.pid);
+});
+
+test("launcher generation gate keeps image generation at one active owner", async () => {
+  const fixture = generationGateFixture();
+  await fixture.acquireGenerationPermit("gen_image_a", 601, "normal", undefined, "image");
+  let imageBAcquired = false;
+  const imageB = fixture.acquireGenerationPermit("gen_image_b", 602, "normal", undefined, "image").then(result => {
+    imageBAcquired = true;
+    return result;
+  });
+  await fixture.acquireGenerationPermit("gen_semantic", 603, "normal", undefined, "semantic");
+  assert.equal(imageBAcquired, false);
+  assert.equal(fixture.generationOwners.has("gen_semantic"), true);
+
+  fixture.releaseGenerationPermit("gen_image_a", 601);
+  await imageB;
+  assert.equal(fixture.generationOwners.has("gen_image_b"), true);
+  fixture.releaseGenerationPermit("gen_semantic", 603);
+  fixture.releaseGenerationPermit("gen_image_b", 602);
+});
+
+test("launcher Send admission spaces every Send across active helpers", async () => {
+  const fixture = generationGateFixture();
+  delete fixture.generationSendStartGapMs;
+  delete fixture.generationSendStartJitterMs;
+  await fixture.acquireGenerationPermit("gen_send_a", 701, "normal");
+  await fixture.acquireGenerationPermit("gen_send_b", 702, "normal");
+
+  const first = await fixture.reserveGenerationSendStart("gen_send_a", 701);
+  assert.equal(first.reservedAt, 1_000);
+  assert.equal(first.nextSendAt, 16_000);
+
+  let secondAdmitted = false;
+  const second = fixture.reserveGenerationSendStart("gen_send_b", 702).then(result => {
+    secondAdmitted = true;
+    return result;
+  });
+  await Promise.resolve();
+  assert.equal(secondAdmitted, false);
+
+  fixture.setGenerationNow(16_000);
+  fixture.dispatchGenerationSendWaiters();
+  const secondResult = await second;
+  assert.equal(secondResult.reservedAt, 16_000);
+  clearGenerationFixtureTimers(fixture);
+  fixture.releaseGenerationPermit("gen_send_a", 701);
+  fixture.releaseGenerationPermit("gen_send_b", 702);
+});
+
+test("launcher 429 feedback reduces concurrency and repeated 429 extends cooldown", async () => {
+  const fixture = generationGateFixture();
+  await fixture.acquireGenerationPermit("gen_rate_limit", 801, "normal");
+
+  const first = fixture.noteGenerationRateLimit("gen_rate_limit", 801);
+  assert.equal(first.repeated, false);
+  assert.equal(first.cooldownMs, 60_000);
+  assert.equal(first.effectiveMaxActive, 1);
+
+  fixture.setGenerationNow(2_000);
+  const repeated = fixture.noteGenerationRateLimit("gen_rate_limit", 801);
+  assert.equal(repeated.repeated, true);
+  assert.equal(repeated.cooldownMs, 120_000);
+  assert.equal(repeated.effectiveMaxActive, 1);
+
+  fixture.setGenerationNow(repeated.until);
+  for (let index = 0; index < 9; index += 1) {
+    const result = fixture.noteGenerationSuccess("gen_rate_limit", 801);
+    assert.equal(result.recovered, false);
+    assert.equal(result.effectiveMaxActive, 1);
+  }
+  const recovered = fixture.noteGenerationSuccess("gen_rate_limit", 801);
+  assert.equal(recovered.recovered, true);
+  assert.equal(recovered.effectiveMaxActive, 2);
+  clearGenerationFixtureTimers(fixture);
+  fixture.releaseGenerationPermit("gen_rate_limit", 801);
 });
 
 function manualTurnFixture() {

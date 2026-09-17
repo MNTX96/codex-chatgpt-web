@@ -83,6 +83,8 @@ import {
   LAUNCHER_TURN_HEARTBEAT_INTERVAL_MS,
   LAUNCHER_TURN_HEARTBEAT_TIMEOUT_MS,
   notifyLauncherTurn,
+  type LauncherGenerationFeedback,
+  type LauncherGenerationKind,
 } from "../../launcher-browser-host";
 import {
   resolveChatGptWebContextLimits,
@@ -1273,6 +1275,8 @@ interface BrowserGenerationLease {
   readonly acquired: boolean;
   acquire(signal?: AbortSignal): Promise<void>;
   release(): void | Promise<void>;
+  reserveSendStart?(signal?: AbortSignal): Promise<void>;
+  reportFeedback?(feedback: LauncherGenerationFeedback): Promise<void>;
 }
 
 interface ChatGptSubmissionBaseline {
@@ -2185,12 +2189,14 @@ export class ChatGptBrowserWorker {
   private generationLease(
     traceId: string,
     priority: ChatGptGenerationPriority = "normal",
+    kind: LauncherGenerationKind = "semantic",
   ): BrowserGenerationLease {
     if (this.config.browserHost === "launcher") {
       return new LauncherGenerationLease(this.config.browserHostDescriptorPath!, {
         traceId,
         helperPid: process.pid,
         priority,
+        kind,
       });
     }
     return new ChatGptGenerationLease(priority);
@@ -3993,6 +3999,7 @@ export class ChatGptBrowserWorker {
     recoverObservation?: ChatGptObservationRecovery,
     attachmentGuard?: AttachmentGuard,
     requireImageGenerationTool = false,
+    generationLease?: BrowserGenerationLease,
   ): Promise<ChatGptSubmissionEvidence> {
     const composer = await this.activeComposer(page);
     if (requireImageGenerationTool && !await this.imageGenerationToolIsSelected(composer, abortSignal)) {
@@ -4027,6 +4034,7 @@ export class ChatGptBrowserWorker {
     await effectiveAttachmentGuard.assertReady(abortSignal);
     abortSignal?.throwIfAborted();
     await chatGptRequestPacer.wait("browser_submit", abortSignal);
+    await generationLease?.reserveSendStart?.(abortSignal);
     await sendButton.press("Enter", {
       noWaitAfter: true,
       signal: abortSignal,
@@ -4063,6 +4071,7 @@ export class ChatGptBrowserWorker {
     externalProgress?: ChatGptTurnProgressReader,
     completionTracker?: ChatGptCompletionTracker,
     recoverObservation?: ChatGptObservationRecovery,
+    generationLease?: BrowserGenerationLease,
   ): Promise<ChatGptSubmissionEvidence> {
     if (channel.isTerminal(request)) throw new Error("ChatGPT follow-up is no longer active");
     const composer = await this.activeComposer(page, 30_000, abortSignal);
@@ -4095,6 +4104,7 @@ export class ChatGptBrowserWorker {
     await attachmentGuard.assertReady(abortSignal);
     abortSignal?.throwIfAborted();
     await chatGptRequestPacer.wait("browser_submit", abortSignal);
+    await generationLease?.reserveSendStart?.(abortSignal);
     await sendButton.press("Enter", {
       noWaitAfter: true,
       signal: abortSignal,
@@ -4129,6 +4139,7 @@ export class ChatGptBrowserWorker {
     submissionLifecycle?: Pick<BrowserTurn, "onSendActivated" | "onSubmitted" | "persistentProjectId">,
     completionTracker?: ChatGptCompletionTracker,
     recoverObservation?: ChatGptObservationRecovery,
+    generationLease?: BrowserGenerationLease,
   ): Promise<ChatGptSubmissionEvidence> {
     if (!source.assistantTurnId || !source.candidateKey || (!source.cardId && !source.fileIdentity)) {
       throw new Error("Image edit source provenance is incomplete");
@@ -4208,6 +4219,7 @@ export class ChatGptBrowserWorker {
       await submissionLifecycle?.onSendActivated?.();
       abortSignal?.throwIfAborted();
       await chatGptRequestPacer.wait("browser_submit", abortSignal);
+      await generationLease?.reserveSendStart?.(abortSignal);
       await send.press("Enter", { noWaitAfter: true, signal: abortSignal, timeout: 0 });
       const evidence = await this.waitForSubmissionAcceptedWithRecovery(
         page,
@@ -5025,7 +5037,12 @@ export class ChatGptBrowserWorker {
 
   private async runExclusive(turn: BrowserTurn): Promise<string> {
     if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
-    const generationLease = this.generationLease(turn.traceId, turn.generationPriority);
+    const generationKind: LauncherGenerationKind = turn.executionTarget?.output === "image"
+      || turn.requireOutputArtifact
+      || !!turn.imageEditSource
+      ? "image"
+      : "semantic";
+    const generationLease = this.generationLease(turn.traceId, turn.generationPriority, generationKind);
     if (this.config.browserHost !== "launcher") {
       try {
         return await this.runBrowserTurn(turn, generationLease);
@@ -5112,6 +5129,16 @@ export class ChatGptBrowserWorker {
     } finally {
       try {
         if (heartbeatTimer) clearInterval(heartbeatTimer);
+        if (terminal === "completed" && generationLease.acquired && generationLease.reportFeedback) {
+          try {
+            await generationLease.reportFeedback({ type: "success" });
+          } catch (feedbackError) {
+            console.warn(
+              `[chatgpt-web] launcher generation success feedback failed for ${turn.traceId}:`
+              + ` ${feedbackError instanceof Error ? feedbackError.message : String(feedbackError)}`,
+            );
+          }
+        }
         try {
           const release = await notifyLauncherTurn(this.config.browserHostDescriptorPath!, {
             phase: "end",
@@ -5335,7 +5362,20 @@ export class ChatGptBrowserWorker {
         const responseText = await responseTurn.innerText();
         return responseText;
       }
-      releaseNetworkDiagnostics = observeChatGptConversationResponses(page, turn.traceId);
+      const reportGenerationRateLimit = (retryAfterMs: number): void => {
+        if (!generationLease.reportFeedback) return;
+        void generationLease.reportFeedback({ type: "rate_limit", retryAfterMs }).catch(error => {
+          console.warn(
+            `[chatgpt-web] launcher generation rate-limit feedback failed for ${turn.traceId}:`
+            + ` ${error instanceof Error ? error.message : String(error)}`,
+          );
+        });
+      };
+      releaseNetworkDiagnostics = observeChatGptConversationResponses(
+        page,
+        turn.traceId,
+        reportGenerationRateLimit,
+      );
       const rebindLauncherPage = async (
         attempt: number,
         cause: Error,
@@ -5390,7 +5430,11 @@ export class ChatGptBrowserWorker {
         turnConnection = connection.browser;
         releaseNetworkDiagnostics?.();
         page = connection.page;
-        releaseNetworkDiagnostics = observeChatGptConversationResponses(page, turn.traceId);
+        releaseNetworkDiagnostics = observeChatGptConversationResponses(
+          page,
+          turn.traceId,
+          reportGenerationRateLimit,
+        );
         diagnosticPage = page;
         console.warn(
           `[chatgpt-web] browser turn ${turn.traceId} rebound its existing launcher page after a stalled DOM probe`,
@@ -5541,6 +5585,7 @@ export class ChatGptBrowserWorker {
                   : undefined,
                 undefined,
                 false,
+                generationLease,
               );
             },
           );
@@ -5636,6 +5681,7 @@ export class ChatGptBrowserWorker {
                   return recovered;
                 }
                 : undefined,
+              generationLease,
             );
           },
         );
@@ -5684,6 +5730,7 @@ export class ChatGptBrowserWorker {
                 const signal = turn.abortSignal
                   ? AbortSignal.any([stageSignal, turn.abortSignal])
                   : stageSignal;
+                await chatGptRequestPacer.wait("browser_reload", signal);
                 await page.reload({ waitUntil: "domcontentloaded", timeout: 60_000 });
                 await this.prepareTemporaryChatSurface(
                   page,
@@ -5746,6 +5793,7 @@ export class ChatGptBrowserWorker {
                 : undefined,
               attachmentGuard,
               executionTarget.output === "image",
+              generationLease,
             );
           },
         );
@@ -5947,6 +5995,7 @@ export class ChatGptBrowserWorker {
                     return recovered;
                   }
                   : undefined,
+                generationLease,
               );
             } catch (error) {
               turn.followUp.recordEvent({

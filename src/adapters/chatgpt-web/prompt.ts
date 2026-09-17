@@ -649,6 +649,7 @@ export function compileChatGptWebPrompt(
         "<codex_output_schema_json>",
         JSON.stringify(parsed.options.outputFormat.schema),
         "</codex_output_schema_json>",
+        "Return the final answer as the bare JSON value only. Do not use a Markdown code fence and do not add any text before or after the JSON value.",
       ]
       : []),
   ];

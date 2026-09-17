@@ -18,7 +18,11 @@ export function chatGptConversationResponseMetadata(response: Pick<Response,"url
 }
 
 /** Observability must neither change the request nor become a reason for a browser turn to fail. */
-export function observeChatGptConversationResponses(page: Page, traceId: string): () => void {
+export function observeChatGptConversationResponses(
+  page: Page,
+  traceId: string,
+  onRateLimit?: (retryAfterMs: number) => void,
+): () => void {
   if (typeof page.on !== "function") return () => {};
   const observe = (response: Response) => {
     try {
@@ -28,6 +32,7 @@ export function observeChatGptConversationResponses(page: Page, traceId: string)
       if (metadata.status === 429) {
         const retryAfter = retryAfterDelayMs(response.headers()["retry-after"] ?? null);
         const cooldown = chatGptRequestPacer.noteRateLimit(retryAfter);
+        onRateLimit?.(retryAfter);
         console.warn(`[chatgpt-web] conversation_rate_limit_cooldown ${JSON.stringify({
           traceId,
           cooldownMs: cooldown.cooldownMs,

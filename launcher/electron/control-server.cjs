@@ -100,7 +100,9 @@ class BrowserControlServer {
     const isTurnRelease = request.url === "/v1/turn/release";
     const generationAction = new Map([
       ["/v1/generation/acquire", "acquire"],
+      ["/v1/generation/send", "send"],
       ["/v1/generation/release", "release"],
+      ["/v1/generation/feedback", "feedback"],
     ]).get(request.url);
     const isSessionInspect = request.url === "/v1/session/inspect";
     const isImageFactoryConfig = request.url === "/v1/image-factory/config";
@@ -169,7 +171,9 @@ class BrowserControlServer {
       if (generationAction) {
         if (generationAction === "acquire") {
           const priority = body.priority ?? "normal";
+          const kind = body.kind ?? "semantic";
           if (priority !== "normal" && priority !== "retry") throw new Error("generation priority is invalid");
+          if (kind !== "semantic" && kind !== "image") throw new Error("generation kind is invalid");
           const controller = new AbortController();
           const abortAcquire = () => {
             if (!response.writableEnded) controller.abort(new Error("generation acquire client disconnected"));
@@ -182,6 +186,7 @@ class BrowserControlServer {
               body.helperPid,
               priority,
               controller.signal,
+              kind,
             );
             if (response.destroyed || response.writableEnded) {
               host.releaseGenerationPermit(body.traceId, body.helperPid, "acquire_response_closed");
@@ -194,7 +199,58 @@ class BrowserControlServer {
             response.off("close", abortAcquire);
           }
         }
-        if (body.priority !== undefined) throw new Error("generation priority is only valid for acquire");
+        if (generationAction === "send") {
+          if (body.priority !== undefined || body.kind !== undefined || body.feedback !== undefined || body.retryAfterMs !== undefined) {
+            throw new Error("generation acquire-only or feedback-only fields are invalid for send");
+          }
+          const controller = new AbortController();
+          const abortSend = () => {
+            if (!response.writableEnded) controller.abort(new Error("generation send client disconnected"));
+          };
+          request.once("aborted", abortSend);
+          response.once("close", abortSend);
+          try {
+            const result = await host.reserveGenerationSendStart(
+              body.traceId,
+              body.helperPid,
+              controller.signal,
+            );
+            if (response.destroyed || response.writableEnded) return;
+            writeJson(response, 200, { ok: true, ...result });
+            return;
+          } finally {
+            request.off("aborted", abortSend);
+            response.off("close", abortSend);
+          }
+        }
+        if (generationAction === "feedback") {
+          if (body.priority !== undefined || body.kind !== undefined) {
+            throw new Error("generation priority and kind are only valid for acquire");
+          }
+          if (body.feedback === "rate_limit") {
+            if (body.retryAfterMs !== undefined
+              && (!Number.isFinite(body.retryAfterMs) || body.retryAfterMs < 0 || body.retryAfterMs > 24 * 60 * 60_000)) {
+              throw new Error("generation retryAfterMs is invalid");
+            }
+            const result = host.noteGenerationRateLimit(
+              body.traceId,
+              body.helperPid,
+              body.retryAfterMs ?? 0,
+            );
+            writeJson(response, 200, { ok: true, ...result });
+            return;
+          }
+          if (body.feedback === "success") {
+            if (body.retryAfterMs !== undefined) throw new Error("generation retryAfterMs is only valid for rate_limit feedback");
+            const result = host.noteGenerationSuccess(body.traceId, body.helperPid);
+            writeJson(response, 200, { ok: true, ...result });
+            return;
+          }
+          throw new Error("generation feedback is invalid");
+        }
+        if (body.priority !== undefined || body.kind !== undefined || body.feedback !== undefined || body.retryAfterMs !== undefined) {
+          throw new Error("generation acquire-only or feedback-only fields are invalid for release");
+        }
         const result = host.releaseGenerationPermit(body.traceId, body.helperPid, "control_release");
         writeJson(response, 200, { ok: true, ...result });
         return;

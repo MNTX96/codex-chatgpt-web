@@ -1,8 +1,19 @@
 import { expect, test } from "bun:test";
 import {
   ChatGptRequestPacer,
+  DEFAULT_CHATGPT_PACING_INTERVALS_MS,
   retryAfterDelayMs,
 } from "../src/chatgpt-request-pacing";
+
+test("uses the minimum account pacing policy for production traffic", () => {
+  expect(DEFAULT_CHATGPT_PACING_INTERVALS_MS).toEqual({
+    browser_tab: 1_500,
+    browser_navigation: 3_000,
+    browser_reload: 5_000,
+    browser_submit: 15_000,
+    native_api: 15_000,
+  });
+});
 
 test("paces concurrent ChatGPT actions through one process-wide schedule", async () => {
   let now = 0;
@@ -11,6 +22,7 @@ test("paces concurrent ChatGPT actions through one process-wide schedule", async
     intervalsMs: {
       browser_tab: 100,
       browser_navigation: 100,
+      browser_reload: 100,
       browser_submit: 100,
       native_api: 100,
     },
