@@ -96,7 +96,7 @@ function assertDescriptorShape(value: unknown): LauncherBrowserHostDescriptor {
   if (descriptor.nativeBuild !== undefined && (!descriptor.nativeBuild
     || !/^[a-f0-9]{64}$/.test(descriptor.nativeBuild.launcher_sha256)
     || Number.isNaN(Date.parse(descriptor.nativeBuild.started_at))
-    || descriptor.nativeBuild.max_native_tabs !== 2)) {
+    || descriptor.nativeBuild.max_native_tabs !== 5)) {
     throw new Error("Launcher native build identity is invalid");
   }
   if (descriptor.profile !== "production" && descriptor.profile !== "development") {
@@ -447,6 +447,144 @@ export const LAUNCHER_TURN_START_TIMEOUT_MS = 5_000;
 export const LAUNCHER_TURN_HEARTBEAT_INTERVAL_MS = 10_000;
 export const LAUNCHER_TURN_HEARTBEAT_TIMEOUT_MS = 5_000;
 export const LAUNCHER_TURN_END_TIMEOUT_MS = 15_000;
+
+export type LauncherGenerationPriority = "normal" | "retry";
+
+export interface LauncherGenerationOwner {
+  traceId: string;
+  helperPid: number;
+  priority?: LauncherGenerationPriority;
+}
+
+async function launcherGenerationRequest(
+  descriptorPath: string,
+  action: "acquire" | "release",
+  owner: LauncherGenerationOwner,
+  options: { abortSignal?: AbortSignal; timeoutMs?: number } = {},
+): Promise<{ response: Response; body: Record<string, unknown> }> {
+  const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
+  const controller = new AbortController();
+  const abort = () => controller.abort(options.abortSignal?.reason);
+  options.abortSignal?.addEventListener("abort", abort, { once: true });
+  const timer = options.timeoutMs === undefined
+    ? undefined
+    : setTimeout(() => controller.abort(new Error("Launcher generation control timed out")), options.timeoutMs);
+  try {
+    const response = await fetch(`${descriptor.control.endpoint}/v1/generation/${action}`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${descriptor.control.token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(action === "acquire" ? owner : {
+        traceId: owner.traceId,
+        helperPid: owner.helperPid,
+      }),
+      signal: controller.signal,
+    });
+    const body = await response.json().catch(() => ({})) as Record<string, unknown>;
+    return { response, body };
+  } finally {
+    if (timer) clearTimeout(timer);
+    options.abortSignal?.removeEventListener("abort", abort);
+  }
+}
+
+function launcherGenerationControlError(response: Response, body: Record<string, unknown>): Error {
+  const detail = typeof body.error === "string" ? `: ${body.error}` : "";
+  return new Error(`Launcher generation control failed: HTTP ${response.status}${detail}`);
+}
+
+export async function acquireLauncherGenerationPermit(
+  descriptorPath: string,
+  owner: LauncherGenerationOwner,
+  abortSignal?: AbortSignal,
+): Promise<void> {
+  const { response, body } = await launcherGenerationRequest(
+    descriptorPath,
+    "acquire",
+    { ...owner, priority: owner.priority ?? "normal" },
+    { abortSignal },
+  );
+  if (!response.ok) throw launcherGenerationControlError(response, body);
+  if (body.ok !== true || body.acquired !== true || typeof body.reused !== "boolean") {
+    throw new Error("Launcher generation control returned an invalid acquire acknowledgement");
+  }
+}
+
+export async function releaseLauncherGenerationPermit(
+  descriptorPath: string,
+  owner: LauncherGenerationOwner,
+  timeoutMs = LAUNCHER_TURN_END_TIMEOUT_MS,
+): Promise<boolean> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const { response, body } = await launcherGenerationRequest(
+        descriptorPath,
+        "release",
+        owner,
+        { timeoutMs },
+      );
+      if (!response.ok) throw launcherGenerationControlError(response, body);
+      if (body.ok !== true || typeof body.released !== "boolean") {
+        throw new Error("Launcher generation control returned an invalid release acknowledgement");
+      }
+      return body.released as boolean;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError;
+}
+
+export class LauncherGenerationLease {
+  private acquiredState = false;
+  private pendingAcquire?: Promise<void>;
+
+  constructor(
+    private readonly descriptorPath: string,
+    private readonly owner: LauncherGenerationOwner,
+  ) {}
+
+  get acquired(): boolean {
+    return this.acquiredState;
+  }
+
+  async acquire(signal?: AbortSignal): Promise<void> {
+    if (this.acquiredState) return;
+    if (!this.pendingAcquire) {
+      const pending = acquireLauncherGenerationPermit(this.descriptorPath, this.owner, signal)
+        .then(async () => {
+          if (signal?.aborted) {
+            await releaseLauncherGenerationPermit(this.descriptorPath, this.owner).catch(() => {});
+            signal.throwIfAborted();
+          }
+          this.acquiredState = true;
+        })
+        .catch(async (error) => {
+          await releaseLauncherGenerationPermit(this.descriptorPath, this.owner).catch(() => {});
+          throw error;
+        });
+      this.pendingAcquire = pending;
+      void pending.finally(() => {
+        if (this.pendingAcquire === pending) this.pendingAcquire = undefined;
+      }).catch(() => {});
+    }
+    await this.pendingAcquire;
+  }
+
+  async release(): Promise<void> {
+    if (!this.acquiredState) return;
+    this.acquiredState = false;
+    try {
+      await releaseLauncherGenerationPermit(this.descriptorPath, this.owner);
+    } catch (error) {
+      this.acquiredState = true;
+      throw error;
+    }
+  }
+}
 
 export interface LauncherManualTurnOwner {
   traceId: string;

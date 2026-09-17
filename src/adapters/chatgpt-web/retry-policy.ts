@@ -76,6 +76,11 @@ export class ChatGptWebTurnRetryPolicy {
     return entry.retries;
   }
 
+  retryCount(key: string, now = Date.now()): number {
+    this.prune(now);
+    return this.entries.get(key)?.retries ?? 0;
+  }
+
   clear(key: string): void {
     this.entries.delete(key);
   }

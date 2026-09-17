@@ -621,6 +621,86 @@ test("new turn tabs defer device emulation until their renderer finishes loading
   assert.equal(tab.deviceEmulationDirty, true);
 });
 
+test("a turn view whose web contents were externally destroyed is ignored during visibility sync", () => {
+  const events = [];
+  const tab = {
+    id: "tab-destroyed-contents",
+    status: "running",
+    rendererReady: true,
+    deviceEmulationViewport: null,
+    deviceEmulationDirty: true,
+    view: {
+      setBounds: bounds => events.push(["bounds", bounds]),
+      setVisible: visible => events.push(["visible", visible]),
+      webContents: undefined,
+    },
+  };
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    visible: false,
+    surfaceActive: true,
+    boundsReady: true,
+    bounds: { x: 280, y: 64, width: 840, height: 656 },
+    selectedTabId: tab.id,
+    turnTabs: new Map([[tab.id, tab]]),
+    authView: null,
+    window: {
+      getContentSize: () => [1120, 720],
+      isMinimized: () => false,
+      isVisible: () => false,
+    },
+    view: {
+      setBounds: bounds => events.push(["home-bounds", bounds]),
+      setVisible: visible => events.push(["home-visible", visible]),
+    },
+  });
+
+  assert.doesNotThrow(() => BrowserHost.prototype.syncViewVisibility.call(fixture));
+  assert.deepEqual(events, [
+    ["home-bounds", { x: 1121, y: 721, width: 1120, height: 720 }],
+    ["home-visible", true],
+  ]);
+});
+
+test("destroying an owned automatic turn surface releases the tab and cancels its runtime owner", async () => {
+  const contents = new EventEmitter();
+  contents.setWindowOpenHandler = () => {};
+  const removed = [];
+  const cancelled = [];
+  const warnings = [];
+  const tab = {
+    id: "tab-external-destroy",
+    traceId: "trace_external_destroy",
+    helperPid: 777,
+    status: "running",
+    interactionMode: "automatic",
+    view: { webContents: contents },
+  };
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    turnTabs: new Map([[tab.id, tab]]),
+    removeTurnTab: (candidate, abortRunning) => {
+      removed.push([candidate.id, abortRunning]);
+      fixture.turnTabs.delete(candidate.id);
+    },
+    cancelTurn: async traceId => { cancelled.push(traceId); },
+    publishState() {},
+    snapshot: () => ({ tabs: [] }),
+    logger: {
+      error() {},
+      info() {},
+      warn: (event, detail) => warnings.push([event, detail]),
+    },
+  });
+
+  BrowserHost.prototype.bindTurnContents.call(fixture, tab);
+  contents.emit("destroyed");
+  await Promise.resolve();
+  await Promise.resolve();
+
+  assert.deepEqual(removed, [[tab.id, true]]);
+  assert.deepEqual(cancelled, [tab.traceId]);
+  assert.equal(warnings[0][0], "browser.tab_contents_destroyed");
+});
+
 test("visible turn tabs establish native bounds before clearing background emulation", () => {
   const events = [];
   const tab = {
@@ -2622,6 +2702,14 @@ test("failed and aborted browser turns release their tab slots", async () => {
     };
     const fixture = Object.assign(Object.create(BrowserHost.prototype), {
       turnTabs: new Map([[tab.id, tab]]),
+      generationOwner: {
+        traceId: tab.traceId,
+        helperPid: tab.helperPid,
+        priority: "normal",
+        acquiredAt: Date.now(),
+      },
+      generationWaiters: [],
+      consecutiveGenerationRetryGrants: 0,
       closedTurnOwners: new Map(),
       userCancelledTurnOwners: new Map(),
       selectedTabId: tab.id,
@@ -2644,10 +2732,104 @@ test("failed and aborted browser turns release their tab slots", async () => {
     );
 
     assert.equal(fixture.turnTabs.size, 0);
+    assert.equal(fixture.generationOwner, null);
     assert.equal(fixture.selectedTabId, "home");
     assert.equal(tab.status, status === "aborted" ? "aborted" : "error");
     assert.equal(closed, true);
   }
+});
+
+function generationGateFixture() {
+  return Object.assign(Object.create(BrowserHost.prototype), {
+    generationOwner: null,
+    generationWaiters: [],
+    consecutiveGenerationRetryGrants: 0,
+    logger: { debug() {}, info() {}, warn() {} },
+  });
+}
+
+test("launcher generation gate serializes different helper processes", async () => {
+  const fixture = generationGateFixture();
+  assert.deepEqual(await fixture.acquireGenerationPermit("gen_owner_a", 101, "normal"), {
+    acquired: true,
+    reused: false,
+  });
+  let secondAcquired = false;
+  const second = fixture.acquireGenerationPermit("gen_owner_b", 202, "normal").then(result => {
+    secondAcquired = true;
+    return result;
+  });
+  await Promise.resolve();
+  assert.equal(secondAcquired, false);
+  assert.equal(fixture.generationOwner.traceId, "gen_owner_a");
+
+  assert.deepEqual(fixture.releaseGenerationPermit("gen_owner_a", 101), { released: true });
+  assert.deepEqual(await second, { acquired: true, reused: false });
+  assert.equal(fixture.generationOwner.traceId, "gen_owner_b");
+  fixture.releaseGenerationPermit("gen_owner_b", 202);
+});
+
+test("launcher generation gate removes an aborted waiter without blocking the next helper", async () => {
+  const fixture = generationGateFixture();
+  await fixture.acquireGenerationPermit("gen_abort_owner", 301, "normal");
+  const controller = new AbortController();
+  const reason = new Error("cancel queued generation");
+  const aborted = fixture.acquireGenerationPermit("gen_abort_waiter", 302, "normal", controller.signal);
+  controller.abort(reason);
+  await assert.rejects(aborted, error => error === reason);
+
+  const next = fixture.acquireGenerationPermit("gen_abort_next", 303, "normal");
+  fixture.releaseGenerationPermit("gen_abort_owner", 301);
+  await next;
+  assert.equal(fixture.generationOwner.traceId, "gen_abort_next");
+  fixture.releaseGenerationPermit("gen_abort_next", 303);
+});
+
+test("launcher generation gate bounds retry priority so normal work cannot starve", async () => {
+  const fixture = generationGateFixture();
+  await fixture.acquireGenerationPermit("gen_priority_owner", 401, "normal");
+  const normal = fixture.acquireGenerationPermit("gen_priority_normal", 402, "normal");
+  const retry1 = fixture.acquireGenerationPermit("gen_priority_retry_1", 403, "retry");
+  const retry2 = fixture.acquireGenerationPermit("gen_priority_retry_2", 404, "retry");
+  const retry3 = fixture.acquireGenerationPermit("gen_priority_retry_3", 405, "retry");
+
+  fixture.releaseGenerationPermit("gen_priority_owner", 401);
+  await retry1;
+  assert.equal(fixture.generationOwner.traceId, "gen_priority_retry_1");
+  fixture.releaseGenerationPermit("gen_priority_retry_1", 403);
+  await retry2;
+  assert.equal(fixture.generationOwner.traceId, "gen_priority_retry_2");
+  fixture.releaseGenerationPermit("gen_priority_retry_2", 404);
+  await normal;
+  assert.equal(fixture.generationOwner.traceId, "gen_priority_normal");
+  fixture.releaseGenerationPermit("gen_priority_normal", 402);
+  await retry3;
+  assert.equal(fixture.generationOwner.traceId, "gen_priority_retry_3");
+  fixture.releaseGenerationPermit("gen_priority_retry_3", 405);
+});
+
+test("launcher generation ownership is exact, idempotent, and reaps a dead helper", async () => {
+  const fixture = generationGateFixture();
+  await fixture.acquireGenerationPermit("gen_exact_owner", 501, "normal");
+  assert.throws(
+    () => fixture.releaseGenerationPermit("gen_exact_owner", 502),
+    /Generation helper ownership mismatch/,
+  );
+  assert.equal(fixture.generationOwner.helperPid, 501);
+  assert.deepEqual(fixture.releaseGenerationPermit("gen_exact_owner", 501), { released: true });
+  assert.deepEqual(fixture.releaseGenerationPermit("gen_exact_owner", 501), { released: false });
+
+  fixture.generationOwner = {
+    traceId: "gen_dead_owner",
+    helperPid: 2_000_000_000,
+    priority: "normal",
+    acquiredAt: Date.now(),
+  };
+  const successor = fixture.acquireGenerationPermit("gen_live_successor", process.pid, "normal");
+  fixture.reapOrphanGenerationPermits();
+  await successor;
+  assert.equal(fixture.generationOwner.traceId, "gen_live_successor");
+  fixture.releaseGenerationPermit("gen_live_successor", process.pid);
 });
 
 function manualTurnFixture() {

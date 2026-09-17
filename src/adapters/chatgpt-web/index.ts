@@ -25,6 +25,7 @@ import type { ProviderAdapter } from "../base";
 import { parseDataUrl } from "../image";
 import { ChatGptWebAdapterError } from "./adapter-error";
 import { ChatGptBrowserWorker, chatGptBrowserCapacityAvailable, type BrowserTurn } from "./browser-worker";
+import type { ChatGptGenerationPriority } from "./concurrency";
 import {
   chatGptTurnUserRevisionHistory,
   contentText,
@@ -630,6 +631,7 @@ export function createChatGptWebAdapter(
           try {
             const answer = await imageFactoryWorker.run({
               traceId: `image_${options.request.jobId.slice(0, 46)}_${attempt}`,
+              generationPriority: attempt > 1 ? "retry" : "normal",
               modelId: imageModelId,
               reasoning: imageModelPolicy.reasoning,
               capabilities: imageCapabilities,
@@ -822,6 +824,7 @@ export function createChatGptWebAdapter(
       onCompactionProgress?: () => void;
       onSendActivated?: () => void | Promise<void>;
       retryHistoryReductionLevel?: number;
+      generationPriority?: ChatGptGenerationPriority;
     } = {},
   ): ChatGptTurnRuntime => {
     const manualRequest = isChatGptWebZeroRiskBackendModel(parsed.modelId);
@@ -1120,6 +1123,7 @@ export function createChatGptWebAdapter(
     if (!mode.localTools) {
       const browserTurn = cancellableBrowserTurn(finalizeCheckpoint(worker.run({
         traceId,
+        ...(hooks.generationPriority ? { generationPriority: hooks.generationPriority } : {}),
         modelId: parsed.modelId,
         reasoning: parsed.options.reasoning,
         capabilities: turnCapabilities,
@@ -1213,6 +1217,7 @@ export function createChatGptWebAdapter(
     };
     const browserTurn = cancellableBrowserTurn(trackBrowserOwner(finalizeCheckpoint(worker.run({
       traceId,
+      ...(hooks.generationPriority ? { generationPriority: hooks.generationPriority } : {}),
       modelId: parsed.modelId,
       reasoning: parsed.options.reasoning,
       capabilities: turnCapabilities,
@@ -1318,6 +1323,9 @@ export function createChatGptWebAdapter(
           "upstream_server_error",
           "Something went wrong",
         );
+        const generationPriority: ChatGptGenerationPriority = chatGptWebTurnRetryPolicy.retryCount(retryKey) > 0
+          ? "retry"
+          : "normal";
         let environment: ReturnType<typeof extractChatGptTurnEnvironment> | undefined;
         if (mode.localTools || (!manualRequest && provider.chatgptWeb?.generatedImageArtifacts?.mode !== "off")) {
           try {
@@ -1614,7 +1622,10 @@ export function createChatGptWebAdapter(
         const session = await chatGptTurnSessions.getOrCreateAfterOwnerRetirement(
           executionKey,
           ownerKey,
-          () => startRuntime(parsed, environment, traceId, turnCapabilities, { retryHistoryReductionLevel }),
+          () => startRuntime(parsed, environment, traceId, turnCapabilities, {
+            retryHistoryReductionLevel,
+            generationPriority,
+          }),
           traceId,
           incoming.abortSignal,
           nativeTurnId,

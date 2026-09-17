@@ -29,6 +29,7 @@ interface RunMessage {
   };
   turn: {
     traceId: string;
+    generationPriority?: BrowserTurn["generationPriority"];
     imageReconcile?: BrowserTurn["imageReconcile"];
     modelId: string;
     reasoning?: string;
@@ -178,6 +179,11 @@ async function run(message: RunMessage): Promise<void> {
     throw new Error("Browser helper turn identity is invalid");
   }
   if (abortControllers.has(message.id)) throw new Error(`Browser helper turn already exists: ${message.id}`);
+  if (message.turn.generationPriority !== undefined
+    && message.turn.generationPriority !== "normal"
+    && message.turn.generationPriority !== "retry") {
+    throw new Error("Browser helper generation priority is invalid");
+  }
   if (message.turn.resumeAvailable !== undefined && typeof message.turn.resumeAvailable !== "boolean") {
     throw new Error("Browser helper resume availability is invalid");
   }
@@ -331,6 +337,7 @@ async function run(message: RunMessage): Promise<void> {
   const prepareSelected = async () => ({ ...await promptSelection.wait(), release: () => {} });
   const turn: BrowserTurn = {
     traceId: message.turn.traceId,
+    ...(message.turn.generationPriority ? { generationPriority: message.turn.generationPriority } : {}),
     modelId: message.turn.modelId,
     reasoning: message.turn.reasoning,
     capabilities: message.turn.capabilities,

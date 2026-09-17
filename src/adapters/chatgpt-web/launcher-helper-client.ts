@@ -401,6 +401,7 @@ export class LauncherBrowserHelperClient {
           },
           turn: {
             traceId: turn.traceId,
+            ...(turn.generationPriority ? { generationPriority: turn.generationPriority } : {}),
             modelId: turn.modelId,
             reasoning: turn.reasoning,
             capabilities: turn.capabilities,

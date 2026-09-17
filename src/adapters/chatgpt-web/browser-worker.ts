@@ -77,6 +77,7 @@ import {
 import { loginVerificationMarkerPath } from "../../browser-login";
 import {
   connectLauncherBrowserHost,
+  LauncherGenerationLease,
   LauncherBrowserTurnCancelledError,
   LauncherRetainedConversationUnavailableError,
   LAUNCHER_TURN_HEARTBEAT_INTERVAL_MS,
@@ -89,7 +90,11 @@ import {
   resolveChatGptWebTransportLimits,
 } from "../../chatgpt-web-models";
 import { LauncherBrowserHelperClient } from "./launcher-helper-client";
-import { MAX_CHATGPT_BROWSER_TABS } from "./concurrency";
+import {
+  ChatGptGenerationLease,
+  MAX_CHATGPT_BROWSER_TABS,
+  type ChatGptGenerationPriority,
+} from "./concurrency";
 import {
   ChatGptCompactionHandoffAccepted,
   ChatGptWebAdapterError,
@@ -1197,6 +1202,7 @@ function browserPageUrl(page: Page): string | undefined {
 
 export interface BrowserTurn {
   traceId: string;
+  generationPriority?: ChatGptGenerationPriority;
   modelId: string;
   reasoning?: string;
   capabilities: ChatGptWebCapabilities;
@@ -1261,6 +1267,12 @@ export interface BrowserTurn {
   imageEditSource?: OutputImageSource;
   /** Automatic retained text turns may receive native Codex steering while this browser stays live. */
   followUp?: ChatGptFollowUpChannel;
+}
+
+interface BrowserGenerationLease {
+  readonly acquired: boolean;
+  acquire(signal?: AbortSignal): Promise<void>;
+  release(): void | Promise<void>;
 }
 
 interface ChatGptSubmissionBaseline {
@@ -2169,6 +2181,21 @@ export class ChatGptBrowserWorker {
   private readonly activeRuns = new Map<string, Promise<string>>();
 
   private constructor(private readonly config: ResolvedBrowserConfig) {}
+
+  private generationLease(
+    traceId: string,
+    priority: ChatGptGenerationPriority = "normal",
+  ): BrowserGenerationLease {
+    if (this.config.browserHost === "launcher") {
+      return new LauncherGenerationLease(this.config.browserHostDescriptorPath!, {
+        traceId,
+        helperPid: process.pid,
+        priority,
+      });
+    }
+    return new ChatGptGenerationLease(priority);
+  }
+
   /**
    * Lexical/contenteditable may preserve ASCII spaces by exposing some of them as NBSP through DOM
    * textContent. That happens inside multi-space runs and for a single leading space after a line
@@ -4478,15 +4505,21 @@ export class ChatGptBrowserWorker {
     const reasoning = account.solAvailable ? "high" : "low";
     const mode = resolveChatGptWebModelMode(modelId, reasoning, capabilities);
     const traceId = `smoke_${randomUUID().replaceAll("-", "")}`;
-    const response = await this.runBrowserTurn({
-      traceId,
-      modelId,
-      reasoning,
-      capabilities,
-      prepare: async () => ({ text: CHATGPT_SMOKE_TEXT, images: [], release: () => {} }),
-      abortSignal,
-      onTextDelta: () => {},
-    }, undefined, page);
+    const generationLease = this.generationLease(traceId);
+    let response: string;
+    try {
+      response = await this.runBrowserTurn({
+        traceId,
+        modelId,
+        reasoning,
+        capabilities,
+        prepare: async () => ({ text: CHATGPT_SMOKE_TEXT, images: [], release: () => {} }),
+        abortSignal,
+        onTextDelta: () => {},
+      }, generationLease, undefined, page);
+    } finally {
+      await generationLease.release();
+    }
     if (response.trim() !== CHATGPT_SMOKE_EXPECTED) {
       throw new Error(
         `ChatGPT smoke test returned an unexpected answer (${JSON.stringify(response.trim().slice(0, 200))})`,
@@ -4992,7 +5025,14 @@ export class ChatGptBrowserWorker {
 
   private async runExclusive(turn: BrowserTurn): Promise<string> {
     if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
-    if (this.config.browserHost !== "launcher") return this.runBrowserTurn(turn);
+    const generationLease = this.generationLease(turn.traceId, turn.generationPriority);
+    if (this.config.browserHost !== "launcher") {
+      try {
+        return await this.runBrowserTurn(turn, generationLease);
+      } finally {
+        await generationLease.release();
+      }
+    }
     if (turn.executionTarget?.output === "image" || turn.requireOutputArtifact) {
       assertLauncherImageDownloadSupport(this.config.browserHostDescriptorPath!);
     }
@@ -5058,7 +5098,7 @@ export class ChatGptBrowserWorker {
       heartbeatTimer.unref?.();
       sendHeartbeat();
       await this.preparePrompt(turn, () => Promise.resolve(turn.onPreparedSelected?.(reused)));
-      return await this.runBrowserTurn(turn, surfaceId, undefined, reused);
+      return await this.runBrowserTurn(turn, generationLease, surfaceId, undefined, reused);
     } catch (error) {
       originalError = error;
       terminal = error instanceof ChatGptCompactionHandoffAccepted
@@ -5070,28 +5110,32 @@ export class ChatGptBrowserWorker {
       terminalMessage = error instanceof Error ? error.message.slice(0, 500) : String(error).slice(0, 500);
       throw error;
     } finally {
-      if (heartbeatTimer) clearInterval(heartbeatTimer);
       try {
-        const release = await notifyLauncherTurn(this.config.browserHostDescriptorPath!, {
-          phase: "end",
-          traceId: turn.traceId,
-          helperPid: process.pid,
-          status: terminal,
-          ...(terminalMessage ? { message: terminalMessage } : {}),
-          ...(terminal === "completed" && turn.retainConversation ? { retain: true } : {}),
-          ...(terminal === "completed" && (turn.nativeConnector || turn.capabilities.localToolsEnabled)
-            ? { connectorBound: true }
-            : {}),
-        });
-        if (release.cancelledByUser) throw chatGptBrowserTabClosedError();
-      } catch (controlError) {
-        if (controlError instanceof ChatGptWebAdapterError && controlError.code === "client_cancelled") {
-          throw controlError;
+        if (heartbeatTimer) clearInterval(heartbeatTimer);
+        try {
+          const release = await notifyLauncherTurn(this.config.browserHostDescriptorPath!, {
+            phase: "end",
+            traceId: turn.traceId,
+            helperPid: process.pid,
+            status: terminal,
+            ...(terminalMessage ? { message: terminalMessage } : {}),
+            ...(terminal === "completed" && turn.retainConversation ? { retain: true } : {}),
+            ...(terminal === "completed" && (turn.nativeConnector || turn.capabilities.localToolsEnabled)
+              ? { connectorBound: true }
+              : {}),
+          });
+          if (release.cancelledByUser) throw chatGptBrowserTabClosedError();
+        } catch (controlError) {
+          if (controlError instanceof ChatGptWebAdapterError && controlError.code === "client_cancelled") {
+            throw controlError;
+          }
+          if (!originalError) throw controlError;
+          console.error(
+            `[chatgpt-web] launcher turn-end notification failed after browser error: ${controlError instanceof Error ? controlError.message : String(controlError)}`,
+          );
         }
-        if (!originalError) throw controlError;
-        console.error(
-          `[chatgpt-web] launcher turn-end notification failed after browser error: ${controlError instanceof Error ? controlError.message : String(controlError)}`,
-        );
+      } finally {
+        await generationLease.release();
       }
     }
   }
@@ -5114,6 +5158,7 @@ export class ChatGptBrowserWorker {
 
   private async runBrowserTurn(
     turn: BrowserTurn,
+    generationLease: BrowserGenerationLease,
     launcherSurfaceId?: string,
     maintenancePage?: Page,
     reuseConversation = false,
@@ -5228,6 +5273,18 @@ export class ChatGptBrowserWorker {
       let deadline = this.config.turnTimeoutMs === undefined
         ? undefined
         : Date.now() + this.config.turnTimeoutMs;
+      const acquireGenerationPermit = async (): Promise<void> => {
+        if (generationLease.acquired) return;
+        const waitStartedAt = Date.now();
+        await generationLease.acquire(turn.abortSignal);
+        // Preserve the pre-existing turn deadline while refunding only time spent queued behind
+        // another active generation. Preparation time still counts exactly as it did before.
+        if (deadline !== undefined) deadline += Math.max(0, Date.now() - waitStartedAt);
+        console.info(
+          `[chatgpt-web] browser turn ${turn.traceId} acquired global generation permit`
+          + ` (priority=${turn.generationPriority ?? "normal"})`,
+        );
+      };
       let page = await this.runStage(turn.traceId, "browser_page", browserStageTimeouts.browserPage, async (abortSignal) => {
         if (maintenancePage) return maintenancePage;
         if (!launcherSurfaceId) {
@@ -5459,6 +5516,7 @@ export class ChatGptBrowserWorker {
             true,
           );
           await diagnostics.capture(page, `multipart-stage-${index + 1}-attachment-complete`);
+          await acquireGenerationPermit();
 
           const evidence = await this.runStage(
             turn.traceId,
@@ -5556,6 +5614,7 @@ export class ChatGptBrowserWorker {
         if (!reuseConversation || prepared.images.length > 0 || prepared.multipart) {
           throw new Error("Image edit requires a retained conversation and a plain Describe edits prompt");
         }
+        await acquireGenerationPermit();
         finalSubmissionEvidence = await this.runStage(
           turn.traceId,
           "image_edit_send",
@@ -5661,6 +5720,7 @@ export class ChatGptBrowserWorker {
           },
         );
         await diagnostics.capture(page, attachmentGuard ? "file-attachment-complete" : "file-attachment-skipped");
+        await acquireGenerationPermit();
         finalSubmissionEvidence = await this.runStage(
           turn.traceId,
           "send",

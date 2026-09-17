@@ -98,6 +98,10 @@ class BrowserControlServer {
       || request.url === "/v1/turn/heartbeat"
       || request.url === "/v1/turn/end";
     const isTurnRelease = request.url === "/v1/turn/release";
+    const generationAction = new Map([
+      ["/v1/generation/acquire", "acquire"],
+      ["/v1/generation/release", "release"],
+    ]).get(request.url);
     const isSessionInspect = request.url === "/v1/session/inspect";
     const isImageFactoryConfig = request.url === "/v1/image-factory/config";
     const imageDownloadAction = new Map([
@@ -113,7 +117,7 @@ class BrowserControlServer {
       ["/v1/manual/end", "end"],
       ["/v1/manual/cancel", "cancel"],
     ]).get(request.url);
-    if (request.method !== "POST" || (!isTurn && !isTurnRelease && !isSessionInspect && !isImageFactoryConfig && !manualAction && !imageDownloadAction)) {
+    if (request.method !== "POST" || (!isTurn && !isTurnRelease && !generationAction && !isSessionInspect && !isImageFactoryConfig && !manualAction && !imageDownloadAction)) {
       writeJson(response, 404, { error: "not_found" });
       return;
     }
@@ -161,6 +165,39 @@ class BrowserControlServer {
       }
       if (!Number.isInteger(body.helperPid) || body.helperPid < 1) {
         throw new Error("browser helper pid is invalid");
+      }
+      if (generationAction) {
+        if (generationAction === "acquire") {
+          const priority = body.priority ?? "normal";
+          if (priority !== "normal" && priority !== "retry") throw new Error("generation priority is invalid");
+          const controller = new AbortController();
+          const abortAcquire = () => {
+            if (!response.writableEnded) controller.abort(new Error("generation acquire client disconnected"));
+          };
+          request.once("aborted", abortAcquire);
+          response.once("close", abortAcquire);
+          try {
+            const result = await host.acquireGenerationPermit(
+              body.traceId,
+              body.helperPid,
+              priority,
+              controller.signal,
+            );
+            if (response.destroyed || response.writableEnded) {
+              host.releaseGenerationPermit(body.traceId, body.helperPid, "acquire_response_closed");
+              return;
+            }
+            writeJson(response, 200, { ok: true, ...result });
+            return;
+          } finally {
+            request.off("aborted", abortAcquire);
+            response.off("close", abortAcquire);
+          }
+        }
+        if (body.priority !== undefined) throw new Error("generation priority is only valid for acquire");
+        const result = host.releaseGenerationPermit(body.traceId, body.helperPid, "control_release");
+        writeJson(response, 200, { ok: true, ...result });
+        return;
       }
       if (imageDownloadAction) {
         const result = host.imageDownload(imageDownloadAction, body);
@@ -360,6 +397,7 @@ class BrowserControlServer {
         return;
       }
     } catch (error) {
+      if (response.destroyed || response.writableEnded) return;
       const message = error instanceof Error ? error.message : String(error);
       this.logger.warn("browser.control_rejected", { message });
       const cancelled = error?.code === "turn_cancelled";

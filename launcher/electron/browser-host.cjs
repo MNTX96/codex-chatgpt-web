@@ -8,7 +8,7 @@ for (const name of fs.readdirSync(__dirname).filter(name => name.endsWith('.cjs'
 const NATIVE_LOADED_LAUNCHER = Object.freeze({
   launcher_sha256: nativeLauncherHash.digest('hex'),
   started_at: new Date(Date.now() - process.uptime() * 1000).toISOString(),
-  max_native_tabs: 2,
+  max_native_tabs: 5,
 });
 const { clipboard, WebContentsView, powerMonitor, powerSaveBlocker, shell } = require("electron");
 const { writePrivateFileAtomic } = require("./atomic-file.cjs");
@@ -40,6 +40,7 @@ const IDLE_BROWSER_URL = "data:text/html;charset=utf-8,%3C!doctype%20html%3E%3Ch
 const PRIMARY_VIEW_BOOTSTRAP_TIMEOUT_MS = 10_000;
 const MAX_BROWSER_VIEW_DIMENSION = 16_384;
 const MAX_BROWSER_TABS = 5;
+const MAX_CONSECUTIVE_GENERATION_RETRY_GRANTS = 2;
 const MAX_CANCELLED_TURN_TRACES = 256;
 const MANUAL_SUBMIT_TIMEOUT_MS = 30_000;
 const MANUAL_COMPACTION_SUBMIT_TIMEOUT_MS = 120_000;
@@ -98,6 +99,12 @@ const CHATGPT_VIEWPORT_CSS = `
 `;
 
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+function generationQueueAbortError(message = "ChatGPT generation queue aborted") {
+  const error = new Error(message);
+  error.name = "AbortError";
+  return error;
+}
 
 function javaScriptLiteral(value) {
   return JSON.stringify(value).replace(/\u2028/g, "\\u2028").replace(/\u2029/g, "\\u2029");
@@ -364,6 +371,9 @@ class BrowserHost {
     this.visible = false;
     this.surfaceActive = true;
     this.turnTabs = new Map();
+    this.generationOwner = null;
+    this.generationWaiters = [];
+    this.consecutiveGenerationRetryGrants = 0;
     this.imageDownloads = new OwnedImageDownloads({ logger });
     this.closedTurnOwners = new Map();
     this.userCancelledTurnOwners = new Map();
@@ -868,6 +878,24 @@ class BrowserHost {
       });
       this.removeTurnTab(tab, true);
     });
+    contents.once("destroyed", () => {
+      if (this.turnTabs.get(tab.id) !== tab) return;
+      const running = tab.status === "running";
+      this.logger.warn("browser.tab_contents_destroyed", {
+        tabId: tab.id,
+        traceId: tab.traceId,
+        status: tab.status,
+      });
+      this.removeTurnTab(tab, running);
+      if (running && this.cancelTurn) {
+        void Promise.resolve().then(() => this.cancelTurn(tab.traceId)).catch(error => {
+          this.logger.warn("browser.destroyed_turn_cancellation_failed", {
+            traceId: tab.traceId,
+            message: error instanceof Error ? error.message : String(error),
+          });
+        });
+      }
+    });
     contents.on("unresponsive", () => {
       this.logger.warn("browser.tab_unresponsive", { tabId: tab.id, traceId: tab.traceId });
     });
@@ -1335,16 +1363,174 @@ class BrowserHost {
     return this.snapshot();
   }
 
+  acquireGenerationPermit(traceId, helperPid, priority = "normal", signal) {
+    if (!this.generationWaiters) this.generationWaiters = [];
+    if (!Number.isInteger(this.consecutiveGenerationRetryGrants)) this.consecutiveGenerationRetryGrants = 0;
+    if (priority !== "normal" && priority !== "retry") throw new Error("generation priority is invalid");
+    if (signal?.aborted) {
+      throw signal.reason instanceof Error ? signal.reason : generationQueueAbortError();
+    }
+    if (this.generationOwner?.traceId === traceId) {
+      if (this.generationOwner.helperPid !== helperPid) {
+        throw new Error(
+          `Generation helper ownership mismatch: expected ${this.generationOwner.helperPid}, received ${helperPid}`,
+        );
+      }
+      return Promise.resolve({ acquired: true, reused: true });
+    }
+    const existing = this.generationWaiters.find(waiter => waiter.traceId === traceId);
+    if (existing) {
+      if (existing.helperPid !== helperPid) {
+        throw new Error(`Generation helper ownership mismatch: expected ${existing.helperPid}, received ${helperPid}`);
+      }
+      return existing.promise;
+    }
+
+    let resolveWaiter;
+    let rejectWaiter;
+    const promise = new Promise((resolve, reject) => {
+      resolveWaiter = resolve;
+      rejectWaiter = reject;
+    });
+    const waiter = {
+      traceId,
+      helperPid,
+      priority,
+      signal,
+      promise,
+      resolve: resolveWaiter,
+      reject: rejectWaiter,
+      onAbort: null,
+    };
+    if (signal) {
+      waiter.onAbort = () => {
+        const index = this.generationWaiters.indexOf(waiter);
+        if (index < 0) return;
+        this.generationWaiters.splice(index, 1);
+        signal.removeEventListener("abort", waiter.onAbort);
+        rejectWaiter(signal.reason instanceof Error ? signal.reason : generationQueueAbortError());
+        this.logger?.debug?.("browser.generation_wait_aborted", { traceId, helperPid });
+        BrowserHost.prototype.dispatchGenerationWaiters.call(this);
+      };
+      signal.addEventListener("abort", waiter.onAbort, { once: true });
+    }
+    this.generationWaiters.push(waiter);
+    this.logger?.debug?.("browser.generation_queued", {
+      traceId,
+      helperPid,
+      priority,
+      queuedCount: this.generationWaiters.length,
+    });
+    BrowserHost.prototype.dispatchGenerationWaiters.call(this);
+    return promise;
+  }
+
+  dispatchGenerationWaiters() {
+    if (!this.generationWaiters) this.generationWaiters = [];
+    if (!Number.isInteger(this.consecutiveGenerationRetryGrants)) this.consecutiveGenerationRetryGrants = 0;
+    if (this.generationOwner) return;
+    while (this.generationWaiters.length > 0) {
+      const retryIndex = this.generationWaiters.findIndex(waiter => waiter.priority === "retry");
+      const normalIndex = this.generationWaiters.findIndex(waiter => waiter.priority === "normal");
+      const index = retryIndex < 0
+        ? normalIndex
+        : normalIndex < 0
+          ? retryIndex
+          : this.consecutiveGenerationRetryGrants < MAX_CONSECUTIVE_GENERATION_RETRY_GRANTS
+            ? retryIndex
+            : normalIndex;
+      const waiter = this.generationWaiters.splice(index, 1)[0];
+      if (waiter.onAbort) waiter.signal?.removeEventListener("abort", waiter.onAbort);
+      if (waiter.signal?.aborted) {
+        waiter.reject(waiter.signal.reason instanceof Error ? waiter.signal.reason : generationQueueAbortError());
+        continue;
+      }
+      this.generationOwner = {
+        traceId: waiter.traceId,
+        helperPid: waiter.helperPid,
+        priority: waiter.priority,
+        acquiredAt: Date.now(),
+      };
+      if (waiter.priority === "retry") this.consecutiveGenerationRetryGrants += 1;
+      else this.consecutiveGenerationRetryGrants = 0;
+      this.logger?.info?.("browser.generation_acquired", {
+        traceId: waiter.traceId,
+        helperPid: waiter.helperPid,
+        priority: waiter.priority,
+        queuedCount: this.generationWaiters.length,
+      });
+      waiter.resolve({ acquired: true, reused: false });
+      return;
+    }
+  }
+
+  releaseGenerationPermit(traceId, helperPid, reason = "explicit_release") {
+    if (!this.generationWaiters) this.generationWaiters = [];
+    if (this.generationOwner?.traceId === traceId) {
+      if (this.generationOwner.helperPid !== helperPid) {
+        throw new Error(
+          `Generation helper ownership mismatch: expected ${this.generationOwner.helperPid}, received ${helperPid}`,
+        );
+      }
+      this.generationOwner = null;
+      this.logger?.info?.("browser.generation_released", { traceId, helperPid, reason });
+      BrowserHost.prototype.dispatchGenerationWaiters.call(this);
+      return { released: true };
+    }
+    const index = this.generationWaiters.findIndex(waiter => waiter.traceId === traceId);
+    if (index >= 0) {
+      const waiter = this.generationWaiters[index];
+      if (waiter.helperPid !== helperPid) {
+        throw new Error(`Generation helper ownership mismatch: expected ${waiter.helperPid}, received ${helperPid}`);
+      }
+      this.generationWaiters.splice(index, 1);
+      if (waiter.onAbort) waiter.signal?.removeEventListener("abort", waiter.onAbort);
+      waiter.reject(generationQueueAbortError(`ChatGPT generation permit released before acquisition: ${reason}`));
+      this.logger?.info?.("browser.generation_wait_released", { traceId, helperPid, reason });
+      BrowserHost.prototype.dispatchGenerationWaiters.call(this);
+      return { released: true };
+    }
+    return { released: false };
+  }
+
+  reapOrphanGenerationPermits() {
+    if (!this.generationWaiters) this.generationWaiters = [];
+    const owner = this.generationOwner;
+    if (owner && !processRunning(owner.helperPid)) {
+      this.logger?.warn?.("browser.generation_orphan_reaped", {
+        traceId: owner.traceId,
+        helperPid: owner.helperPid,
+        evidence: "owner_process_exited",
+      });
+      this.generationOwner = null;
+    }
+    for (const waiter of [...this.generationWaiters]) {
+      if (processRunning(waiter.helperPid)) continue;
+      const index = this.generationWaiters.indexOf(waiter);
+      if (index < 0) continue;
+      this.generationWaiters.splice(index, 1);
+      if (waiter.onAbort) waiter.signal?.removeEventListener("abort", waiter.onAbort);
+      waiter.reject(generationQueueAbortError("ChatGPT generation owner process exited"));
+      this.logger?.warn?.("browser.generation_waiter_orphan_reaped", {
+        traceId: waiter.traceId,
+        helperPid: waiter.helperPid,
+        evidence: "owner_process_exited",
+      });
+    }
+    BrowserHost.prototype.dispatchGenerationWaiters.call(this);
+  }
+
   imageDownload(action, body) {
     requireAutomaticBrowserInspection(this, "Image artifact download");
     const tab = [...this.turnTabs.values()].find(candidate => candidate.traceId === body.traceId);
+    const contents = tab?.view?.webContents;
     if (!tab || tab.helperPid !== body.helperPid || tab.surfaceId !== body.surfaceId
       || tab.interactionMode !== "automatic" || tab.status !== "running"
-      || tab.view.webContents.isDestroyed()
-      || tab.view.webContents.getOrCreateDevToolsTargetId() !== body.targetId) {
+      || !contents || contents.isDestroyed()
+      || contents.getOrCreateDevToolsTargetId() !== body.targetId) {
       throw Object.assign(new Error("image_download_owner_mismatch"), { code: "image_download_owner_mismatch" });
     }
-    if (action === "begin") return this.imageDownloads.begin(tab.view.webContents, body);
+    if (action === "begin") return this.imageDownloads.begin(contents, body);
     if (action === "status") return this.imageDownloads.status(body);
     return this.imageDownloads.release(body);
   }
@@ -1377,6 +1563,7 @@ class BrowserHost {
   }
 
   reapExpiredTurnTabs(now = Date.now()) {
+    BrowserHost.prototype.reapOrphanGenerationPermits.call(this);
     const lastSweepAt = this.lastTurnSweepAt;
     this.lastTurnSweepAt = now;
     if (sweepGapIndicatesSuspension(lastSweepAt, now, TURN_HEARTBEAT_SWEEP_MS)) {
@@ -1456,7 +1643,14 @@ class BrowserHost {
   }
 
   activeView() {
-    return this.authView || this.selectedTurnTab()?.view || this.view;
+    const authContents = this.authView?.webContents;
+    if (authContents
+      && (typeof authContents.isDestroyed !== "function" || !authContents.isDestroyed())) return this.authView;
+    const turnView = this.selectedTurnTab()?.view;
+    const turnContents = turnView?.webContents;
+    if (turnContents
+      && (typeof turnContents.isDestroyed !== "function" || !turnContents.isDestroyed())) return turnView;
+    return this.view;
   }
 
   hiddenTurnBounds() {
@@ -1475,6 +1669,9 @@ class BrowserHost {
   }
 
   enableHiddenTurnViewport(contents, { width, height }) {
+    if (!contents || contents.isDestroyed?.() || typeof contents.enableDeviceEmulation !== "function") {
+      return false;
+    }
     contents.enableDeviceEmulation({
       screenPosition: "desktop",
       screenSize: { width, height },
@@ -1483,19 +1680,24 @@ class BrowserHost {
       viewSize: { width, height },
       scale: 1,
     });
+    return true;
   }
 
   presentTurnView(tab, visible) {
+    const view = tab?.view;
+    if (!view) return;
     if (tab.interactionMode === "manual") {
-      tab.view.setBounds(visible ? this.bounds : this.hiddenTurnBounds());
-      tab.view.setVisible(visible || tab.status === "running");
+      view.setBounds(visible ? this.bounds : this.hiddenTurnBounds());
+      view.setVisible(visible || tab.status === "running");
       return;
     }
+    const contents = view.webContents;
+    if (!contents || contents.isDestroyed?.()) return;
     if (visible) {
       // Establish native on-screen bounds before removing the background viewport contract.
-      tab.view.setBounds(this.bounds);
+      view.setBounds(this.bounds);
       if (tab.rendererReady && tab.deviceEmulationViewport) {
-        tab.view.webContents.disableDeviceEmulation();
+        contents.disableDeviceEmulation();
         tab.deviceEmulationViewport = null;
       }
       if (tab.rendererReady) tab.deviceEmulationDirty = false;
@@ -1508,13 +1710,14 @@ class BrowserHost {
         && (tab.deviceEmulationDirty
           || tab.deviceEmulationViewport?.width !== bounds.width
           || tab.deviceEmulationViewport?.height !== bounds.height)) {
-        this.enableHiddenTurnViewport(tab.view.webContents, bounds);
-        tab.deviceEmulationViewport = { width: bounds.width, height: bounds.height };
-        tab.deviceEmulationDirty = false;
+        if (this.enableHiddenTurnViewport(contents, bounds)) {
+          tab.deviceEmulationViewport = { width: bounds.width, height: bounds.height };
+          tab.deviceEmulationDirty = false;
+        }
       }
-      tab.view.setBounds(bounds);
+      view.setBounds(bounds);
     }
-    tab.view.setVisible(visible || tab.status === "running");
+    view.setVisible(visible || tab.status === "running");
   }
 
   presentPrimaryView(visible) {
@@ -1560,8 +1763,15 @@ class BrowserHost {
 
   removeTurnTab(tab, abortRunning) {
     if (!this.turnTabs.has(tab.id)) return;
+    BrowserHost.prototype.releaseGenerationPermit.call(
+      this,
+      tab.traceId,
+      tab.helperPid,
+      abortRunning ? "turn_removed_aborted" : "turn_removed",
+    );
     this.turnTabs.delete(tab.id);
-    this.imageDownloads?.releaseContents(tab.view.webContents);
+    const contents = tab.view?.webContents;
+    this.imageDownloads?.releaseContents(contents);
     if (tab.interactionMode === "manual") {
       if (tab.manualDeadlineTimer) clearTimeout(tab.manualDeadlineTimer);
       tab.manualDeadlineTimer = null;
@@ -1580,8 +1790,8 @@ class BrowserHost {
       this.closedTurnOwners.set(tab.traceId, tab.helperPid);
       tab.status = "aborted";
     }
-    try { this.window.contentView.removeChildView(tab.view); } catch {}
-    if (!tab.view.webContents.isDestroyed()) tab.view.webContents.close();
+    try { if (tab.view) this.window.contentView.removeChildView(tab.view); } catch {}
+    if (contents && !contents.isDestroyed()) contents.close();
     if (this.selectedTabId === tab.id) {
       this.selectedTabId = [...this.turnTabs.keys()].at(-1) || "home";
       const homeContents = this.view?.webContents;
@@ -2416,13 +2626,15 @@ class BrowserHost {
         `Browser helper ownership mismatch: expected ${tab.helperPid}, received ${helperPid}`,
       );
     }
+    BrowserHost.prototype.releaseGenerationPermit.call(this, traceId, helperPid, `turn_${status}`);
     const cancelledByUser = this.userCancelledTurnOwners.get(traceId) === helperPid;
     tab.status = status === "completed" ? "ready" : status === "aborted" ? "aborted" : "error";
-    this.imageDownloads?.releaseContents(tab.view.webContents);
+    const contents = tab.view?.webContents;
+    this.imageDownloads?.releaseContents(contents);
     this.syncPowerSaveBlocker();
     tab.message = status === "completed" ? "Task completed" : message || `ChatGPT turn ${status}`;
     tab.loading = false;
-    if (!tab.view.webContents.isDestroyed()) tab.view.webContents.setBackgroundThrottling(true);
+    if (contents && !contents.isDestroyed()) contents.setBackgroundThrottling(true);
     if (status === "completed") {
       this.logger.info("browser.tab_completed", { tabId: tab.id, traceId });
     }
@@ -2946,7 +3158,7 @@ class BrowserHost {
     if (browserInteractionModeFor(this) === "automatic") {
       const surfaces = [[this.surfaceId, this.view?.webContents],
         ...[...this.turnTabs.values()].filter(tab => tab.interactionMode === "automatic")
-          .map(tab => [tab.surfaceId, tab.view.webContents])];
+          .map(tab => [tab.surfaceId, tab.view?.webContents])];
       for (const [surfaceId, contents] of surfaces) {
         if (!contents || contents.isDestroyed()) continue;
         if (Object.hasOwn(surfaceTargets, surfaceId)) throw new Error("Browser surface ownership is duplicated");
@@ -2981,6 +3193,11 @@ class BrowserHost {
   }
 
   destroy() {
+    this.generationOwner = null;
+    for (const waiter of this.generationWaiters.splice(0)) {
+      if (waiter.onAbort) waiter.signal?.removeEventListener("abort", waiter.onAbort);
+      waiter.reject(generationQueueAbortError("ChatGPT browser host was destroyed"));
+    }
     this.imageDownloads?.destroy();
     try {
       const current = JSON.parse(fs.readFileSync(this.descriptorPath, "utf8"));
@@ -3015,7 +3232,8 @@ class BrowserHost {
         tab.manualTerminalWaiters?.clear();
       }
       try { this.window.contentView.removeChildView(tab.view); } catch {}
-      if (!tab.view.webContents.isDestroyed()) tab.view.webContents.close();
+      const contents = tab.view?.webContents;
+      if (contents && !contents.isDestroyed()) contents.close();
     }
     this.turnTabs.clear();
     if (this.view && !this.view.webContents.isDestroyed()) this.view.webContents.close();
